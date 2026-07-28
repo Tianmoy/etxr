@@ -47,6 +47,17 @@ curl_download() {
     --retry 3 --retry-delay 2 --retry-max-time 180 "$@"
 }
 
+github_api() {
+  local headers=()
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    headers=(
+      --header "Authorization: Bearer ${GITHUB_TOKEN}"
+      --header "X-GitHub-Api-Version: 2022-11-28"
+    )
+  fi
+  curl_download "${headers[@]}" "$@"
+}
+
 free_tcp_port() {
   python3 - <<'PY'
 import socket
@@ -70,7 +81,7 @@ wait_tcp() {
 }
 
 if [[ ! -x "$XRAY" ]]; then
-  api="$(curl_download https://api.github.com/repos/XTLS/Xray-core/releases/latest)"
+  api="$(github_api https://api.github.com/repos/XTLS/Xray-core/releases/latest)"
   url="$("$JQ" -r '.assets[] | select(.name=="Xray-linux-64.zip") | .browser_download_url' <<<"$api")"
   curl_download "$url" -o "$TOOLS/xray.zip"
   unzip -p "$TOOLS/xray.zip" xray >"$XRAY"
@@ -78,7 +89,7 @@ if [[ ! -x "$XRAY" ]]; then
 fi
 
 if [[ ! -x "$SING_BOX" ]]; then
-  api="$(curl_download https://api.github.com/repos/SagerNet/sing-box/releases/latest)"
+  api="$(github_api https://api.github.com/repos/SagerNet/sing-box/releases/latest)"
   tag="$("$JQ" -r '.tag_name' <<<"$api")"
   ver="${tag#v}"
   asset="sing-box-${ver}-linux-amd64.tar.gz"

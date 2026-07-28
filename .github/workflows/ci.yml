@@ -39,4 +39,6 @@ jobs:
       - name: Check control plane
         run: python3 tests/control-e2e-test.py
       - name: Run protocol integration test
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: JQ=jq tests/runtime-test.sh
