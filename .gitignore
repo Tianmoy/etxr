@@ -1,0 +1,10 @@
+state.json
+generated/
+backups/
+tools/
+*.tmp
+dist/
+/etxr-dataplane
+/etxr-dataplane.exe
+__pycache__/
+*.py[cod]

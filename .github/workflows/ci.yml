@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq python3-aiohttp shellcheck
+      - name: Check shell and Python sources
+        run: |
+          bash -n etxr.sh
+          shellcheck -x -e SC2016 etxr.sh examples/*.sh tests/*.sh
+          python3 -m compileall -q tests
+          python3 tests/static-test.py
+          python3 tests/menu-smoke-test.py
+      - name: Check Go data plane
+        run: |
+          test -z "$(gofmt -l cmd internal)"
+          go vet ./...
+          go test -race ./...
+          python3 tests/data-plane-test.py
+      - name: Check control plane
+        run: python3 tests/control-e2e-test.py
+      - name: Run protocol integration test
+        run: JQ=jq tests/runtime-test.sh

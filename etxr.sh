@@ -1,0 +1,6499 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+VERSION="0.11.0"
+
+STATE_FILE="${ETXR_STATE:-/etc/etxr/state.json}"
+RUNTIME_DIR="${ETXR_RUNTIME:-/etc/etxr}"
+GENERATED_DIR="${ETXR_GENERATED:-${RUNTIME_DIR}/generated}"
+BACKUP_DIR="${ETXR_BACKUPS:-${RUNTIME_DIR}/backups}"
+SUBSCRIPTION_DIR="${ETXR_SUBSCRIPTIONS:-/var/lib/etxr/subscriptions}"
+CONTROL_DIR="${ETXR_CONTROL_DIR:-${RUNTIME_DIR}/control}"
+CONTROL_HELPER="${ETXR_CONTROL_HELPER:-/usr/local/lib/etxr/control.py}"
+CONTROL_PORT="${ETXR_CONTROL_PORT:-18180}"
+DATAPLANE_BIN="${ETXR_DATAPLANE_BIN:-/usr/local/bin/etxr-dataplane}"
+DATAPLANE_DOWNLOAD_BASE="${ETXR_DOWNLOAD_BASE:-https://github.com/Tianmoy/etxr/releases/download/v${VERSION}}"
+LIMITER_CONFIG="${ETXR_LIMITER_CONFIG:-${RUNTIME_DIR}/live/limits.json}"
+LIMITER_PORT="${ETXR_LIMITER_PORT:-18181}"
+USAGE_FILE="${ETXR_USAGE_FILE:-/var/lib/etxr/usage.json}"
+XRAY_API_PORT="${ETXR_XRAY_API_PORT:-18182}"
+HY2_BRIDGE_PORT="${ETXR_HY2_BRIDGE_PORT:-18183}"
+SYSTEMD_UNIT_DIR="${ETXR_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+WAIT_IP_HELPER="${ETXR_WAIT_IP_HELPER:-/usr/local/libexec/etxr-wait-ip}"
+PAIR_KEY_DIR="${ETXR_PAIR_KEY_DIR:-${RUNTIME_DIR}/keys}"
+PAIR_PRIVATE_KEY="${ETXR_PAIR_PRIVATE_KEY:-${PAIR_KEY_DIR}/pair-signing.key}"
+PAIR_PUBLIC_KEY="${ETXR_PAIR_PUBLIC_KEY:-${PAIR_KEY_DIR}/pair-signing.pub}"
+PAIR_ID_MAX_BYTES="${ETXR_PAIR_ID_MAX_BYTES:-262144}"
+PAIR_BUNDLE_MAX_BYTES="${ETXR_PAIR_BUNDLE_MAX_BYTES:-1048576}"
+XRAY_BIN="${XRAY_BIN:-/usr/local/bin/xray}"
+SING_BOX_BIN="${SING_BOX_BIN:-/usr/local/bin/sing-box}"
+EASYTIER_CORE_BIN="${EASYTIER_CORE_BIN:-/usr/local/bin/easytier-core}"
+EASYTIER_CLI_BIN="${EASYTIER_CLI_BIN:-/usr/local/bin/easytier-cli}"
+EASYTIER_CONFIG="${ETXR_EASYTIER_CONFIG:-${RUNTIME_DIR}/easytier.toml}"
+DRY_RUN=0
+FORCE=0
+YES=0
+STATE_LOCK_HELD=0
+
+if [[ -t 1 && "${TERM:-dumb}" != "dumb" ]]; then
+  C_RED=$'\033[31m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_BLUE=$'\033[34m'
+  C_CYAN=$'\033[36m'
+  C_BOLD=$'\033[1m'
+  C_RESET=$'\033[0m'
+else
+  C_RED="" C_GREEN="" C_YELLOW="" C_BLUE="" C_CYAN="" C_BOLD="" C_RESET=""
+fi
+
+log() { printf '[etxr] %s\n' "$*" >&2; }
+warn() { printf '[etxr] WARN: %s\n' "$*" >&2; }
+die() { printf '[etxr] ERROR: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+etxr - Xray/XHTTP/Hysteria2 multi-node configuration manager
+
+Global options:
+  --state FILE        State file (default: /etc/etxr/state.json)
+  --dry-run           Print planned privileged changes
+  --force             Allow an explicitly requested takeover/conflict
+  --yes               Skip confirmation prompts
+  -h, --help
+
+Commands:
+  menu                Open the Chinese numbered menu
+  init                Initialize a node state file
+  user add|remove|list|limit|usage|reset-usage
+  route add|remove|list
+  exit add|remove|list
+  reality add|remove|list
+  hy2 enable|disable|show
+  keys reality|vlessenc
+  render [--out DIR]
+  validate
+  apply
+  install [--components xray,sing-box,easytier,nginx]
+  subscription USER
+  client USER --route ROUTE [--socks-port 10808] [--out FILE]
+  backup
+  status
+  xray status|start|stop|restart|logs|follow|monitor|check-update|update
+  cluster master-init
+  pair create|join|list|remove
+  control apply|status
+  version
+
+Run "etxr COMMAND --help" for command-specific examples.
+EOF
+}
+
+clear_screen() {
+  [[ -t 1 ]] && printf '\033[2J\033[H' || true
+}
+
+menu_pause() {
+  local _
+  printf '\n%s按回车键返回菜单...%s' "$C_YELLOW" "$C_RESET"
+  read -r _ || true
+}
+
+prompt_value() {
+  local label="$1" default="${2:-}" value
+  if [[ -n "$default" ]]; then
+    read -r -p "${label} [${default}]: " value
+    printf '%s' "${value:-$default}"
+  else
+    read -r -p "${label}: " value
+    printf '%s' "$value"
+  fi
+}
+
+prompt_secret() {
+  local label="$1" value
+  read -r -s -p "${label}: " value
+  printf '\n' >&2
+  printf '%s' "$value"
+}
+
+prompt_secret_default() {
+  local label="$1" default="$2" value
+  read -r -s -p "${label} [已生成默认值，直接回车使用]: " value
+  printf '\n' >&2
+  printf '%s' "${value:-$default}"
+}
+
+prompt_bool() {
+  local label="$1" default="$2" answer
+  if [[ "$default" == "y" ]]; then
+    read -r -p "${label} [Y/n]: " answer
+    [[ ! "$answer" =~ ^[Nn]$ ]] && printf 'y' || printf 'n'
+  else
+    read -r -p "${label} [y/N]: " answer
+    [[ "$answer" =~ ^[Yy]$ ]] && printf 'y' || printf 'n'
+  fi
+}
+
+valid_mbps() { [[ "$1" =~ ^[0-9]+$ ]] && (( "$1" <= 100000 )); }
+valid_url() { [[ "$1" =~ ^https?://[^[:space:]]+$ ]]; }
+
+port_is_listening() {
+  local proto="$1" port="$2"
+  command -v ss >/dev/null 2>&1 || return 1
+  case "$proto" in
+    tcp) ss -H -lnt "sport = :$port" 2>/dev/null | grep -q . ;;
+    udp) ss -H -lnu "sport = :$port" 2>/dev/null | grep -q . ;;
+    *) return 1 ;;
+  esac
+}
+
+port_is_nginx_owned() {
+  local proto="$1" port="$2"
+  command -v ss >/dev/null 2>&1 || return 1
+  ss -H -lntp "sport = :$port" 2>/dev/null | grep -q 'users:(("nginx"'
+}
+
+prompt_port_checked() {
+  local label="$1" default="$2" proto="$3" value
+  while true; do
+    value="$(prompt_value "$label" "$default")"
+    if ! valid_port "$value"; then
+      warn "端口必须是 1 到 65535 的数字"
+      continue
+    fi
+    if port_is_listening "$proto" "$value"; then
+      warn "$proto 端口 $value 已被占用，请换一个端口"
+      continue
+    fi
+    printf '%s' "$value"
+    return
+  done
+}
+
+prompt_port_value() {
+  local label="$1" default="$2" value
+  while true; do
+    value="$(prompt_value "$label" "$default")"
+    if valid_port "$value"; then
+      printf '%s' "$value"
+      return
+    fi
+    warn "端口必须是 1 到 65535 的数字"
+  done
+}
+
+prompt_mbps() {
+  local label="$1" default="$2" value
+  while true; do
+    value="$(prompt_value "$label" "$default")"
+    if valid_mbps "$value"; then
+      printf '%s' "$value"
+      return
+    fi
+    warn "带宽必须是 0 到 100000 的整数，0 表示不限速"
+  done
+}
+
+prompt_name_value() {
+  local label="$1" default="$2" value
+  while true; do
+    value="$(prompt_value "$label" "$default")"
+    if valid_name "$value"; then
+      printf '%s' "$value"
+      return
+    fi
+    warn "名称只能包含字母、数字、点、下划线和短横线，最长 64 位"
+  done
+}
+
+prompt_hostname_value() {
+  local label="$1" default="$2" value
+  while true; do
+    value="$(prompt_value "$label" "$default")"
+    if valid_hostname "$value"; then
+      printf '%s' "$value"
+      return
+    fi
+    warn "IP 或域名格式不正确"
+  done
+}
+
+prompt_ipv4_value() {
+  local label="$1" default="$2" value
+  while true; do
+    value="$(prompt_value "$label" "$default")"
+    if valid_ipv4 "$value"; then
+      printf '%s' "$value"
+      return
+    fi
+    warn "IPv4 地址格式不正确"
+  done
+}
+
+prompt_target_value() {
+  local label="$1" default="$2" value host port
+  while true; do
+    value="$(prompt_value "$label" "$default")"
+    host="${value%:*}"
+    port="${value##*:}"
+    if [[ "$host" != "$value" ]] && valid_hostname "$host" && valid_port "$port"; then
+      printf '%s' "$value"
+      return
+    fi
+    warn "目标格式应为 域名:端口，例如 www.microsoft.com:443"
+  done
+}
+
+prompt_uuid_value() {
+  local label="$1" default="$2" value
+  while true; do
+    value="$(prompt_value "$label" "$default")"
+    if valid_uuid "$value"; then
+      printf '%s' "${value,,}"
+      return
+    fi
+    warn "UUID 格式不正确"
+  done
+}
+
+prompt_path_value() {
+  local label="$1" default="$2" value
+  while true; do
+    value="$(normalize_path "$(prompt_value "$label" "$default")")"
+    if valid_http_path "$value" && [[ "$value" != "/" ]]; then
+      printf '%s' "$value"
+      return
+    fi
+    warn "Path 必须以 / 开头，且不能使用根路径 /"
+  done
+}
+
+prompt_url_value() {
+  local label="$1" default="$2" value
+  while true; do
+    value="$(prompt_value "$label" "$default")"
+    if valid_url "$value"; then
+      printf '%s' "$value"
+      return
+    fi
+    warn "请输入完整的 http:// 或 https:// 网址"
+  done
+}
+
+menu_confirm() {
+  local label="$1" answer
+  read -r -p "${label} [y/N]: " answer
+  [[ "$answer" =~ ^[Yy]$ ]]
+}
+
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
+need_jq() { need_cmd jq; }
+need_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "This command must run as root"; }
+
+run() {
+  if (( DRY_RUN )); then
+    printf '+ ' >&2
+    printf '%q ' "$@" >&2
+    printf '\n' >&2
+  else
+    "$@"
+  fi
+}
+
+confirm() {
+  local prompt="$1" reply
+  (( YES )) && return 0
+  read -r -p "${prompt} [y/N] " reply
+  [[ "$reply" =~ ^[Yy]$ ]]
+}
+
+require_state() {
+  [[ -f "$STATE_FILE" ]] || die "State not found: $STATE_FILE (run init first)"
+  need_jq
+  jq -e '.schema_version == 1' "$STATE_FILE" >/dev/null ||
+    die "Unsupported or invalid state: $STATE_FILE"
+}
+
+ensure_parent() { mkdir -p "$(dirname "$1")"; }
+
+atomic_write() {
+  local target="$1" tmp
+  ensure_parent "$target"
+  tmp="$(mktemp "$(dirname "$target")/.etxr.XXXXXX")"
+  cat >"$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$target"
+}
+
+state_update() {
+  local filter="$1"; shift
+  local tmp
+  require_state
+  state_lock_acquire
+  tmp="$(mktemp "$(dirname "$STATE_FILE")/.state.XXXXXX")"
+  jq "$@" "$filter" "$STATE_FILE" >"$tmp" || {
+    rm -f "$tmp"
+    die "Failed to update state"
+  }
+  jq -e . "$tmp" >/dev/null || {
+    rm -f "$tmp"
+    die "Updated state is invalid JSON"
+  }
+  mv -f "$tmp" "$STATE_FILE"
+  chmod 600 "$STATE_FILE"
+  state_lock_release
+}
+
+state_lock_acquire() {
+  (( STATE_LOCK_HELD )) && return 0
+  need_cmd flock
+  ensure_parent "$STATE_FILE"
+  exec 9>"${STATE_FILE}.lock"
+  flock -x 9
+  STATE_LOCK_HELD=1
+}
+
+state_lock_release() {
+  (( STATE_LOCK_HELD )) || return 0
+  flock -u 9 || true
+  exec 9>&-
+  STATE_LOCK_HELD=0
+}
+
+random_hex() {
+  local bytes="${1:-16}"
+  openssl rand -hex "$bytes"
+}
+
+random_uuid() {
+  if command -v uuidgen >/dev/null 2>&1; then
+    uuidgen | tr '[:upper:]' '[:lower:]'
+  elif [[ -r /proc/sys/kernel/random/uuid ]]; then
+    cat /proc/sys/kernel/random/uuid
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import uuid; print(uuid.uuid4())'
+  else
+    die "uuidgen, /proc random UUID, or python3 is required"
+  fi
+}
+
+random_password() {
+  openssl rand -base64 24 | tr -d '\n=/+' | cut -c1-28
+}
+
+sha1_prefix() {
+  local value="$1"
+  if command -v sha1sum >/dev/null 2>&1; then
+    printf '%s' "$value" | sha1sum | awk '{print substr($1, 1, 8)}'
+  else
+    printf '%s' "$value" | openssl dgst -sha1 -r | awk '{print substr($1, 1, 8)}'
+  fi
+}
+
+ensure_control_state() {
+  require_state
+  local role base_path
+  role="$(jq -r '.node.role' "$STATE_FILE")"
+  [[ "$role" != "exit" ]] || return 0
+  base_path="$(jq -r '.control.base_path // ""' "$STATE_FILE")"
+  base_path="${base_path:-/$(random_hex 16)}"
+  state_update '
+    .control = ((.control // {}) + {
+      enabled: true,
+      base_path: $base_path,
+      listen: "127.0.0.1",
+      port: $port
+    })
+  ' --arg base_path "$base_path" --argjson port "$CONTROL_PORT"
+}
+
+control_base_url() {
+  printf 'https://%s%s' \
+    "$(jq -r '.node.domain' "$STATE_FILE")" \
+    "$(jq -r '.control.base_path' "$STATE_FILE")"
+}
+
+render_control_desired() {
+  require_state
+  [[ "$(jq -r '.control.enabled // false' "$STATE_FILE")" == "true" ]] ||
+    return 0
+  local node name token base version output issued_at
+  mkdir -p "$CONTROL_DIR/nodes" "$CONTROL_DIR/reports"
+  chmod 700 "$CONTROL_DIR" "$CONTROL_DIR/nodes" "$CONTROL_DIR/reports"
+  while IFS= read -r node; do
+    [[ -n "$node" ]] || continue
+    name="$(jq -r '.name' <<<"$node")"
+    token="$(jq -r '.control_token // ""' <<<"$node")"
+    [[ -n "$token" ]] || continue
+    base="$(jq -c --arg node "$name" '{node_id: $node, users: .users}' "$STATE_FILE")"
+    version="$(printf '%s' "$base" | sha256sum | awk '{print $1}')"
+    issued_at="$(date +%s)"
+    output="$(jq -n -c \
+      --arg node "$name" --arg version "$version" \
+      --arg generated "$(date -u +%FT%TZ)" \
+      --argjson issued_at "$issued_at" \
+      --argjson users "$(jq '.users' "$STATE_FILE")" '
+      {
+        node_id: $node,
+        version: $version,
+        issued_at: $issued_at,
+        generated_at: $generated,
+        users: $users
+      }
+    ')"
+    printf '%s\n' "$output" | atomic_write "$CONTROL_DIR/nodes/${name}.json"
+  done < <(jq -c '(.paired_nodes // [])[]' "$STATE_FILE")
+}
+
+normalize_path() {
+  local value="$1"
+  [[ "$value" == /* ]] || value="/$value"
+  value="${value%/}"
+  [[ -n "$value" ]] || value="/"
+  printf '%s' "$value"
+}
+
+valid_name() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; }
+valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( "$1" >= 1 && "$1" <= 65535 )); }
+valid_ipv4() {
+  local value="$1" octet
+  local -a octets
+  [[ "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  IFS='.' read -r -a octets <<<"$value"
+  for octet in "${octets[@]}"; do
+    (( 10#$octet <= 255 )) || return 1
+  done
+}
+valid_uuid() {
+  [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]]
+}
+valid_hostname() {
+  [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$ ]]
+}
+valid_http_path() {
+  [[ "$1" =~ ^/[A-Za-z0-9._~/-]+$ && "$1" != *"//"* && "$1" != *".."* ]]
+}
+valid_absolute_path() { [[ "$1" =~ ^/[A-Za-z0-9._/-]+$ ]]; }
+valid_secret_value() { [[ "$1" =~ ^[A-Za-z0-9._:@+-]{1,256}$ ]]; }
+valid_bearer_token() { [[ "$1" =~ ^[0-9a-fA-F]{40}$ ]]; }
+valid_subscription_prefix() { [[ "$1" =~ ^[0-9a-fA-F]{8}$ ]]; }
+valid_control_token() { [[ "$1" =~ ^[0-9a-fA-F]{64}$ ]]; }
+
+parse_common_flags() {
+  local -a rest=()
+  while (($#)); do
+    case "$1" in
+      --state) [[ $# -ge 2 ]] || die "--state needs a file"; STATE_FILE="$2"; shift 2 ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      --force) FORCE=1; shift ;;
+      --yes) YES=1; shift ;;
+      *) rest+=("$1"); shift ;;
+    esac
+  done
+  REMAINING_ARGS=("${rest[@]}")
+}
+
+cmd_init() {
+  local name="" role="" domain="" address="" nginx_mode="standalone"
+  local cert="" key="" snippet="" xray_config="/etc/etxr/live/xray.json"
+  local sing_config="/etc/etxr/live/sing-box.json"
+  local tls_port=443 https_listen_port=8443 stream_path=""
+  local shared_tcp443=false control_path
+
+  if [[ "${1:-}" == "--help" ]]; then
+    cat <<'EOF'
+Usage:
+  etxr init --name hk --role gateway --domain hk.example.com \
+    --address hk.example.com --nginx-mode standalone \
+    --cert /etc/letsencrypt/live/hk.example.com/fullchain.pem \
+    --key /etc/letsencrypt/live/hk.example.com/privkey.pem
+
+Baota extension mode:
+  etxr init --name us --role exit --domain us.example.com \
+    --nginx-mode snippet \
+    --snippet /www/server/panel/vhost/nginx/extension/us.example.com/etxr.conf \
+    --cert /www/server/panel/vhost/cert/us.example.com/fullchain.pem \
+    --key /www/server/panel/vhost/cert/us.example.com/privkey.pem
+
+Shared Baota TCP 443:
+  add --nginx-shared-tcp443 true --nginx-https-listen-port 8443
+  Reality public port is 443 and its local listen port is separate.
+EOF
+    return
+  fi
+
+  while (($#)); do
+    case "$1" in
+      --name) name="$2"; shift 2 ;;
+      --role) role="$2"; shift 2 ;;
+      --domain) domain="$2"; shift 2 ;;
+      --address) address="$2"; shift 2 ;;
+      --nginx-mode) nginx_mode="$2"; shift 2 ;;
+      --cert) cert="$2"; shift 2 ;;
+      --key) key="$2"; shift 2 ;;
+      --snippet) snippet="$2"; shift 2 ;;
+      --tls-port) tls_port="$2"; shift 2 ;;
+      --nginx-https-listen-port) https_listen_port="$2"; shift 2 ;;
+      --nginx-stream-path) stream_path="$2"; shift 2 ;;
+      --nginx-shared-tcp443) shared_tcp443="$2"; shift 2 ;;
+      --xray-config) xray_config="$2"; shift 2 ;;
+      --sing-box-config) sing_config="$2"; shift 2 ;;
+      *) die "Unknown init option: $1" ;;
+    esac
+  done
+
+  [[ -n "$name" && -n "$role" && -n "$domain" ]] ||
+    die "init requires --name, --role, and --domain"
+  valid_name "$name" || die "Invalid node name"
+  valid_hostname "$domain" || die "Invalid domain"
+  [[ "$role" == "gateway" || "$role" == "exit" || "$role" == "hybrid" ]] ||
+    die "--role must be gateway, exit, or hybrid"
+  [[ "$nginx_mode" == "standalone" || "$nginx_mode" == "snippet" ||
+     "$nginx_mode" == "disabled" ]] ||
+    die "--nginx-mode must be standalone, snippet, or disabled"
+  valid_port "$tls_port" || die "Invalid TLS port"
+  valid_port "$https_listen_port" || die "Invalid nginx HTTPS listen port"
+  valid_port "$LIMITER_PORT" || die "Invalid limiter port"
+  valid_port "$XRAY_API_PORT" || die "Invalid Xray API port"
+  valid_port "$HY2_BRIDGE_PORT" || die "Invalid Hysteria2 bridge port"
+  [[ "$shared_tcp443" == "true" || "$shared_tcp443" == "false" ]] ||
+    die "Invalid nginx shared TCP 443 flag"
+  if [[ "$shared_tcp443" == "true" ]]; then
+    [[ "$nginx_mode" == "snippet" ]] ||
+      die "Shared TCP 443 currently requires Baota snippet mode"
+    [[ "$tls_port" == "443" ]] ||
+      die "Shared TCP 443 requires public TLS port 443"
+    [[ "$https_listen_port" != "443" ]] ||
+      die "nginx internal HTTPS port must differ from 443"
+    [[ -n "$stream_path" ]] || stream_path="/www/server/panel/vhost/nginx/tcp/etxr.conf"
+  fi
+  [[ -z "$cert" ]] || valid_absolute_path "$cert" || die "Invalid certificate path"
+  [[ -z "$key" ]] || valid_absolute_path "$key" || die "Invalid certificate key path"
+  [[ -z "$stream_path" ]] || valid_absolute_path "$stream_path" ||
+    die "Invalid nginx stream path"
+  valid_absolute_path "$xray_config" || die "Invalid Xray config path"
+  valid_absolute_path "$sing_config" || die "Invalid sing-box config path"
+  [[ "$nginx_mode" != "snippet" || -n "$snippet" ]] ||
+    die "--snippet is required in snippet mode"
+  [[ -z "$snippet" ]] || valid_absolute_path "$snippet" || die "Invalid nginx snippet path"
+  [[ ! -e "$STATE_FILE" || "$FORCE" -eq 1 ]] ||
+    die "State already exists: $STATE_FILE (use --force to replace)"
+
+  address="${address:-$domain}"
+  control_path="/$(random_hex 16)"
+  ensure_parent "$STATE_FILE"
+
+  jq -n \
+    --arg name "$name" \
+    --arg role "$role" \
+    --arg domain "$domain" \
+    --arg address "$address" \
+    --arg mode "$nginx_mode" \
+    --arg cert "$cert" \
+    --arg key "$key" \
+    --arg snippet "$snippet" \
+    --arg xray_config "$xray_config" \
+    --arg sing_config "$sing_config" \
+    --arg control_path "$control_path" \
+    --arg stream_path "$stream_path" \
+    --argjson shared_tcp443 "$shared_tcp443" \
+    --argjson https_listen_port "$https_listen_port" \
+    --argjson tls_port "$tls_port" \
+    --argjson limiter_port "$LIMITER_PORT" \
+    --argjson xray_api_port "$XRAY_API_PORT" \
+    --argjson hy2_bridge_port "$HY2_BRIDGE_PORT" \
+    '{
+      schema_version: 1,
+      node: {
+        name: $name,
+        role: $role,
+        domain: $domain,
+        address: $address
+      },
+      nginx: {
+        mode: $mode,
+        tls_port: $tls_port,
+        shared_tcp443: $shared_tcp443,
+        https_listen_port: $https_listen_port,
+        stream_path: $stream_path,
+        certificate: $cert,
+        certificate_key: $key,
+        snippet_path: $snippet,
+        standalone_path: "/etc/nginx/conf.d/etxr.conf",
+        paths_path: "/etc/etxr/live/nginx-paths.conf",
+        web_root: "/var/www/etxr"
+      },
+      xray: {
+        config_path: $xray_config,
+        loglevel: "warning",
+        block_bittorrent: true,
+        routes: [],
+        exits: [],
+        reality_inbounds: [],
+        relay_inbounds: []
+      },
+      hysteria2: {
+        enabled: false,
+        config_path: $sing_config,
+        listen: "0.0.0.0",
+        port: 8443,
+        up_mbps: 0,
+        down_mbps: 0,
+        obfs: "salamander",
+        obfs_password: "",
+        masquerade: "",
+        certificate: $cert,
+        certificate_key: $key,
+        insecure: false
+      },
+      easytier: {
+        enabled: false,
+        ipv4: "",
+        public_endpoint: "",
+        network_name: "",
+        network_secret: "",
+        peer: "",
+        tcp_port: 11010
+      },
+      paired_nodes: [],
+      control: {
+        enabled: ($role != "exit"),
+        base_path: $control_path,
+        listen: "127.0.0.1",
+        port: 18180,
+        agent: {enabled: false}
+      },
+      data_plane: {
+        limiter_listen: "127.0.0.1",
+        limiter_port: $limiter_port,
+        xray_api_port: $xray_api_port,
+        hy2_bridge_port: $hy2_bridge_port
+      },
+      subscription: {
+        enabled: true,
+        base_path: ""
+      },
+      users: []
+    }' | atomic_write "$STATE_FILE"
+
+  log "Initialized $STATE_FILE"
+  log "Next: add at least one user and one route"
+}
+
+cmd_user_add() {
+  local name="" uuid="" password="" expires="" routes="*" sub_token sub_prefix
+  local up_mbps=0 down_mbps=0 usage_epoch
+  while (($#)); do
+    case "$1" in
+      --name) name="$2"; shift 2 ;;
+      --uuid) uuid="$2"; shift 2 ;;
+      --password) password="$2"; shift 2 ;;
+      --expires) expires="$2"; shift 2 ;;
+      --routes) routes="$2"; shift 2 ;;
+      --up-mbps) up_mbps="$2"; shift 2 ;;
+      --down-mbps) down_mbps="$2"; shift 2 ;;
+      --help)
+        cat <<'EOF'
+Usage: etxr user add --name alice [--uuid UUID] [--password PASS]
+       [--expires 2027-01-01T00:00:00Z] [--routes '*|hk,tw,us']
+       [--up-mbps 0] [--down-mbps 0]
+EOF
+        return ;;
+      *) die "Unknown user add option: $1" ;;
+    esac
+  done
+  require_state
+  [[ -n "$name" ]] || die "--name is required"
+  valid_name "$name" || die "Invalid user name"
+  jq -e --arg name "$name" '.users[]? | select(.name == $name)' "$STATE_FILE" >/dev/null &&
+    die "User already exists: $name"
+  uuid="${uuid:-$(random_uuid)}"
+  password="${password:-$(random_password)}"
+  usage_epoch="$(random_hex 8)"
+  valid_uuid "$uuid" || die "Invalid UUID"
+  valid_mbps "$up_mbps" || die "Invalid upload Mbps"
+  valid_mbps "$down_mbps" || die "Invalid download Mbps"
+  if [[ -n "$expires" ]]; then
+    [[ "$expires" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] ||
+      die "Expiry must use UTC ISO-8601 format, for example 2027-01-01T00:00:00Z"
+    date -u -d "$expires" +%s >/dev/null 2>&1 ||
+      die "Invalid expiry timestamp"
+  fi
+  sub_token="$(random_hex 20)"
+  sub_prefix="$(sha1_prefix "$name")"
+
+  local routes_json
+  if [[ "$routes" == "*" ]]; then
+    routes_json='["*"]'
+  else
+    routes_json="$(printf '%s' "$routes" | jq -R 'split(",") | map(select(length > 0))')"
+    jq -e 'all(.[]; test("^[A-Za-z0-9._-]{1,64}$"))' <<<"$routes_json" >/dev/null ||
+      die "Invalid route name in --routes"
+  fi
+  state_update \
+    '.users += [{
+      name: $name,
+      uuid: $uuid,
+      hy2_password: $password,
+      enabled: true,
+      expires_at: (if $expires == "" then null else $expires end),
+      routes: $routes,
+      subscription_prefix: $prefix,
+      subscription_token: $token,
+      speed_limit: {
+        up_mbps: $up_mbps,
+        down_mbps: $down_mbps
+      },
+      usage_epoch: $usage_epoch
+    }]' \
+    --arg name "$name" --arg uuid "$uuid" --arg password "$password" \
+    --arg expires "$expires" --arg prefix "$sub_prefix" \
+    --arg token "$sub_token" --arg usage_epoch "$usage_epoch" \
+    --argjson routes "$routes_json" --argjson up_mbps "$up_mbps" \
+    --argjson down_mbps "$down_mbps"
+  log "Added user $name"
+  printf 'UUID: %s\nHysteria2 password: %s\nSubscription path: /%s/%s\n' \
+    "$uuid" "$password" "$sub_prefix" "$sub_token"
+}
+
+cmd_user_remove() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "Usage: etxr user remove NAME"
+  require_state
+  jq -e --arg name "$name" '.users[]? | select(.name == $name)' "$STATE_FILE" >/dev/null ||
+    die "Unknown user: $name"
+  state_update '.users |= map(select(.name != $name))' --arg name "$name"
+  log "Removed user $name"
+}
+
+cmd_user_list() {
+  require_state
+  jq -r '
+    ["NAME","ENABLED","UPLOAD","DOWNLOAD","EXPIRES","ROUTES"],
+    (.users[] | [
+      .name,
+      (.enabled|tostring),
+      (if (.speed_limit.up_mbps // 0) == 0 then "不限速" else "\(.speed_limit.up_mbps) Mbps" end),
+      (if (.speed_limit.down_mbps // 0) == 0 then "不限速" else "\(.speed_limit.down_mbps) Mbps" end),
+      (.expires_at // "-"),
+      (.routes|join(","))
+    ])
+    | @tsv' "$STATE_FILE" | column -t -s $'\t' 2>/dev/null ||
+    jq -r '.users[] |
+      "\(.name)\tenabled=\(.enabled)\tup=\(.speed_limit.up_mbps // 0)Mbps\tdown=\(.speed_limit.down_mbps // 0)Mbps\texpires=\(.expires_at // "-")\troutes=\(.routes|join(","))"' "$STATE_FILE"
+}
+
+cmd_user_limit() {
+  local name="${1:-}" up_mbps="" down_mbps=""
+  [[ -n "$name" ]] || die "Usage: etxr user limit NAME --up-mbps N --down-mbps N"
+  shift || true
+  while (($#)); do
+    case "$1" in
+      --up-mbps) up_mbps="$2"; shift 2 ;;
+      --down-mbps) down_mbps="$2"; shift 2 ;;
+      *) die "Unknown user limit option: $1" ;;
+    esac
+  done
+  require_state
+  jq -e --arg name "$name" '.users[]? | select(.name == $name)' \
+    "$STATE_FILE" >/dev/null || die "Unknown user: $name"
+  [[ -n "$up_mbps" ]] ||
+    up_mbps="$(jq -r --arg name "$name" \
+      '.users[] | select(.name == $name) | (.speed_limit.up_mbps // 0)' "$STATE_FILE")"
+  [[ -n "$down_mbps" ]] ||
+    down_mbps="$(jq -r --arg name "$name" \
+      '.users[] | select(.name == $name) | (.speed_limit.down_mbps // 0)' "$STATE_FILE")"
+  valid_mbps "$up_mbps" || die "Invalid upload Mbps"
+  valid_mbps "$down_mbps" || die "Invalid download Mbps"
+  state_update '
+    (.users[] | select(.name == $name)) |= (
+      .speed_limit = {up_mbps: $up_mbps, down_mbps: $down_mbps} |
+      .usage_epoch = (.usage_epoch // $usage_epoch)
+    )
+  ' --arg name "$name" --arg usage_epoch "$(random_hex 8)" \
+    --argjson up_mbps "$up_mbps" --argjson down_mbps "$down_mbps"
+  log "Updated speed limit for $name: upload=${up_mbps}Mbps download=${down_mbps}Mbps"
+}
+
+cmd_user_reset_usage() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "Usage: etxr user reset-usage NAME|all"
+  require_state
+  if [[ "$name" == "all" ]]; then
+    state_update '.users |= map(.usage_epoch = $epoch)' \
+      --arg epoch "$(random_hex 8)"
+  else
+    jq -e --arg name "$name" '.users[]? | select(.name == $name)' \
+      "$STATE_FILE" >/dev/null || die "Unknown user: $name"
+    state_update '(.users[] | select(.name == $name) | .usage_epoch) = $epoch' \
+      --arg name "$name" --arg epoch "$(random_hex 8)"
+  fi
+  log "Usage reset requested for $name"
+}
+
+format_bytes() {
+  local value="${1:-0}"
+  if command -v numfmt >/dev/null 2>&1; then
+    numfmt --to=iec-i --suffix=B "$value"
+  else
+    printf '%s B' "$value"
+  fi
+}
+
+cmd_user_usage() {
+  local name="${1:-}" sources totals line
+  require_state
+  if [[ -n "$name" ]]; then
+    jq -e --arg name "$name" '.users[]? | select(.name == $name)' \
+      "$STATE_FILE" >/dev/null || die "Unknown user: $name"
+  fi
+  if [[ -x "$DATAPLANE_BIN" && -x "$XRAY_BIN" && ${EUID:-$(id -u)} -eq 0 ]]; then
+    "$DATAPLANE_BIN" meter --state "$STATE_FILE" \
+      --usage-file "$USAGE_FILE" --xray-bin "$XRAY_BIN" --once \
+      >/dev/null 2>&1 || true
+  fi
+  sources="$(mktemp)"
+  if [[ -f "$USAGE_FILE" ]]; then
+    jq -c '{updated_at: (.updated_at // 0), users: (.users // {})}' \
+      "$USAGE_FILE" >>"$sources" 2>/dev/null || true
+  fi
+  if [[ "$(jq -r '.node.role' "$STATE_FILE")" != "exit" &&
+        -d "$CONTROL_DIR/reports" ]]; then
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && printf '%s\n' "$line" >>"$sources"
+    done < <(jq -c '
+      select(.usage | type == "object") |
+      {
+        updated_at: (.usage.updated_at // 0),
+        users: (.usage.users // {})
+      }
+    ' "$CONTROL_DIR"/reports/*.json 2>/dev/null || true)
+  fi
+  totals="$(jq -s --slurpfile state "$STATE_FILE" '
+    $state[0].users as $configured |
+    reduce .[] as $source (
+      {};
+      reduce (($source.users // {}) | to_entries[]) as $entry (
+        .;
+        ($configured | map(select(
+          .name == $entry.key and
+          .uuid == ($entry.value.uuid // "") and
+          ((.usage_epoch // "") | tostring) ==
+            (($entry.value.usage_epoch // "") | tostring)
+        )) | first // null) as $known |
+        if $known == null then .
+        else
+          .[$entry.key].uplink =
+            ((.[$entry.key].uplink // 0) + ($entry.value.uplink // 0)) |
+          .[$entry.key].downlink =
+            ((.[$entry.key].downlink // 0) + ($entry.value.downlink // 0))
+        end
+      )
+    )
+  ' "$sources")"
+  rm -f "$sources"
+
+  printf '用户\t上传\t下载\t合计\t上传限速\t下载限速\n'
+  while IFS=$'\t' read -r user_name uplink downlink up_limit down_limit; do
+    [[ -n "$user_name" ]] || continue
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$user_name" \
+      "$(format_bytes "$uplink")" \
+      "$(format_bytes "$downlink")" \
+      "$(format_bytes "$((uplink + downlink))")" \
+      "$([[ "$up_limit" == "0" ]] && printf '不限速' || printf '%s Mbps' "$up_limit")" \
+      "$([[ "$down_limit" == "0" ]] && printf '不限速' || printf '%s Mbps' "$down_limit")"
+  done < <(jq -r --arg name "$name" --argjson totals "$totals" '
+    .users[] |
+    select($name == "" or .name == $name) |
+    [
+      .name,
+      ($totals[.name].uplink // 0),
+      ($totals[.name].downlink // 0),
+      (.speed_limit.up_mbps // 0),
+      (.speed_limit.down_mbps // 0)
+    ] | @tsv
+  ' "$STATE_FILE")
+}
+
+cmd_user() {
+  local action="${1:-}"; shift || true
+  case "$action" in
+    add) cmd_user_add "$@" ;;
+    remove|rm) cmd_user_remove "$@" ;;
+    list|ls) cmd_user_list ;;
+    limit) cmd_user_limit "$@" ;;
+    usage) cmd_user_usage "$@" ;;
+    reset-usage) cmd_user_reset_usage "$@" ;;
+    enable|disable)
+      local name="${1:-}"; [[ -n "$name" ]] || die "User name required"
+      jq -e --arg name "$name" '.users[]? | select(.name == $name)' "$STATE_FILE" >/dev/null ||
+        die "Unknown user: $name"
+      local enabled=true; [[ "$action" == "disable" ]] && enabled=false
+      state_update '(.users[] | select(.name == $name) | .enabled) = $enabled' \
+        --arg name "$name" --argjson enabled "$enabled"
+      ;;
+    *) die "Usage: etxr user add|remove|list|enable|disable|limit|usage|reset-usage" ;;
+  esac
+}
+
+cmd_route_add() {
+  local name="" path="" port="" target="direct" profile="plain"
+  local decryption="none" encryption="none" flow="" host=""
+  while (($#)); do
+    case "$1" in
+      --name) name="$2"; shift 2 ;;
+      --path) path="$2"; shift 2 ;;
+      --port) port="$2"; shift 2 ;;
+      --target) target="$2"; shift 2 ;;
+      --profile) profile="$2"; shift 2 ;;
+      --decryption) decryption="$2"; shift 2 ;;
+      --client-encryption) encryption="$2"; shift 2 ;;
+      --flow) flow="$2"; shift 2 ;;
+      --host) host="$2"; shift 2 ;;
+      --help)
+        cat <<'EOF'
+Usage:
+  etxr route add --name hk --path /PATH_HK --port 18001 --target direct
+  etxr route add --name tw --path /PATH_TW --port 18002 --target tw
+
+VLESS Encryption + Vision + XHTTP XMUX + nginx TLS:
+  etxr keys vlessenc
+  etxr route add --name pq --path /PATH_PQ --port 18003 \
+    --profile vlessenc-vision \
+    --decryption 'SERVER_DECRYPTION' \
+    --client-encryption 'CLIENT_ENCRYPTION'
+
+Profiles:
+  plain               VLESS + XHTTP behind nginx TLS
+  vlessenc-vision     VLESS Encryption + Vision + XHTTP/XMUX behind nginx TLS
+EOF
+        return ;;
+      *) die "Unknown route add option: $1" ;;
+    esac
+  done
+  require_state
+  [[ -n "$name" && -n "$path" && -n "$port" ]] ||
+    die "route add requires --name, --path, and --port"
+  valid_name "$name" || die "Invalid route name"
+  valid_port "$port" || die "Invalid port"
+  path="$(normalize_path "$path")"
+  valid_http_path "$path" || die "Path may contain only letters, digits, /, ., _, ~, and -"
+  [[ "$path" != "/" ]] || die "Root path / is not allowed"
+  [[ -z "$host" ]] || valid_hostname "$host" || die "Invalid HTTP host"
+  [[ "$profile" == "plain" || "$profile" == "vlessenc-vision" ]] ||
+    die "Unsupported route profile: $profile"
+  if [[ "$profile" == "vlessenc-vision" ]]; then
+    [[ "$decryption" != "none" && "$encryption" != "none" ]] ||
+      die "vlessenc-vision needs --decryption and --client-encryption"
+    flow="${flow:-xtls-rprx-vision}"
+  else
+    decryption="none"
+    encryption="none"
+    flow=""
+  fi
+  if [[ "$target" != "direct" ]]; then
+    jq -e --arg name "$target" '.xray.exits[]? | select(.name == $name)' "$STATE_FILE" >/dev/null ||
+      die "Target exit does not exist: $target (add it first)"
+  fi
+  jq -e --arg name "$name" '.xray.routes[]? | select(.name == $name)' "$STATE_FILE" >/dev/null &&
+    die "Route already exists: $name"
+  jq -e --arg path "$path" '.xray.routes[]? | select(.path == $path)' "$STATE_FILE" >/dev/null &&
+    die "Path already exists: $path"
+  jq -e --argjson port "$port" '.xray.routes[]? | select(.port == $port)' "$STATE_FILE" >/dev/null &&
+    die "Route port already exists: $port"
+
+  state_update \
+    '.xray.routes += [{
+      name: $name, path: $path, listen: "127.0.0.1", port: $port,
+      target: $target, profile: $profile, host: $host,
+      decryption: $decryption, client_encryption: $encryption, flow: $flow
+    }]' \
+    --arg name "$name" --arg path "$path" --arg target "$target" \
+    --arg profile "$profile" --arg host "$host" \
+    --arg decryption "$decryption" --arg encryption "$encryption" --arg flow "$flow" \
+    --argjson port "$port"
+  log "Added path route $path -> $target via local port $port"
+}
+
+cmd_route_remove() {
+  local name="${1:-}"; [[ -n "$name" ]] || die "Route name required"
+  state_update '.xray.routes |= map(select(.name != $name))' --arg name "$name"
+}
+
+cmd_route_list() {
+  require_state
+  jq -r '.xray.routes[]? |
+    "\(.name)\t\(.path)\t127.0.0.1:\(.port)\ttarget=\(.target)\tprofile=\(.profile)"' "$STATE_FILE"
+}
+
+cmd_route() {
+  local action="${1:-}"; shift || true
+  case "$action" in
+    add) cmd_route_add "$@" ;;
+    remove|rm) cmd_route_remove "$@" ;;
+    list|ls) cmd_route_list ;;
+    *) die "Usage: etxr route add|remove|list" ;;
+  esac
+}
+
+cmd_exit_add() {
+  local name="" address="" port=443 transport="tls" server_name="" host="" path=""
+  local uuid="" encryption="none" flow="" public_key="" short_id="" fingerprint="chrome"
+  while (($#)); do
+    case "$1" in
+      --name) name="$2"; shift 2 ;;
+      --address) address="$2"; shift 2 ;;
+      --port) port="$2"; shift 2 ;;
+      --transport) transport="$2"; shift 2 ;;
+      --server-name) server_name="$2"; shift 2 ;;
+      --host) host="$2"; shift 2 ;;
+      --path) path="$2"; shift 2 ;;
+      --uuid) uuid="$2"; shift 2 ;;
+      --encryption) encryption="$2"; shift 2 ;;
+      --flow) flow="$2"; shift 2 ;;
+      --public-key) public_key="$2"; shift 2 ;;
+      --short-id) short_id="$2"; shift 2 ;;
+      --fingerprint) fingerprint="$2"; shift 2 ;;
+      --help)
+        cat <<'EOF'
+Usage:
+  etxr exit add --name tw --address tw.example.com --port 443 \
+    --transport tls --server-name tw.example.com --host tw.example.com \
+    --path /RELAY_PATH --uuid UUID
+
+  etxr exit add --name us --address US_IP --port 8444 \
+    --transport reality --server-name REALITY_SNI --path /RELAY_PATH \
+    --uuid UUID --public-key PUBLIC_KEY --short-id SHORT_ID
+
+  etxr exit add --name tw-private --address 10.10.0.2 --port 18000 \
+    --transport none --path /RELAY_PATH --uuid UUID \
+    --encryption CLIENT_VLESS_ENCRYPTION --flow xtls-rprx-vision
+
+transport: tls | reality | none
+For transport=none, use a private overlay address or VLESS Encryption.
+EOF
+        return ;;
+      *) die "Unknown exit add option: $1" ;;
+    esac
+  done
+  require_state
+  [[ -n "$name" && -n "$address" && -n "$path" && -n "$uuid" ]] ||
+    die "exit add requires --name, --address, --path, and --uuid"
+  valid_name "$name" || die "Invalid exit name"
+  valid_port "$port" || die "Invalid port"
+  valid_uuid "$uuid" || die "Invalid UUID"
+  [[ "$address" =~ ^[A-Za-z0-9.-]+$ ]] || die "Invalid exit address"
+  [[ "$transport" == "tls" || "$transport" == "reality" || "$transport" == "none" ]] ||
+    die "--transport must be tls, reality, or none"
+  path="$(normalize_path "$path")"
+  valid_http_path "$path" || die "Path may contain only letters, digits, /, ., _, ~, and -"
+  [[ "$path" != "/" ]] || die "Root path / is not allowed"
+  server_name="${server_name:-$address}"
+  host="${host:-$server_name}"
+  valid_hostname "$server_name" || die "Invalid server name"
+  valid_hostname "$host" || die "Invalid HTTP host"
+  if [[ "$transport" == "reality" ]]; then
+    [[ -n "$public_key" && -n "$short_id" ]] ||
+      die "Reality exit needs --public-key and --short-id"
+  fi
+  if [[ "$transport" == "none" && "$encryption" == "none" ]]; then
+    warn "Unencrypted VLESS is only suitable for a trusted private overlay"
+  fi
+  jq -e --arg name "$name" '.xray.exits[]? | select(.name == $name)' "$STATE_FILE" >/dev/null &&
+    die "Exit already exists: $name"
+
+  state_update \
+    '.xray.exits += [{
+      name: $name, address: $address, port: $port, transport: $transport,
+      server_name: $server_name, host: $host, path: $path, uuid: $uuid,
+      encryption: $encryption, flow: $flow, public_key: $public_key,
+      short_id: $short_id, fingerprint: $fingerprint,
+      xmux: {
+        maxConcurrency: "16-32", maxConnections: 0,
+        cMaxReuseTimes: "64-128", cMaxLifetimeMs: 0,
+        hMaxRequestTimes: "800-900", hKeepAlivePeriod: 0
+      }
+    }]' \
+    --arg name "$name" --arg address "$address" --arg transport "$transport" \
+    --arg server_name "$server_name" --arg host "$host" --arg path "$path" \
+    --arg uuid "$uuid" --arg encryption "$encryption" --arg flow "$flow" \
+    --arg public_key "$public_key" --arg short_id "$short_id" \
+    --arg fingerprint "$fingerprint" --argjson port "$port"
+  log "Added exit $name"
+}
+
+cmd_exit_remove() {
+  local name="${1:-}"; [[ -n "$name" ]] || die "Exit name required"
+  require_state
+  jq -e --arg name "$name" '.xray.routes[]? | select(.target == $name)' "$STATE_FILE" >/dev/null &&
+    die "Exit $name is still used by a route"
+  state_update '.xray.exits |= map(select(.name != $name))' --arg name "$name"
+}
+
+cmd_exit_list() {
+  require_state
+  jq -r '.xray.exits[]? |
+    "\(.name)\t\(.transport)://\(.address):\(.port)\tpath=\(.path)\tflow=\(.flow // "")"' "$STATE_FILE"
+}
+
+cmd_exit() {
+  local action="${1:-}"; shift || true
+  case "$action" in
+    add) cmd_exit_add "$@" ;;
+    remove|rm) cmd_exit_remove "$@" ;;
+    list|ls) cmd_exit_list ;;
+    *) die "Usage: etxr exit add|remove|list" ;;
+  esac
+}
+
+cmd_reality_add() {
+  local name="" port="" listen_port="" listen_address="0.0.0.0"
+  local path="" target="" server_names="" private_key="" public_key="" short_ids=""
+  while (($#)); do
+    case "$1" in
+      --name) name="$2"; shift 2 ;;
+      --port) port="$2"; shift 2 ;;
+      --listen-port) listen_port="$2"; shift 2 ;;
+      --listen-address) listen_address="$2"; shift 2 ;;
+      --path) path="$2"; shift 2 ;;
+      --target) target="$2"; shift 2 ;;
+      --server-names) server_names="$2"; shift 2 ;;
+      --private-key) private_key="$2"; shift 2 ;;
+      --public-key) public_key="$2"; shift 2 ;;
+      --short-ids) short_ids="$2"; shift 2 ;;
+      --help)
+        cat <<'EOF'
+Usage:
+  etxr keys reality
+  etxr reality add --name reality --port 8444 --path /REALITY_PATH \
+    --target TARGET_DOMAIN:443 --server-names SNI1,SNI2 \
+    --listen-port 8444 --listen-address 0.0.0.0 \
+    --private-key PRIVATE_KEY --public-key PUBLIC_KEY \
+    --short-ids SHORT_ID1,SHORT_ID2
+EOF
+        return ;;
+      *) die "Unknown reality add option: $1" ;;
+    esac
+  done
+  require_state
+  [[ -n "$name" && -n "$port" && -n "$path" && -n "$target" &&
+     -n "$server_names" && -n "$private_key" && -n "$public_key" &&
+     -n "$short_ids" ]] ||
+    die "Missing required Reality option"
+  valid_name "$name" || die "Invalid Reality name"
+  valid_port "$port" || die "Invalid Reality port"
+  if [[ "$(jq -r '.nginx.shared_tcp443 // false' "$STATE_FILE")" == "true" ]]; then
+    [[ "$port" == "443" ]] ||
+      die "Shared TCP 443 Reality must use public port 443"
+    listen_address="127.0.0.1"
+    listen_port="${listen_port:-18443}"
+  fi
+  listen_port="${listen_port:-$port}"
+  valid_port "$listen_port" || die "Invalid Reality listen port"
+  [[ "$listen_address" == "0.0.0.0" || "$listen_address" == "127.0.0.1" ]] ||
+    die "Invalid Reality listen address"
+  path="$(normalize_path "$path")"
+  valid_http_path "$path" || die "Path may contain only letters, digits, /, ., _, ~, and -"
+  [[ "$path" != "/" ]] || die "Root path / is not allowed"
+  [[ "$target" =~ ^[A-Za-z0-9.-]+:[0-9]{1,5}$ ]] || die "Invalid Reality target"
+  valid_hostname "${server_names%%,*}" || die "Invalid Reality server name"
+  [[ "$private_key" =~ ^[A-Za-z0-9_-]{20,256}$ ]] || die "Invalid Reality private key"
+  [[ "$public_key" =~ ^[A-Za-z0-9_-]{20,256}$ ]] || die "Invalid Reality public key"
+  local server_names_json short_ids_json
+  server_names_json="$(printf '%s' "$server_names" | jq -R 'split(",") | map(select(length > 0))')"
+  short_ids_json="$(printf '%s' "$short_ids" | jq -R 'split(",") | map(select(length > 0))')"
+  state_update \
+    '.xray.reality_inbounds += [{
+      name: $name, listen: $listen_address, port: $port, listen_port: $listen_port,
+      path: $path,
+      target: $target, server_names: $server_names,
+      private_key: $private_key, public_key: $public_key, short_ids: $short_ids
+    }]' \
+    --arg name "$name" --arg path "$path" --arg target "$target" \
+    --arg listen_address "$listen_address" \
+    --arg private_key "$private_key" --arg public_key "$public_key" \
+    --argjson port "$port" --argjson listen_port "$listen_port" \
+    --argjson server_names "$server_names_json" \
+    --argjson short_ids "$short_ids_json"
+}
+
+cmd_reality_remove() {
+  local name="${1:-}"; [[ -n "$name" ]] || die "Reality name required"
+  state_update '.xray.reality_inbounds |= map(select(.name != $name))' --arg name "$name"
+}
+
+cmd_reality_list() {
+  require_state
+  jq -r '.xray.reality_inbounds[]? |
+    "\(.name)\tpublic=\(.port)\tlisten=\(.listen // "0.0.0.0"):\(.listen_port // .port)\tpath=\(.path)\tSNI=\(.server_names|join(","))"' "$STATE_FILE"
+}
+
+cmd_reality() {
+  local action="${1:-}"; shift || true
+  case "$action" in
+    add) cmd_reality_add "$@" ;;
+    remove|rm) cmd_reality_remove "$@" ;;
+    list|ls) cmd_reality_list ;;
+    *) die "Usage: etxr reality add|remove|list" ;;
+  esac
+}
+
+cmd_hy2_enable() {
+  local port=8443 up=0 down=0 obfs="salamander" obfs_password="" masquerade=""
+  local cert="" key=""
+  while (($#)); do
+    case "$1" in
+      --port) port="$2"; shift 2 ;;
+      --up-mbps) up="$2"; shift 2 ;;
+      --down-mbps) down="$2"; shift 2 ;;
+      --obfs) obfs="$2"; shift 2 ;;
+      --obfs-password) obfs_password="$2"; shift 2 ;;
+      --masquerade) masquerade="$2"; shift 2 ;;
+      --cert) cert="$2"; shift 2 ;;
+      --key) key="$2"; shift 2 ;;
+      --help)
+        cat <<'EOF'
+Usage:
+  etxr hy2 enable --port 8443 --up-mbps 30 --down-mbps 200 \
+    --obfs salamander --masquerade https://www.example.com
+
+Use UDP 443 only when nginx QUIC/HTTP3 is disabled and no other process owns UDP 443.
+EOF
+        return ;;
+      *) die "Unknown hy2 option: $1" ;;
+    esac
+  done
+  require_state
+  valid_port "$port" || die "Invalid Hysteria2 port"
+  [[ "$obfs" == "salamander" || "$obfs" == "none" ]] ||
+    die "--obfs must be salamander or none"
+  valid_mbps "$up" || die "Invalid upload Mbps"
+  valid_mbps "$down" || die "Invalid download Mbps"
+  [[ -z "$masquerade" ]] || valid_url "$masquerade" || die "Invalid Hysteria2 masquerade URL"
+  if [[ "$obfs" == "salamander" ]]; then
+    obfs_password="${obfs_password:-$(random_password)}"
+  else
+    obfs_password=""
+  fi
+  cert="${cert:-$(jq -r '.nginx.certificate' "$STATE_FILE")}"
+  key="${key:-$(jq -r '.nginx.certificate_key' "$STATE_FILE")}"
+  state_update \
+    '.hysteria2.enabled = true |
+     .hysteria2.port = $port |
+     .hysteria2.up_mbps = $up |
+     .hysteria2.down_mbps = $down |
+     .hysteria2.obfs = $obfs |
+     .hysteria2.obfs_password = $password |
+     .hysteria2.masquerade = $masquerade |
+     .hysteria2.certificate = $cert |
+     .hysteria2.certificate_key = $key' \
+    --argjson port "$port" --argjson up "$up" --argjson down "$down" \
+    --arg obfs "$obfs" --arg password "$obfs_password" \
+    --arg masquerade "$masquerade" --arg cert "$cert" --arg key "$key"
+  log "Enabled Hysteria2 on UDP $port"
+  [[ -z "$obfs_password" ]] || printf 'Hysteria2 obfs password: %s\n' "$obfs_password"
+}
+
+cmd_hy2() {
+  local action="${1:-}"; shift || true
+  case "$action" in
+    enable) cmd_hy2_enable "$@" ;;
+    disable) state_update '.hysteria2.enabled = false' ;;
+    show) require_state; jq '.hysteria2' "$STATE_FILE" ;;
+    *) die "Usage: etxr hy2 enable|disable|show" ;;
+  esac
+}
+
+cmd_keys() {
+  local kind="${1:-}"
+  case "$kind" in
+    reality)
+      [[ -x "$XRAY_BIN" ]] || die "Xray not found at $XRAY_BIN"
+      "$XRAY_BIN" x25519
+      printf 'ShortId: %s\n' "$(random_hex 8)"
+      ;;
+    vlessenc)
+      [[ -x "$XRAY_BIN" ]] || die "Xray not found at $XRAY_BIN"
+      "$XRAY_BIN" vlessenc
+      ;;
+    *) die "Usage: etxr keys reality|vlessenc" ;;
+  esac
+}
+
+render_xray() {
+  local out="$1" tmp_users tmp_routes tmp_exits tmp_reality tmp_relays
+  local tmp_output block loglevel
+  ensure_parent "$out"
+  tmp_users="$(mktemp)"
+  tmp_routes="$(mktemp)"
+  tmp_exits="$(mktemp)"
+  tmp_reality="$(mktemp)"
+  tmp_relays="$(mktemp)"
+  tmp_output="$(mktemp "$(dirname "$out")/.xray.XXXXXX")"
+  jq --argjson now_epoch "$(date +%s)" '
+    [.users[] | select(
+      .enabled == true and
+      (.expires_at == null or .expires_at == "" or
+       (((.expires_at | fromdateiso8601?) // 0) > $now_epoch))
+    )]' "$STATE_FILE" >"$tmp_users"
+  jq '.xray.routes' "$STATE_FILE" >"$tmp_routes"
+  jq '.xray.exits' "$STATE_FILE" >"$tmp_exits"
+  jq '.xray.reality_inbounds' "$STATE_FILE" >"$tmp_reality"
+  jq '.xray.relay_inbounds // []' "$STATE_FILE" >"$tmp_relays"
+  block="$(jq -r '.xray.block_bittorrent' "$STATE_FILE")"
+  loglevel="$(jq -r '.xray.loglevel' "$STATE_FILE")"
+
+  jq -n \
+    --slurpfile users "$tmp_users" \
+    --slurpfile routes "$tmp_routes" \
+    --slurpfile exits "$tmp_exits" \
+    --slurpfile realities "$tmp_reality" \
+    --slurpfile relays "$tmp_relays" \
+    --arg loglevel "$loglevel" \
+    --argjson limiter_port "$(jq -r '.data_plane.limiter_port // 18181' "$STATE_FILE")" \
+    --argjson api_port "$(jq -r '.data_plane.xray_api_port // 18182' "$STATE_FILE")" \
+    --argjson hy2_bridge_port "$(jq -r '.data_plane.hy2_bridge_port // 18183' "$STATE_FILE")" \
+    --argjson hy2_enabled "$(jq -r '.hysteria2.enabled // false' "$STATE_FILE")" \
+    --argjson block "$block" '
+    def allowed_users($route_name; $flow):
+      $users[0]
+      | map(select((.routes | index("*")) != null or (.routes | index($route_name)) != null))
+      | map({
+          id: .uuid,
+          level: 0,
+          email: (.name + "@" + $route_name)
+        } + (if $flow == "" then {} else {flow: $flow} end));
+
+    def sniffing:
+      {
+        enabled: true,
+        destOverride: ["http", "tls", "quic"],
+        metadataOnly: false,
+        routeOnly: true
+      };
+
+    def xhttp_extra_server:
+      {
+        noSSEHeader: false,
+        scMaxEachPostBytes: 1000000,
+        scMaxBufferedPosts: 30,
+        xPaddingBytes: "100-1000"
+      };
+
+    def limited_users:
+      $users[0] | map(select(
+        ((.speed_limit.up_mbps // 0) > 0) or
+        ((.speed_limit.down_mbps // 0) > 0)
+      ));
+
+    def outbound_for_exit($e; $tag; $address; $port; $dialer):
+      {
+        tag: $tag,
+        protocol: "vless",
+        settings: {
+          vnext: [{
+            address: $address,
+            port: $port,
+            users: [{
+              id: $e.uuid,
+              encryption: ($e.encryption // "none"),
+              level: 0
+            } + (if ($e.flow // "") == "" then {} else {flow: $e.flow} end)]
+          }]
+        },
+        streamSettings:
+          ({
+            network: ($e.network // "xhttp"),
+            security: ($e.transport // "none"),
+            sockopt: ({
+              tcpFastOpen: true,
+              tcpNoDelay: true
+            } + (if $dialer == "" then {} else {dialerProxy: $dialer} end))
+          }
+          + (if ($e.network // "xhttp") == "xhttp" then {
+              xhttpSettings: {
+                host: ($e.host // ""),
+                path: $e.path,
+                mode: "auto",
+                extra: {
+                  noGRPCHeader: false,
+                  scMaxEachPostBytes: 1000000,
+                  scMinPostsIntervalMs: 30,
+                  xPaddingBytes: "100-1000",
+                  xmux: ($e.xmux // {})
+                }
+              }
+            } else {} end)
+          + (if ($e.transport // "none") == "tls" then {
+              tlsSettings: {
+                serverName: $e.server_name,
+                allowInsecure: false,
+                alpn: ["h2"],
+                fingerprint: ($e.fingerprint // "chrome")
+              }
+            } elif ($e.transport // "none") == "reality" then {
+              realitySettings: {
+                show: false,
+                serverName: $e.server_name,
+                fingerprint: ($e.fingerprint // "chrome"),
+                publicKey: $e.public_key,
+                shortId: $e.short_id,
+                spiderX: "/"
+              }
+            } else {} end))
+      };
+
+    def exit_outbounds:
+      $exits[0] | map(
+        . as $e |
+        if (($e.backup_address // "") != "") then [
+          outbound_for_exit($e; ("exit-" + $e.name + "-primary"); $e.address; $e.port; ""),
+          outbound_for_exit($e; ("exit-" + $e.name + "-backup"); $e.backup_address; $e.backup_port; "")
+        ] else [
+          outbound_for_exit($e; ("exit-" + $e.name); $e.address; $e.port; "")
+        ] end
+      ) | flatten;
+
+    def limiter_socks_outbounds:
+      limited_users | map(. as $u | {
+        tag: ("limit-socks-" + $u.name),
+        protocol: "socks",
+        settings: {
+          servers: [{
+            address: "127.0.0.1",
+            port: $limiter_port,
+            users: [{
+              user: $u.name,
+              pass: $u.subscription_token
+            }]
+          }]
+        }
+      });
+
+    def limited_direct_outbounds:
+      limited_users | map(. as $u | {
+        tag: ("limit-direct-" + $u.name),
+        protocol: "freedom",
+        settings: {},
+        streamSettings: {
+          sockopt: {
+            dialerProxy: ("limit-socks-" + $u.name)
+          }
+        }
+      });
+
+    def limited_exit_outbounds:
+      [
+        limited_users[] as $u |
+        $exits[0][] as $e |
+        if (($e.backup_address // "") != "") then [
+          outbound_for_exit(
+            $e;
+            ("limit-exit-" + $u.name + "-" + $e.name + "-primary");
+            $e.address;
+            $e.port;
+            ("limit-socks-" + $u.name)
+          ),
+          outbound_for_exit(
+            $e;
+            ("limit-exit-" + $u.name + "-" + $e.name + "-backup");
+            $e.backup_address;
+            $e.backup_port;
+            ("limit-socks-" + $u.name)
+          )
+        ] else [
+          outbound_for_exit(
+            $e;
+            ("limit-exit-" + $u.name + "-" + $e.name);
+            $e.address;
+            $e.port;
+            ("limit-socks-" + $u.name)
+          )
+        ] end
+      ] | flatten;
+
+    def target_rule($r):
+      ($exits[0] | map(select(.name == $r.target)) | first // null) as $e |
+      {
+        type: "field",
+        inboundTag: [("path-" + $r.name)]
+      }
+      + (if $r.target == "direct" then {outboundTag: "direct"}
+        elif $e != null and (($e.backup_address // "") != "") then
+          {balancerTag: ("failover-" + $r.target)}
+        else {outboundTag: ("exit-" + $r.target)} end);
+
+    def limited_route_rules:
+      [
+        $routes[0][] as $r |
+        limited_users[] as $u |
+        select(
+          (($u.routes | index("*")) != null) or
+          (($u.routes | index($r.name)) != null)
+        ) |
+        ($exits[0] | map(select(.name == $r.target)) | first // null) as $e |
+        {
+          type: "field",
+          inboundTag: [("path-" + $r.name)],
+          user: [($u.name + "@" + $r.name)]
+        }
+        + (if $r.target == "direct" then
+            {outboundTag: ("limit-direct-" + $u.name)}
+          elif $e != null and (($e.backup_address // "") != "") then
+            {balancerTag: ("limit-failover-" + $u.name + "-" + $r.target)}
+          else
+            {outboundTag: ("limit-exit-" + $u.name + "-" + $r.target)}
+          end)
+      ];
+
+    def limited_reality_rules:
+      [
+        $realities[0][] as $r |
+        limited_users[] as $u |
+        {
+          type: "field",
+          inboundTag: [("reality-" + $r.name)],
+          user: [($u.name + "@" + $r.name)],
+          outboundTag: ("limit-direct-" + $u.name)
+        }
+      ];
+
+    def limited_hy2_rules:
+      if $hy2_enabled then [
+        limited_users[] as $u |
+        {
+          type: "field",
+          inboundTag: ["hy2-bridge-in"],
+          user: [($u.name + "@hy2")],
+          outboundTag: ("limit-direct-" + $u.name)
+        }
+      ] else [] end;
+
+    {
+      log: {loglevel: $loglevel},
+      inbounds: (
+        ($routes[0] | map(. as $r | {
+          tag: ("path-" + $r.name),
+          listen: $r.listen,
+          port: $r.port,
+          protocol: "vless",
+          settings: {
+            clients: allowed_users($r.name; ($r.flow // "")),
+            decryption: ($r.decryption // "none")
+          },
+          streamSettings:
+            ({
+              network: "xhttp",
+              security: ($r.security // "none"),
+              xhttpSettings: {
+                host: ($r.host // ""),
+                path: $r.path,
+                mode: "auto",
+                extra: xhttp_extra_server
+              },
+              sockopt: {
+                acceptProxyProtocol: false,
+                tcpFastOpen: true,
+                tcpNoDelay: true
+              }
+            }
+            + (if ($r.security // "none") == "tls" then {
+                tlsSettings: {
+                  certificates: [{
+                    certificateFile: $r.certificate,
+                    keyFile: $r.certificate_key
+                  }]
+                }
+              } else {} end)),
+          sniffing: sniffing
+        }))
+        +
+        ($realities[0] | map(. as $r | {
+          tag: ("reality-" + $r.name),
+          listen: ($r.listen // "0.0.0.0"),
+          port: ($r.listen_port // $r.port),
+          protocol: "vless",
+          settings: {
+            clients: allowed_users($r.name; ""),
+            decryption: "none"
+          },
+          streamSettings: {
+            network: "xhttp",
+            security: "reality",
+            realitySettings: {
+              show: false,
+              target: $r.target,
+              xver: 0,
+              serverNames: $r.server_names,
+              privateKey: $r.private_key,
+              shortIds: $r.short_ids
+            },
+            xhttpSettings: {
+              host: "",
+              path: $r.path,
+              mode: "auto",
+              extra: xhttp_extra_server
+            },
+            sockopt: {
+              tcpFastOpen: true,
+              tcpNoDelay: true
+            }
+          },
+          sniffing: sniffing
+        }))
+        +
+        ($relays[0] | map(. as $r | {
+          tag: ("relay-" + $r.name),
+          listen: $r.listen,
+          port: $r.port,
+          protocol: "vless",
+          settings: {
+            clients: [{
+              id: $r.uuid,
+              level: 0,
+              email: ("relay@" + $r.name),
+              flow: ($r.flow // "xtls-rprx-vision")
+            }],
+            decryption: $r.decryption
+          },
+          streamSettings: {
+            network: "raw",
+            security: "none",
+            sockopt: {
+              tcpFastOpen: true,
+              tcpNoDelay: true
+            }
+          },
+          sniffing: sniffing
+        }))
+        +
+        (if $hy2_enabled then [{
+          tag: "hy2-bridge-in",
+          listen: "127.0.0.1",
+          port: $hy2_bridge_port,
+          protocol: "vless",
+          settings: {
+            clients: ($users[0] | map({
+              id: .uuid,
+              level: 0,
+              email: (.name + "@hy2")
+            })),
+            decryption: "none"
+          },
+          streamSettings: {
+            network: "raw",
+            security: "none",
+            sockopt: {
+              tcpFastOpen: true,
+              tcpNoDelay: true
+            }
+          },
+          sniffing: sniffing
+        }] else [] end)
+        +
+        [{
+          tag: "api-in",
+          listen: "127.0.0.1",
+          port: $api_port,
+          protocol: "dokodemo-door",
+          settings: {address: "127.0.0.1"}
+        }]
+      ),
+      outbounds: (
+        [
+          {tag: "direct", protocol: "freedom", settings: {}},
+          {tag: "blocked", protocol: "blackhole", settings: {}}
+        ] + exit_outbounds + limiter_socks_outbounds +
+        limited_direct_outbounds + limited_exit_outbounds
+      ),
+      routing: {
+        domainStrategy: "IPIfNonMatch",
+        rules: (
+          [{
+            type: "field",
+            inboundTag: ["api-in"],
+            outboundTag: "api"
+          }]
+          +
+          (if $block then [{
+            type: "field",
+            protocol: ["bittorrent"],
+            outboundTag: "blocked"
+          }] else [] end)
+          +
+          limited_route_rules
+          +
+          limited_reality_rules
+          +
+          limited_hy2_rules
+          +
+          ($relays[0] | map(
+            if (.public // false) and ((.allowed_source // "") != "") then [
+              {
+                type: "field",
+                inboundTag: [("relay-" + .name)],
+                source: [.allowed_source],
+                outboundTag: "direct"
+              },
+              {
+                type: "field",
+                inboundTag: [("relay-" + .name)],
+                outboundTag: "blocked"
+              }
+            ] else [{
+              type: "field",
+              inboundTag: [("relay-" + .name)],
+              outboundTag: "direct"
+            }] end
+          ) | flatten)
+          +
+          ($routes[0] | map(target_rule(.)))
+        ),
+        balancers:
+          (
+            ($exits[0] | map(select((.backup_address // "") != "") | {
+              tag: ("failover-" + .name),
+              selector: [("exit-" + .name + "-primary")],
+              fallbackTag: ("exit-" + .name + "-backup"),
+              strategy: {type: "leastPing"}
+            }))
+            +
+            ([
+              limited_users[] as $u |
+              $exits[0][] |
+              select((.backup_address // "") != "") |
+              {
+                tag: ("limit-failover-" + $u.name + "-" + .name),
+                selector: [
+                  ("limit-exit-" + $u.name + "-" + .name + "-primary")
+                ],
+                fallbackTag:
+                  ("limit-exit-" + $u.name + "-" + .name + "-backup"),
+                strategy: {type: "leastPing"}
+              }
+            ])
+          )
+      },
+      policy: {
+        levels: {
+          "0": {
+            statsUserUplink: true,
+            statsUserDownlink: true
+          }
+        }
+      },
+      stats: {},
+      api: {
+        tag: "api",
+        services: ["StatsService"]
+      }
+    }
+    + (if ($exits[0] | map(select((.backup_address // "") != "")) | length) > 0 then {
+        observatory: {
+          subjectSelector: (
+            (
+              $exits[0] | map(select((.backup_address // "") != "") |
+                ("exit-" + .name + "-primary"))
+            )
+            +
+            ([
+              limited_users[] as $u |
+              $exits[0][] |
+              select((.backup_address // "") != "") |
+              ("limit-exit-" + $u.name + "-" + .name + "-primary")
+            ])
+          ),
+          probeUrl: "https://connectivitycheck.gstatic.com/generate_204",
+          probeInterval: "10s",
+          enableConcurrency: true
+        }
+      } else {} end)
+    ' >"$tmp_output" || {
+      rm -f "$tmp_users" "$tmp_routes" "$tmp_exits" "$tmp_reality" \
+        "$tmp_relays" "$tmp_output"
+      die "Xray 配置生成失败；未覆盖现有配置"
+    }
+  jq -e 'type == "object" and (.inbounds | type == "array")' \
+    "$tmp_output" >/dev/null || {
+      rm -f "$tmp_users" "$tmp_routes" "$tmp_exits" "$tmp_reality" \
+        "$tmp_relays" "$tmp_output"
+      die "Xray 配置生成结果不是有效 JSON；未覆盖现有配置"
+    }
+  chmod 600 "$tmp_output"
+  mv -f "$tmp_output" "$out"
+  rm -f "$tmp_users" "$tmp_routes" "$tmp_exits" "$tmp_reality" "$tmp_relays"
+}
+
+render_nginx_stream() {
+  local out="$1" https_port tmp_output idx name listen_port sni
+  ensure_parent "$out"
+  tmp_output="$(mktemp "$(dirname "$out")/.nginx-stream.XXXXXX")"
+  https_port="$(jq -r '.nginx.https_listen_port // 8443' "$STATE_FILE")"
+
+  {
+    printf '# Generated by etxr %s. Do not edit.\n' "$VERSION"
+    printf '# Requires nginx stream_ssl_preread_module and the Baota tcp include.\n'
+    printf 'map $ssl_preread_server_name $etxr_backend {\n'
+    printf '    default etxr_https;\n'
+    while IFS=$'\t' read -r idx name listen_port; do
+      [[ -n "$name" ]] || continue
+      while IFS= read -r sni; do
+        [[ -n "$sni" ]] || continue
+        printf '    %s etxr_reality_%s;\n' "$sni" "$idx"
+      done < <(jq -r --arg name "$name" \
+        '.xray.reality_inbounds[] | select(.name == $name) | .server_names[]' \
+        "$STATE_FILE")
+    done < <(jq -r '.xray.reality_inbounds | to_entries[] |
+      "\(.key)\t\(.value.name)\t\(.value.listen_port // .value.port)"' "$STATE_FILE")
+    printf '}\n\n'
+    printf 'upstream etxr_https {\n    server 127.0.0.1:%s;\n}\n\n' "$https_port"
+    while IFS=$'\t' read -r idx name listen_port; do
+      [[ -n "$name" ]] || continue
+      printf 'upstream etxr_reality_%s {\n    server 127.0.0.1:%s;\n}\n\n' \
+        "$idx" "$listen_port"
+    done < <(jq -r '.xray.reality_inbounds | to_entries[] |
+      "\(.key)\t\(.value.name)\t\(.value.listen_port // .value.port)"' "$STATE_FILE")
+    cat <<'EOF'
+server {
+    listen 443;
+    proxy_pass $etxr_backend;
+    ssl_preread on;
+    proxy_connect_timeout 10s;
+    proxy_timeout 1h;
+}
+EOF
+  } >"$tmp_output" || {
+    rm -f "$tmp_output"
+    die "nginx stream 配置生成失败；未覆盖现有配置"
+  }
+  [[ -s "$tmp_output" ]] || {
+    rm -f "$tmp_output"
+    die "nginx stream 配置为空；未覆盖现有配置"
+  }
+  chmod 600 "$tmp_output"
+  mv -f "$tmp_output" "$out"
+}
+
+render_nginx_paths() {
+  local out="$1" domain subdir tmp_output
+  ensure_parent "$out"
+  tmp_output="$(mktemp "$(dirname "$out")/.nginx-paths.XXXXXX")"
+  domain="$(jq -r '.node.domain' "$STATE_FILE")"
+  subdir="$SUBSCRIPTION_DIR"
+  valid_absolute_path "$subdir" || die "Unsafe subscription directory path"
+  while IFS= read -r user; do
+    [[ -n "$user" ]] || continue
+    valid_subscription_prefix "$(jq -r '.subscription_prefix' <<<"$user")" ||
+      die "Invalid subscription prefix in state"
+    valid_bearer_token "$(jq -r '.subscription_token' <<<"$user")" ||
+      die "Invalid subscription token in state"
+  done < <(jq -c '.users[]?' "$STATE_FILE")
+  {
+    printf '# Generated by etxr %s. Do not edit.\n' "$VERSION"
+    jq -r --arg domain "$domain" '
+      .xray.routes[] |
+      "location ^~ \(.path) {\n" +
+      "    proxy_pass http://127.0.0.1:\(.port);\n" +
+      "    proxy_http_version 1.1;\n" +
+      "    proxy_set_header Host " + (if (.host // "") == "" then $domain else .host end) + ";\n" +
+      "    proxy_set_header X-Real-IP $remote_addr;\n" +
+      "    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n" +
+      "    proxy_set_header X-Forwarded-Proto https;\n" +
+      "    proxy_set_header Connection \"\";\n" +
+      "    proxy_buffering off;\n" +
+      "    proxy_request_buffering off;\n" +
+      "    proxy_connect_timeout 15s;\n" +
+      "    proxy_send_timeout 600s;\n" +
+      "    proxy_read_timeout 600s;\n" +
+      "}\n"
+    ' "$STATE_FILE"
+    jq -r --arg dir "$subdir" '
+      . as $root |
+      select($root.subscription.enabled == true) |
+      $root.users[] |
+      "location = /\(.subscription_prefix)/\(.subscription_token) {\n" +
+      "    alias \($dir)/\(.subscription_token);\n" +
+      "    default_type text/plain;\n" +
+      "    add_header Cache-Control \"no-store\";\n" +
+      "}\n"
+    ' "$STATE_FILE"
+    if [[ "$(jq -r '.control.enabled // false' "$STATE_FILE")" == "true" ]]; then
+      local control_path control_port
+      control_path="$(jq -r '.control.base_path' "$STATE_FILE")"
+      control_port="$(jq -r '.control.port' "$STATE_FILE")"
+      valid_http_path "$control_path" || die "Invalid control Path"
+      valid_port "$control_port" || die "Invalid control port"
+      cat <<EOF
+location ^~ ${control_path}/ {
+    proxy_pass http://127.0.0.1:${control_port}/;
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header Upgrade \$http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_connect_timeout 15s;
+    proxy_send_timeout 60s;
+    proxy_read_timeout 3600s;
+    client_max_body_size 1m;
+}
+EOF
+    fi
+  } >"$tmp_output" || {
+    rm -f "$tmp_output"
+    die "nginx Path 配置生成失败；未覆盖现有配置"
+  }
+  [[ -s "$tmp_output" ]] || {
+    rm -f "$tmp_output"
+    die "nginx Path 配置为空；未覆盖现有配置"
+  }
+  chmod 600 "$tmp_output"
+  mv -f "$tmp_output" "$out"
+}
+
+render_nginx_standalone() {
+  local out="$1" domain port cert key root include_file redirect_port="" tmp_output
+  ensure_parent "$out"
+  tmp_output="$(mktemp "$(dirname "$out")/.nginx-standalone.XXXXXX")"
+  domain="$(jq -r '.node.domain' "$STATE_FILE")"
+  port="$(jq -r '.nginx.tls_port' "$STATE_FILE")"
+  cert="$(jq -r '.nginx.certificate' "$STATE_FILE")"
+  key="$(jq -r '.nginx.certificate_key' "$STATE_FILE")"
+  root="$(jq -r '.nginx.web_root' "$STATE_FILE")"
+  include_file="$(jq -r '.nginx.paths_path // "/etc/etxr/live/nginx-paths.conf"' "$STATE_FILE")"
+  [[ "$port" == "443" ]] || redirect_port=":${port}"
+  cat <<EOF >"$tmp_output"
+# Generated by etxr ${VERSION}. Do not edit.
+server {
+    listen 80;
+    server_name ${domain};
+
+    location ^~ /.well-known/acme-challenge/ {
+        root ${root};
+    }
+    location / {
+        return 301 https://\$host${redirect_port}\$request_uri;
+    }
+}
+
+server {
+    listen ${port} ssl http2;
+    server_name ${domain};
+
+    ssl_certificate ${cert};
+    ssl_certificate_key ${key};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:EDGE_TLS:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    include ${include_file};
+
+    location / {
+        root ${root};
+        try_files \$uri \$uri/ =404;
+    }
+}
+EOF
+  [[ -s "$tmp_output" ]] || {
+    rm -f "$tmp_output"
+    die "nginx 独立站点配置为空；未覆盖现有配置"
+  }
+  chmod 600 "$tmp_output"
+  mv -f "$tmp_output" "$out"
+}
+
+render_sing_box() {
+  local out="$1" tmp_output
+  ensure_parent "$out"
+  tmp_output="$(mktemp "$(dirname "$out")/.sing-box.XXXXXX")"
+  jq -n --slurpfile s "$STATE_FILE" '
+    $s[0] as $c |
+    [
+      $c.users[] |
+      select(
+        .enabled == true and
+        (.expires_at == null or .expires_at == "" or
+         (((.expires_at | fromdateiso8601?) // 0) > now))
+      )
+    ] as $active_users |
+    ($active_users | map({name: .name, password: .hy2_password})) as $users |
+    {
+      log: {level: "warn", timestamp: true},
+      inbounds: [{
+        type: "hysteria2",
+        tag: "hy2-in",
+        listen: $c.hysteria2.listen,
+        listen_port: $c.hysteria2.port,
+        users: $users,
+        tls: {
+          enabled: true,
+          server_name: $c.node.domain,
+          certificate_path: $c.hysteria2.certificate,
+          key_path: $c.hysteria2.certificate_key
+        },
+        masquerade: (
+          if $c.hysteria2.masquerade == "" then
+            "file:///var/www/etxr"
+          else $c.hysteria2.masquerade end
+        )
+      }
+      + (if $c.hysteria2.up_mbps > 0 then {up_mbps: $c.hysteria2.up_mbps} else {} end)
+      + (if $c.hysteria2.down_mbps > 0 then {down_mbps: $c.hysteria2.down_mbps} else {} end)
+      + (if $c.hysteria2.obfs == "none" then {} else {
+          obfs: {
+            type: $c.hysteria2.obfs,
+            password: $c.hysteria2.obfs_password
+          }
+        } end)],
+      outbounds: (
+        [{type: "direct", tag: "direct"}]
+        +
+        ($active_users | map(. as $u | {
+          type: "vless",
+          tag: ("hy2-bridge-" + $u.name),
+          server: "127.0.0.1",
+          server_port: ($c.data_plane.hy2_bridge_port // 18183),
+          uuid: $u.uuid,
+          packet_encoding: "xudp"
+        }))
+      ),
+      route: {
+        rules: (
+          (if $c.xray.block_bittorrent then [
+              {action: "sniff"},
+              {protocol: "bittorrent", action: "reject"}
+            ] else [] end)
+          +
+          ($active_users | map(. as $u | {
+            auth_user: [$u.name],
+            action: "route",
+            outbound: ("hy2-bridge-" + $u.name)
+          }))
+        ),
+        final: "direct",
+        auto_detect_interface: true
+      }
+    }' >"$tmp_output" || {
+      rm -f "$tmp_output"
+      die "sing-box 配置生成失败；未覆盖现有配置"
+    }
+  jq -e 'type == "object" and (.inbounds | type == "array")' \
+    "$tmp_output" >/dev/null || {
+      rm -f "$tmp_output"
+      die "sing-box 配置生成结果不是有效 JSON；未覆盖现有配置"
+    }
+  chmod 600 "$tmp_output"
+  mv -f "$tmp_output" "$out"
+}
+
+render_limits() {
+  local out="$1" tmp_output
+  ensure_parent "$out"
+  tmp_output="$(mktemp "$(dirname "$out")/.limits.XXXXXX")"
+  jq --argjson now_epoch "$(date +%s)" '
+    {
+      listen: (.data_plane.limiter_listen // "127.0.0.1"),
+      port: (.data_plane.limiter_port // 18181),
+      users: (
+        [.users[] |
+          select(
+            .enabled == true and
+            (.expires_at == null or .expires_at == "" or
+             (((.expires_at | fromdateiso8601?) // 0) > $now_epoch)) and
+            (
+              ((.speed_limit.up_mbps // 0) > 0) or
+              ((.speed_limit.down_mbps // 0) > 0)
+            )
+          ) |
+          {
+            name: .name,
+            password: .subscription_token,
+            up_mbps: (.speed_limit.up_mbps // 0),
+            down_mbps: (.speed_limit.down_mbps // 0)
+          }
+        ]
+      )
+    }
+  ' "$STATE_FILE" >"$tmp_output" || {
+    rm -f "$tmp_output"
+    die "限速配置生成失败；未覆盖现有配置"
+  }
+  jq -e '
+    (.listen == "127.0.0.1") and
+    (.port | type == "number" and . >= 1 and . <= 65535) and
+    (.users | type == "array")
+  ' "$tmp_output" >/dev/null || {
+    rm -f "$tmp_output"
+    die "限速配置无效；未覆盖现有配置"
+  }
+  chmod 600 "$tmp_output"
+  mv -f "$tmp_output" "$out"
+}
+
+urlencode() {
+  jq -rn --arg v "$1" '$v | @uri'
+}
+
+active_user_json() {
+  local name="$1"
+  jq -e --arg name "$name" '
+    .users[] | select(
+      .name == $name and
+      .enabled == true and
+      (.expires_at == null or .expires_at == "" or
+       (((.expires_at | fromdateiso8601?) // 0) > now))
+    )' "$STATE_FILE"
+}
+
+vless_link_for_route() {
+  local route="$1" user="$2"
+  local uuid domain address port name path profile encryption flow host query security
+  uuid="$(jq -r '.uuid' <<<"$user")"
+  domain="$(jq -r '.node.domain' "$STATE_FILE")"
+  address="$(jq -r '.node.address' "$STATE_FILE")"
+  if [[ "$(jq -r '.direct // false' <<<"$route")" == "true" ]]; then
+    port="$(jq -r '.public_port // .port' <<<"$route")"
+  else
+    port="$(jq -r '.nginx.tls_port' "$STATE_FILE")"
+  fi
+  name="$(jq -r '.name' <<<"$route")"
+  path="$(jq -r '.path' <<<"$route")"
+  profile="$(jq -r '.profile' <<<"$route")"
+  encryption="$(jq -r '.client_encryption // "none"' <<<"$route")"
+  flow="$(jq -r '.flow // ""' <<<"$route")"
+  host="$(jq -r --arg d "$domain" 'if (.host // "") == "" then $d else .host end' <<<"$route")"
+  security="$(jq -r '.security // "tls"' <<<"$route")"
+  [[ "$(jq -r '.direct // false' <<<"$route")" != "true" ]] || security="$(jq -r '.security // "tls"' <<<"$route")"
+  query="encryption=$(urlencode "$encryption")&security=$(urlencode "$security")&sni=$(urlencode "$domain")&type=xhttp&host=$(urlencode "$host")&path=$(urlencode "$path")&mode=auto"
+  if [[ "$(jq -r '.allow_insecure // false' <<<"$route")" == "true" ]]; then
+    query+="&allowInsecure=1"
+  fi
+  [[ -z "$flow" ]] || query+="&flow=$(urlencode "$flow")"
+  if [[ "$profile" == "vlessenc-vision" ]]; then
+    local extra
+    extra='{"xmux":{"maxConcurrency":"16-32","maxConnections":0,"cMaxReuseTimes":"64-128","cMaxLifetimeMs":0,"hMaxRequestTimes":"800-900","hKeepAlivePeriod":0}}'
+    query+="&extra=$(urlencode "$extra")"
+  fi
+  printf 'vless://%s@%s:%s?%s#%s\n' \
+    "$uuid" "$address" "$port" "$query" "$(urlencode "${name}-${domain}")"
+}
+
+vless_link_for_reality() {
+  local reality="$1" user="$2"
+  local uuid address name port path sni public_key short_id query
+  uuid="$(jq -r '.uuid' <<<"$user")"
+  address="$(jq -r '.node.address' "$STATE_FILE")"
+  name="$(jq -r '.name' <<<"$reality")"
+  port="$(jq -r '.port' <<<"$reality")"
+  path="$(jq -r '.path' <<<"$reality")"
+  sni="$(jq -r '.server_names[0]' <<<"$reality")"
+  # Derive the public key from the private key when Xray is available.
+  public_key="$(jq -r '.public_key // ""' <<<"$reality")"
+  short_id="$(jq -r '.short_ids[0]' <<<"$reality")"
+  if [[ -z "$public_key" ]]; then
+    warn "Reality $name has no public_key in state; client link omitted"
+    return 0
+  fi
+  query="encryption=none&security=reality&sni=$(urlencode "$sni")&fp=chrome&pbk=$(urlencode "$public_key")&sid=$(urlencode "$short_id")&type=xhttp&path=$(urlencode "$path")&mode=auto"
+  printf 'vless://%s@%s:%s?%s#%s\n' \
+    "$uuid" "$address" "$port" "$query" "$(urlencode "${name}-reality")"
+}
+
+hy2_link_for_user() {
+  local user="$1" password address domain port name query
+  password="$(jq -r '.hy2_password' <<<"$user")"
+  name="$(jq -r '.name' <<<"$user")"
+  address="$(jq -r '.node.address' "$STATE_FILE")"
+  domain="$(jq -r '.node.domain' "$STATE_FILE")"
+  port="$(jq -r '.hysteria2.port' "$STATE_FILE")"
+  query="sni=$(urlencode "$domain")"
+  if [[ "$(jq -r '.hysteria2.insecure // false' "$STATE_FILE")" == "true" ]]; then
+    query+="&insecure=1"
+  fi
+  if [[ "$(jq -r '.hysteria2.obfs' "$STATE_FILE")" != "none" ]]; then
+    query+="&obfs=$(urlencode "$(jq -r '.hysteria2.obfs' "$STATE_FILE")")"
+    query+="&obfs-password=$(urlencode "$(jq -r '.hysteria2.obfs_password' "$STATE_FILE")")"
+  fi
+  printf 'hysteria2://%s@%s:%s/?%s#%s\n' \
+    "$(urlencode "$password")" "$address" "$port" "$query" "$(urlencode "${name}-hy2")"
+}
+
+subscription_plain() {
+  local name="$1" user route reality
+  user="$(active_user_json "$name")" || die "Enabled user not found: $name"
+  while IFS= read -r route; do
+    [[ -n "$route" ]] || continue
+    local route_name
+    route_name="$(jq -r '.name' <<<"$route")"
+    jq -e --arg r "$route_name" '(.routes | index("*")) != null or (.routes | index($r)) != null' <<<"$user" >/dev/null ||
+      continue
+    vless_link_for_route "$route" "$user"
+  done < <(jq -c '.xray.routes[]?' "$STATE_FILE")
+  while IFS= read -r reality; do
+    [[ -n "$reality" ]] || continue
+    vless_link_for_reality "$reality" "$user"
+  done < <(jq -c '.xray.reality_inbounds[]?' "$STATE_FILE")
+  if [[ "$(jq -r '.hysteria2.enabled' "$STATE_FILE")" == "true" ]]; then
+    hy2_link_for_user "$user"
+  fi
+}
+
+render_subscriptions() {
+  local target_dir="$1" user token plain
+  [[ -n "$target_dir" && "$target_dir" != "/" ]] || die "Unsafe subscription directory"
+  mkdir -p "$target_dir"
+  find "$target_dir" -mindepth 1 -maxdepth 1 -type f -delete
+  while IFS= read -r user; do
+    [[ -n "$user" ]] || continue
+    token="$(jq -r '.subscription_token' <<<"$user")"
+    valid_bearer_token "$token" || die "Invalid subscription token in state"
+    valid_subscription_prefix "$(jq -r '.subscription_prefix' <<<"$user")" ||
+      die "Invalid subscription prefix in state"
+    plain="$(subscription_plain "$(jq -r '.name' <<<"$user")")"
+    printf '%s' "$plain" | base64 -w 0 >"${target_dir}/${token}"
+    chmod 600 "${target_dir}/${token}"
+  done < <(jq -c '.users[] | select(
+    .enabled == true and
+    (.expires_at == null or .expires_at == "" or
+     (((.expires_at | fromdateiso8601?) // 0) > now))
+  )' "$STATE_FILE")
+}
+
+cmd_render() {
+  local out="$GENERATED_DIR"
+  while (($#)); do
+    case "$1" in
+      --out) out="$2"; shift 2 ;;
+      --help) echo "Usage: etxr render [--out DIR]"; return ;;
+      *) die "Unknown render option: $1" ;;
+    esac
+  done
+  require_state
+  state_lock_acquire
+  ensure_control_state
+  render_control_desired
+  mkdir -p "$out"
+  render_xray "$out/xray.json"
+  jq -e 'type == "object"' "$out/xray.json" >/dev/null ||
+    die "生成的 Xray 配置无效"
+  if [[ "$(jq -r '.nginx.mode' "$STATE_FILE")" != "disabled" ]]; then
+    render_nginx_paths "$out/nginx-paths.conf"
+    [[ -s "$out/nginx-paths.conf" ]] || die "生成的 nginx Path 配置为空"
+  else
+    rm -f "$out/nginx-paths.conf" "$out/nginx-standalone.conf"
+  fi
+  if [[ "$(jq -r '.nginx.mode' "$STATE_FILE")" == "standalone" ]]; then
+    render_nginx_standalone "$out/nginx-standalone.conf"
+    [[ -s "$out/nginx-standalone.conf" ]] || die "生成的 nginx 配置为空"
+  fi
+  if [[ "$(jq -r '.nginx.shared_tcp443 // false' "$STATE_FILE")" == "true" ]]; then
+    render_nginx_stream "$out/nginx-stream.conf"
+    [[ -s "$out/nginx-stream.conf" ]] || die "生成的 nginx stream 配置为空"
+  else
+    rm -f "$out/nginx-stream.conf"
+  fi
+  if [[ "$(jq -r '.hysteria2.enabled' "$STATE_FILE")" == "true" ]]; then
+    render_sing_box "$out/sing-box.json"
+    jq -e 'type == "object"' "$out/sing-box.json" >/dev/null ||
+      die "生成的 sing-box 配置无效"
+  else
+    rm -f "$out/sing-box.json"
+  fi
+  render_limits "$out/limits.json"
+  render_subscriptions "$out/subscriptions"
+  chmod -R go-rwx "$out"
+  log "Rendered configuration in $out"
+  state_lock_release
+}
+
+nginx_bin() {
+  local configured
+  configured="$(jq -r '.nginx.binary // empty' "$STATE_FILE")"
+  if [[ -n "$configured" && -x "$configured" ]]; then
+    printf '%s' "$configured"
+  elif [[ -x /www/server/nginx/sbin/nginx ]]; then
+    printf '%s' /www/server/nginx/sbin/nginx
+  elif [[ -x /usr/sbin/nginx ]]; then
+    printf '%s' /usr/sbin/nginx
+  elif command -v nginx >/dev/null 2>&1; then
+    command -v nginx
+  else
+    return 1
+  fi
+}
+
+nginx_supports_stream_preread() {
+  local nb
+  nb="$(nginx_bin)" || return 1
+  "$nb" -V 2>&1 | grep -q -- '--with-stream_ssl_preread_module'
+}
+
+check_baota_shared_nginx_layout() {
+  local nb="$1" stream_path hits main_conf
+  nginx_supports_stream_preread ||
+    die "当前 nginx 未编译 stream_ssl_preread_module，无法进行 Reality/XHTTP TCP 443 分流"
+  stream_path="$(jq -r '.nginx.stream_path // empty' "$STATE_FILE")"
+  main_conf="/www/server/nginx/conf/nginx.conf"
+  if [[ -f "$main_conf" ]] &&
+     ! grep -Eq 'include[[:space:]]+/www/server/panel/vhost/nginx/tcp/\*\.conf' \
+       "$main_conf"; then
+    die "宝塔主配置未包含 tcp/*.conf，无法加载 ETXR 的 stream 分流配置"
+  fi
+  if [[ -d /www/server/panel/vhost/nginx ]]; then
+    hits="$(
+      while IFS= read -r candidate; do
+        if grep -E \
+          '^[[:space:]]*listen[[:space:]]+443([[:space:];]|[[:space:]]+ssl|[[:space:]]+reuseport)' \
+          "$candidate" 2>/dev/null |
+          grep -Evq '(^|[[:space:]])quic([[:space:];]|$)'; then
+          printf '%s\n' "$candidate"
+        fi
+      done < <(grep -RIlE \
+        '^[[:space:]]*listen[[:space:]]+443([[:space:];]|[[:space:]]+ssl|[[:space:]]+reuseport)' \
+        /www/server/panel/vhost/nginx --exclude-dir=tcp 2>/dev/null || true)
+    )"
+    if [[ -n "$hits" ]]; then
+      printf '%s\n' "$hits" >&2
+      die "宝塔 HTTPS vhost 仍直接监听 TCP 443；请先改为 127.0.0.1:8443（不会自动修改其他网站）"
+    fi
+    hits="$(grep -RIlE '^[[:space:]]*listen[[:space:]]+443[[:space:]]*;' \
+      /www/server/panel/vhost/nginx/tcp 2>/dev/null |
+      grep -vFx "$stream_path" || true)"
+    [[ -z "$hits" ]] || {
+      printf '%s\n' "$hits" >&2
+      die "宝塔 tcp 目录已有其他 TCP 443 stream 配置，请先处理端口冲突"
+    }
+  fi
+  [[ -n "$nb" ]]
+}
+
+validate_state_semantics() {
+  local errors=0
+  if ! jq -e '
+    ([.xray.routes[].name] | length == (unique | length)) and
+    ([.xray.routes[].path] | length == (unique | length)) and
+    ([.xray.routes[].port] | length == (unique | length)) and
+    ([.xray.exits[].name] | length == (unique | length)) and
+    ([.users[].name] | length == (unique | length))
+  ' "$STATE_FILE" >/dev/null; then
+    warn "Duplicate route, exit, user, path, or port"
+    errors=1
+  fi
+  if jq -e '
+    [.xray.routes[] | select(.target != "direct") | .target] -
+    [.xray.exits[].name] | length > 0
+  ' "$STATE_FILE" >/dev/null; then
+    warn "One or more routes reference a missing exit"
+    errors=1
+  fi
+  if jq -e '
+    [.xray.routes[] | select(.profile == "vlessenc-vision" and
+      ((.decryption // "none") == "none" or (.client_encryption // "none") == "none"))]
+    | length > 0
+  ' "$STATE_FILE" >/dev/null; then
+    warn "A vlessenc-vision route is missing its encryption pair"
+    errors=1
+  fi
+  if ! jq -e '
+    (([.xray.routes[]?.port] +
+      [.xray.reality_inbounds[]? | (.listen_port // .port)] +
+      [.xray.relay_inbounds[]?.port] +
+      [
+        (.data_plane.limiter_port // 18181),
+        (.data_plane.xray_api_port // 18182),
+        (if (.hysteria2.enabled // false) then
+          (.data_plane.hy2_bridge_port // 18183)
+        else empty end)
+      ] +
+      (if (.control.enabled // false) then
+        [(.control.port // 18180)]
+      else [] end)) |
+      map(select(type == "number"))) as $tcp |
+    ($tcp | length) == ($tcp | unique | length)
+  ' "$STATE_FILE" >/dev/null; then
+    warn "Xray TCP ports conflict inside the state"
+    errors=1
+  fi
+  if ! jq -e '
+    all(.users[];
+      ((.speed_limit.up_mbps // 0) |
+        type == "number" and floor == . and . >= 0 and . <= 100000) and
+      ((.speed_limit.down_mbps // 0) |
+        type == "number" and floor == . and . >= 0 and . <= 100000) and
+      ((.usage_epoch // "") | type == "string" and length <= 128)
+    ) and
+    ((.data_plane.limiter_listen // "127.0.0.1") == "127.0.0.1")
+  ' "$STATE_FILE" >/dev/null; then
+    warn "Invalid per-user speed limit or data-plane state"
+    errors=1
+  fi
+  if ! jq -e '
+    def valid_ipv4:
+      type == "string" and
+      (split(".") | length == 4 and
+        all(.[]; test("^[0-9]{1,3}$") and
+          ((tonumber) >= 0 and (tonumber) <= 255)));
+    def valid_peer:
+      if . == "" then true
+      elif type != "string" then false
+      else
+        (try capture("^(?<host>[A-Za-z0-9.-]+):(?<port>[0-9]{1,5})$") catch null) as $peer |
+        ($peer != null and
+          ($peer.host | test("^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$")) and
+          (($peer.port | tonumber) >= 1 and ($peer.port | tonumber) <= 65535))
+      end;
+    (.easytier.enabled // false) == false or
+    ((.easytier.ipv4 | valid_ipv4) and
+     (.easytier.network_name | type == "string" and test("^[A-Za-z0-9._:-]{1,64}$")) and
+     (.easytier.network_secret | type == "string" and test("^[A-Za-z0-9._:@+-]{1,256}$")) and
+     (.easytier.tcp_port | type == "number" and floor == . and . >= 1 and . <= 65535) and
+     ((.easytier.peer // "") | valid_peer))
+  ' "$STATE_FILE" >/dev/null; then
+    warn "Invalid EasyTier state values"
+    errors=1
+  fi
+  if [[ "$(jq -r '.nginx.shared_tcp443 // false' "$STATE_FILE")" == "true" ]]; then
+    if ! jq -e '
+      (.nginx.mode == "snippet") and
+      (.nginx.tls_port == 443) and
+      (.nginx.https_listen_port | type == "number" and . != 443) and
+      ([.xray.reality_inbounds[]?] | length > 0) and
+      (all(.xray.reality_inbounds[]?; .port == 443 and
+        (.listen // "127.0.0.1") == "127.0.0.1")) and
+      ([.xray.reality_inbounds[]?.server_names[]?] |
+        length == (unique | length))
+    ' "$STATE_FILE" >/dev/null; then
+      warn "Shared TCP 443 state is incomplete or Reality SNI values are duplicated"
+      errors=1
+    fi
+  fi
+  return "$errors"
+}
+
+port_conflict_check() {
+  command -v ss >/dev/null 2>&1 || return 0
+  local port
+  while IFS= read -r port; do
+    if ss -lntH "sport = :$port" 2>/dev/null | grep -q .; then
+      warn "TCP $port is already listening (may be the currently running managed service)"
+    fi
+  done < <(jq -r '.xray.reality_inbounds[]? |
+    (.listen_port // .port)' "$STATE_FILE")
+  if [[ "$(jq -r '.hysteria2.enabled' "$STATE_FILE")" == "true" ]]; then
+    port="$(jq -r '.hysteria2.port' "$STATE_FILE")"
+    if ss -lnuH "sport = :$port" 2>/dev/null | grep -q .; then
+      warn "UDP $port is already listening (may be the currently running managed service)"
+    fi
+  fi
+}
+
+cmd_validate() {
+  require_state
+  state_lock_acquire
+  local temp rc=0 nb
+  temp="$(mktemp -d)"
+  cmd_render --out "$temp"
+  jq -e . "$temp/xray.json" >/dev/null || rc=1
+  [[ ! -f "$temp/sing-box.json" ]] || jq -e . "$temp/sing-box.json" >/dev/null || rc=1
+  validate_state_semantics || rc=1
+
+  if [[ -x "$XRAY_BIN" ]]; then
+    "$XRAY_BIN" run -test -config "$temp/xray.json" || rc=1
+  else
+    warn "Xray binary not found; skipped Xray runtime validation"
+  fi
+  if [[ -f "$temp/sing-box.json" ]]; then
+    if [[ -x "$SING_BOX_BIN" ]]; then
+      "$SING_BOX_BIN" check -c "$temp/sing-box.json" || rc=1
+    else
+      warn "sing-box binary not found; skipped Hysteria2 runtime validation"
+    fi
+  fi
+  if [[ "$(jq -r '.nginx.mode' "$STATE_FILE")" != "disabled" ]]; then
+    if nb="$(nginx_bin 2>/dev/null)"; then
+      if [[ "$(jq -r '.nginx.shared_tcp443 // false' "$STATE_FILE")" == "true" ]]; then
+        check_baota_shared_nginx_layout "$nb" || rc=1
+      fi
+      "$nb" -t || {
+        warn "Current nginx configuration test failed"
+        rc=1
+      }
+    else
+      warn "nginx binary not found; skipped nginx runtime validation"
+    fi
+  fi
+  port_conflict_check
+  if (( rc != 0 )); then
+    rm -rf "$temp"
+    die "Validation failed"
+  fi
+  rm -rf "$temp"
+  state_lock_release
+  log "Validation passed"
+}
+
+backup_file() {
+  local source="$1" dest_dir="$2"
+  [[ -e "$source" ]] || return 0
+  mkdir -p "$dest_dir"
+  cp -a "$source" "$dest_dir/$(basename "$source")"
+}
+
+cmd_backup() {
+  require_state
+  local stamp dest
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  dest="${BACKUP_DIR}/${stamp}"
+  mkdir -p "$dest"
+  cp -a "$STATE_FILE" "$dest/state.json"
+  backup_file "$(jq -r '.xray.config_path' "$STATE_FILE")" "$dest"
+  backup_file "$(jq -r '.hysteria2.config_path' "$STATE_FILE")" "$dest"
+  backup_file "$(jq -r '.nginx.snippet_path' "$STATE_FILE")" "$dest"
+  backup_file "$(jq -r '.nginx.standalone_path' "$STATE_FILE")" "$dest"
+  backup_file "$(jq -r '.nginx.paths_path // empty' "$STATE_FILE")" "$dest"
+  backup_file "$(jq -r '.nginx.stream_path // empty' "$STATE_FILE")" "$dest"
+  backup_file "$EASYTIER_CONFIG" "$dest"
+  backup_file "$LIMITER_CONFIG" "$dest"
+  backup_file "$USAGE_FILE" "$dest"
+  log "Backup created: $dest"
+}
+
+install_data_helper() {
+  local arch asset base tmp expected actual candidate_version target_tmp=""
+  local backup="" stamp
+  if [[ -n "${ETXR_DATAPLANE_SOURCE:-}" ]]; then
+    [[ -x "$ETXR_DATAPLANE_SOURCE" ]] ||
+      die "ETXR_DATAPLANE_SOURCE 不是可执行文件"
+    candidate_version="$("$ETXR_DATAPLANE_SOURCE" version 2>/dev/null || true)"
+    [[ "$candidate_version" == "$VERSION" || "${ETXR_DATAPLANE_ALLOW_DEV:-0}" == "1" ]] ||
+      die "本地数据面版本不匹配：需要 ${VERSION}，得到 ${candidate_version:-未知}"
+    mkdir -p "$(dirname "$DATAPLANE_BIN")" "$BACKUP_DIR/dataplane-binary"
+    target_tmp="$(mktemp "$(dirname "$DATAPLANE_BIN")/.etxr-dataplane.XXXXXX")"
+    install -m 755 "$ETXR_DATAPLANE_SOURCE" "$target_tmp"
+    if [[ -e "$DATAPLANE_BIN" ]]; then
+      stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+      backup="$BACKUP_DIR/dataplane-binary/etxr-dataplane-${stamp}"
+      cp -a "$DATAPLANE_BIN" "$backup"
+    fi
+    if ! mv -f "$target_tmp" "$DATAPLANE_BIN" ||
+       { [[ "${ETXR_DATAPLANE_ALLOW_DEV:-0}" != "1" ]] &&
+         [[ "$("$DATAPLANE_BIN" version 2>/dev/null || true)" != "$VERSION" ]]; }; then
+      rm -f "$target_tmp"
+      if [[ -n "$backup" && -e "$backup" ]]; then
+        cp -a "$backup" "$DATAPLANE_BIN"
+      fi
+      die "安装本地 ETXR 数据面失败，已恢复旧版本"
+    fi
+    return
+  fi
+  if [[ -x "$DATAPLANE_BIN" ]] &&
+     [[ "$("$DATAPLANE_BIN" version 2>/dev/null || true)" == "$VERSION" ]]; then
+    return
+  fi
+  need_cmd curl
+  need_cmd sha256sum
+  arch="$(detect_arch_dataplane)"
+  asset="etxr-dataplane-linux-${arch}"
+  base="${DATAPLANE_DOWNLOAD_BASE%/}"
+  tmp="$(mktemp -d)"
+  curl --proto '=https' --tlsv1.2 -fL \
+    "$base/checksums.txt" -o "$tmp/checksums.txt" || {
+      rm -rf "$tmp"
+      die "下载 ETXR 数据面校验文件失败"
+    }
+  curl --proto '=https' --tlsv1.2 -fL \
+    "$base/$asset" -o "$tmp/$asset" || {
+      rm -rf "$tmp"
+      die "下载 ETXR 数据面失败"
+    }
+  expected="$(awk -v n="$asset" '
+    $2 == n || $2 == ("*" n) {print $1; exit}
+  ' "$tmp/checksums.txt")"
+  actual="$(sha256sum "$tmp/$asset" | awk '{print $1}')"
+  if [[ ! "$expected" =~ ^[0-9a-fA-F]{64}$ ||
+        "${expected,,}" != "${actual,,}" ]]; then
+    rm -rf "$tmp"
+    die "ETXR 数据面 SHA256 校验失败"
+  fi
+  chmod 755 "$tmp/$asset"
+  candidate_version="$("$tmp/$asset" version 2>/dev/null || true)"
+  if [[ "$candidate_version" != "$VERSION" ]]; then
+    rm -rf "$tmp"
+    die "ETXR 数据面版本不匹配：需要 ${VERSION}，得到 ${candidate_version:-未知}"
+  fi
+
+  mkdir -p "$(dirname "$DATAPLANE_BIN")" "$BACKUP_DIR/dataplane-binary"
+  target_tmp="$(mktemp "$(dirname "$DATAPLANE_BIN")/.etxr-dataplane.XXXXXX")"
+  install -m 755 "$tmp/$asset" "$target_tmp"
+  if [[ -e "$DATAPLANE_BIN" ]]; then
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    backup="$BACKUP_DIR/dataplane-binary/etxr-dataplane-${stamp}"
+    cp -a "$DATAPLANE_BIN" "$backup"
+  fi
+  if ! mv -f "$target_tmp" "$DATAPLANE_BIN" ||
+     [[ "$("$DATAPLANE_BIN" version 2>/dev/null || true)" != "$VERSION" ]]; then
+    rm -f "$target_tmp"
+    if [[ -n "$backup" && -e "$backup" ]]; then
+      cp -a "$backup" "$DATAPLANE_BIN"
+    fi
+    rm -rf "$tmp"
+    die "安装 ETXR 数据面失败，已恢复旧版本"
+  fi
+  rm -rf "$tmp"
+  log "Installed ETXR data plane ${VERSION} (${arch})"
+}
+
+install_control_helper() {
+  local tmp
+  tmp="$(mktemp)"
+  # ETXR_CONTROL_HELPER_BEGIN
+  cat >"$tmp" <<'PY'
+#!/usr/bin/env python3
+import argparse
+import asyncio
+import hashlib
+import hmac
+import json
+import os
+import random
+import tempfile
+import time
+from pathlib import Path
+from urllib.parse import urlsplit
+
+import aiohttp
+from aiohttp import web
+
+MAX_CONFIG_BYTES = 1024 * 1024
+MAX_CLOCK_SKEW_SECONDS = 300
+
+
+def read_json(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def atomic_text(path, value):
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=target.name + ".", dir=target.parent
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def atomic_json(path, value):
+    atomic_text(
+        path,
+        json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n",
+    )
+
+
+class Hub:
+    def __init__(self, state_path, control_dir):
+        self.state_path = state_path
+        self.control_dir = Path(control_dir)
+        self.connection_limit = asyncio.Semaphore(128)
+
+    def node(self, node_id):
+        state = read_json(self.state_path)
+        for node in state.get("paired_nodes", []):
+            if node.get("name") == node_id:
+                return node
+        return None
+
+    def authorized(self, request, node):
+        supplied = request.headers.get("Authorization", "")
+        expected = "Bearer " + str(node.get("control_token", ""))
+        return hmac.compare_digest(supplied, expected)
+
+    def desired_bytes(self, node_id):
+        return (self.control_dir / "nodes" / f"{node_id}.json").read_bytes()
+
+    def save_report(self, node_id, report, request=None):
+        if not isinstance(report, dict):
+            raise ValueError("report must be an object")
+        if len(json.dumps(report, ensure_ascii=False)) > 128 * 1024:
+            raise ValueError("report is too large")
+        report_path = self.control_dir / "reports" / f"{node_id}.json"
+        try:
+            previous = read_json(report_path)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            previous = {}
+        if (
+            "usage" not in report
+            and isinstance(previous, dict)
+            and isinstance(previous.get("usage"), dict)
+        ):
+            report["usage"] = previous["usage"]
+        report["node_id"] = node_id
+        report["received_at"] = int(time.time())
+        if request is not None:
+            report["remote"] = request.remote
+        atomic_json(report_path, report)
+
+    async def health(self, request):
+        return web.json_response({"status": "ok"})
+
+    async def config(self, request):
+        node_id = request.match_info["node_id"]
+        node = self.node(node_id)
+        if node is None or not self.authorized(request, node):
+            raise web.HTTPUnauthorized()
+        try:
+            body = self.desired_bytes(node_id)
+        except FileNotFoundError:
+            raise web.HTTPNotFound()
+        signature = hmac.new(
+            node["control_token"].encode(), body, hashlib.sha256
+        ).hexdigest()
+        return web.Response(
+            body=body,
+            content_type="application/json",
+            headers={"X-ETXR-Signature": signature, "Cache-Control": "no-store"},
+        )
+
+    async def report(self, request):
+        node_id = request.match_info["node_id"]
+        node = self.node(node_id)
+        if node is None or not self.authorized(request, node):
+            raise web.HTTPUnauthorized()
+        try:
+            report = await request.json()
+        except (json.JSONDecodeError, aiohttp.ContentTypeError):
+            raise web.HTTPBadRequest()
+        try:
+            self.save_report(node_id, report, request)
+        except ValueError:
+            raise web.HTTPBadRequest()
+        return web.json_response({"status": "accepted"})
+
+    async def websocket(self, request):
+        if self.connection_limit.locked():
+            raise web.HTTPServiceUnavailable(text="too many control connections")
+        async with self.connection_limit:
+            return await self._websocket(request)
+
+    async def _websocket(self, request):
+        node_id = request.match_info["node_id"]
+        node = self.node(node_id)
+        if node is None or not self.authorized(request, node):
+            raise web.HTTPUnauthorized()
+        ws = web.WebSocketResponse(heartbeat=25)
+        await ws.prepare(request)
+        last_version = ""
+        last_heartbeat = 0.0
+        self.save_report(node_id, {"status": "connected"}, request)
+        while not ws.closed:
+            try:
+                desired = json.loads(self.desired_bytes(node_id))
+                version = str(desired["version"])
+                if version != last_version:
+                    await ws.send_json({"type": "update", "version": version})
+                    last_version = version
+            except (FileNotFoundError, KeyError, json.JSONDecodeError):
+                pass
+            now = time.monotonic()
+            if now - last_heartbeat >= 20:
+                await ws.send_json({"type": "heartbeat", "time": int(time.time())})
+                last_heartbeat = now
+            try:
+                message = await ws.receive(timeout=1)
+            except asyncio.TimeoutError:
+                continue
+            if message.type == aiohttp.WSMsgType.TEXT:
+                try:
+                    payload = json.loads(message.data)
+                except json.JSONDecodeError:
+                    continue
+                if payload.get("type") == "report":
+                    try:
+                        self.save_report(node_id, payload, request)
+                    except ValueError:
+                        continue
+            elif message.type in {
+                aiohttp.WSMsgType.CLOSE,
+                aiohttp.WSMsgType.CLOSED,
+                aiohttp.WSMsgType.ERROR,
+            }:
+                break
+        return ws
+
+    def app(self):
+        app = web.Application(client_max_size=1024 * 1024)
+        app.router.add_get("/health", self.health)
+        app.router.add_get("/ws/{node_id}", self.websocket)
+        app.router.add_get("/config/{node_id}", self.config)
+        app.router.add_post("/report/{node_id}", self.report)
+        return app
+
+
+class Agent:
+    def __init__(self, state_path, etxr_bin, usage_file):
+        self.state_path = state_path
+        self.etxr_bin = etxr_bin
+        self.usage_file = usage_file
+        self.version_path = str(Path(state_path).parent / "control-version")
+        self.issued_at_path = str(Path(state_path).parent / "control-issued-at")
+
+    def settings(self):
+        return read_json(self.state_path)["control"]["agent"]
+
+    def current_version(self):
+        try:
+            return Path(self.version_path).read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            return ""
+
+    def current_issued_at(self):
+        try:
+            value = Path(self.issued_at_path).read_text(encoding="utf-8").strip()
+            return int(value)
+        except (FileNotFoundError, ValueError):
+            return 0
+
+    def usage(self):
+        try:
+            value = read_json(self.usage_file)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {"updated_at": 0, "users": {}}
+        users = value.get("users", {})
+        if not isinstance(users, dict):
+            users = {}
+        return {
+            "updated_at": int(value.get("updated_at", 0)),
+            "users": users,
+        }
+
+    @staticmethod
+    def validate_base_url(value):
+        parsed = urlsplit(value)
+        if parsed.scheme == "https" and parsed.hostname:
+            return True
+        return parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+
+    async def report(self, session, base_url, node_id, payload):
+        payload = dict(payload)
+        payload["hostname"] = os.uname().nodename
+        payload["usage"] = self.usage()
+        try:
+            async with session.post(
+                f"{base_url}/report/{node_id}", json=payload
+            ) as response:
+                await response.read()
+        except aiohttp.ClientError:
+            pass
+
+    async def synchronize(self, session, expected_version=None):
+        settings = self.settings()
+        base_url = settings["base_url"].rstrip("/")
+        if not self.validate_base_url(base_url):
+            raise RuntimeError("control base_url must use HTTPS")
+        node_id = settings["node_id"]
+        token = settings["token"]
+        async with session.get(f"{base_url}/config/{node_id}") as response:
+            response.raise_for_status()
+            if (response.content_length is not None and
+                    response.content_length > MAX_CONFIG_BYTES):
+                raise RuntimeError("configuration response is too large")
+            body = await response.content.read(MAX_CONFIG_BYTES + 1)
+            if len(body) > MAX_CONFIG_BYTES:
+                raise RuntimeError("configuration response is too large")
+            signature = response.headers.get("X-ETXR-Signature", "")
+        calculated = hmac.new(token.encode(), body, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, calculated):
+            raise RuntimeError("configuration signature mismatch")
+        bundle = json.loads(body)
+        if bundle.get("node_id") != node_id or not isinstance(bundle.get("users"), list):
+            raise RuntimeError("invalid configuration bundle")
+        issued_at = bundle.get("issued_at")
+        if not isinstance(issued_at, int) or issued_at <= 0:
+            raise RuntimeError("configuration has no valid issue time")
+        if issued_at > int(time.time()) + MAX_CLOCK_SKEW_SECONDS:
+            raise RuntimeError("configuration issue time is in the future")
+        current_issued_at = self.current_issued_at()
+        if current_issued_at and issued_at < current_issued_at:
+            raise RuntimeError("refusing replayed configuration")
+        version = str(bundle.get("version", ""))
+        if expected_version and version != expected_version:
+            raise RuntimeError("configuration version changed during download")
+        if version == self.current_version():
+            if issued_at > current_issued_at:
+                atomic_text(self.issued_at_path, str(issued_at) + "\n")
+            await self.report(
+                session, base_url, node_id,
+                {"type": "report", "status": "current", "version": version},
+            )
+            return
+        env = dict(os.environ)
+        env["ETXR_AGENT_APPLY"] = "1"
+        process = await asyncio.create_subprocess_exec(
+            self.etxr_bin,
+            "control",
+            "apply",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        stdout, stderr = await process.communicate(
+            json.dumps(bundle["users"], separators=(",", ":")).encode()
+        )
+        if process.returncode != 0:
+            message = (stderr or stdout).decode(errors="replace")[-2000:]
+            await self.report(
+                session, base_url, node_id,
+                {"type": "report", "status": "failed", "version": version,
+                 "message": message},
+            )
+            raise RuntimeError(f"etxr apply failed with code {process.returncode}")
+        atomic_text(self.version_path, version + "\n")
+        atomic_text(self.issued_at_path, str(issued_at) + "\n")
+        await self.report(
+            session, base_url, node_id,
+            {"type": "report", "status": "applied", "version": version},
+        )
+
+    async def run(self):
+        backoff = 2
+        while True:
+            try:
+                settings = self.settings()
+                base_url = settings["base_url"].rstrip("/")
+                node_id = settings["node_id"]
+                token = settings["token"]
+                if not self.validate_base_url(base_url):
+                    raise RuntimeError("control base_url must use HTTPS")
+                ws_url = base_url.replace("https://", "wss://", 1).replace(
+                    "http://", "ws://", 1
+                )
+                headers = {"Authorization": "Bearer " + token}
+                timeout = aiohttp.ClientTimeout(total=None, connect=20, sock_read=360)
+                async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+                    async with session.ws_connect(
+                        f"{ws_url}/ws/{node_id}", heartbeat=25,
+                        max_msg_size=64 * 1024,
+                    ) as ws:
+                        backoff = 2
+                        next_check = time.monotonic() + 300
+                        next_report = time.monotonic() + 60
+                        while True:
+                            now = time.monotonic()
+                            receive_timeout = max(
+                                1.0, min(
+                                    60.0,
+                                    next_check - now,
+                                    next_report - now,
+                                )
+                            )
+                            try:
+                                message = await ws.receive(timeout=receive_timeout)
+                            except asyncio.TimeoutError:
+                                now = time.monotonic()
+                                if now >= next_check:
+                                    await self.synchronize(session)
+                                    next_check = time.monotonic() + 300
+                                if now >= next_report:
+                                    await self.report(
+                                        session, base_url, node_id,
+                                        {
+                                            "type": "report",
+                                            "status": "current",
+                                            "version": self.current_version(),
+                                        },
+                                    )
+                                    next_report = time.monotonic() + 60
+                                continue
+                            if message.type == aiohttp.WSMsgType.TEXT:
+                                payload = json.loads(message.data)
+                                if payload.get("type") == "update":
+                                    await self.synchronize(session, str(payload["version"]))
+                                    next_check = time.monotonic() + 300
+                            elif message.type in {
+                                aiohttp.WSMsgType.CLOSE,
+                                aiohttp.WSMsgType.CLOSED,
+                                aiohttp.WSMsgType.ERROR,
+                            }:
+                                break
+                            if time.monotonic() >= next_check:
+                                await self.synchronize(session)
+                                next_check = time.monotonic() + 300
+                            if time.monotonic() >= next_report:
+                                await self.report(
+                                    session, base_url, node_id,
+                                    {
+                                        "type": "report",
+                                        "status": "current",
+                                        "version": self.current_version(),
+                                    },
+                                )
+                                next_report = time.monotonic() + 60
+            except (aiohttp.ClientError, asyncio.TimeoutError, KeyError,
+                    json.JSONDecodeError, OSError, RuntimeError) as error:
+                print(f"etxr-agent: {error}", flush=True)
+            await asyncio.sleep(backoff + random.random())
+            backoff = min(backoff * 2, 60)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="mode", required=True)
+    hub_parser = subparsers.add_parser("hub")
+    hub_parser.add_argument("--state", required=True)
+    hub_parser.add_argument("--control-dir", required=True)
+    hub_parser.add_argument("--listen", default="127.0.0.1")
+    hub_parser.add_argument("--port", type=int, default=18180)
+    agent_parser = subparsers.add_parser("agent")
+    agent_parser.add_argument("--state", required=True)
+    agent_parser.add_argument("--etxr-bin", default="/usr/local/sbin/etxr")
+    agent_parser.add_argument(
+        "--usage-file", default="/var/lib/etxr/usage.json"
+    )
+    args = parser.parse_args()
+    if args.mode == "hub":
+        hub = Hub(args.state, args.control_dir)
+        web.run_app(hub.app(), host=args.listen, port=args.port, access_log=None)
+    else:
+        asyncio.run(Agent(args.state, args.etxr_bin, args.usage_file).run())
+
+
+if __name__ == "__main__":
+    main()
+PY
+  # ETXR_CONTROL_HELPER_END
+  mkdir -p "$(dirname "$CONTROL_HELPER")"
+  install -m 755 "$tmp" "$CONTROL_HELPER"
+  rm -f "$tmp"
+}
+
+ensure_control_runtime() {
+  need_root
+  if ! python3 -c 'import aiohttp' >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y python3 python3-aiohttp
+  fi
+  install_control_helper
+  python3 -m py_compile "$CONTROL_HELPER"
+}
+
+write_systemd_units() {
+  local xray_after="network-online.target" xray_wants="network-online.target"
+  local xray_prestart=""
+  if [[ "$(jq -r '.easytier.enabled // false' "$STATE_FILE")" == "true" ]]; then
+    local et_ip
+    xray_after+=" etxr-easytier.service"
+    xray_wants+=" etxr-easytier.service"
+    et_ip="$(jq -r '.easytier.ipv4' "$STATE_FILE")"
+    valid_ipv4 "$et_ip" || die "Invalid EasyTier IPv4 in state"
+    local wait_helper wait_helper_tmp
+    wait_helper="$WAIT_IP_HELPER"
+    wait_helper_tmp="$(mktemp)"
+    cat >"$wait_helper_tmp" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ip_addr="${1:-}"
+[[ "$ip_addr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 2
+for _ in $(seq 1 30); do
+  ip -4 address show | grep -Fq "inet ${ip_addr}/" && exit 0
+  sleep 1
+done
+exit 1
+EOF
+    run install -D -m 755 "$wait_helper_tmp" "$wait_helper"
+    rm -f "$wait_helper_tmp"
+    xray_prestart="ExecStartPre=${wait_helper} ${et_ip}"
+  fi
+  if jq -e 'any(.users[]?;
+    ((.speed_limit.up_mbps // 0) > 0) or
+    ((.speed_limit.down_mbps // 0) > 0)
+  )' "$STATE_FILE" >/dev/null; then
+    xray_after+=" etxr-limiter.service"
+    xray_wants+=" etxr-limiter.service"
+  fi
+  mkdir -p "$SYSTEMD_UNIT_DIR"
+  cat <<EOF | run tee "$SYSTEMD_UNIT_DIR/etxr-xray.service" >/dev/null
+[Unit]
+Description=ETXR Xray
+After=${xray_after}
+Wants=${xray_wants}
+
+[Service]
+Type=simple
+User=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+${xray_prestart}
+ExecStart=${XRAY_BIN} run -config $(jq -r '.xray.config_path' "$STATE_FILE")
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  cat <<EOF | run tee "$SYSTEMD_UNIT_DIR/etxr-sing-box.service" >/dev/null
+[Unit]
+Description=ETXR Hysteria2 (sing-box)
+After=network-online.target etxr-xray.service
+Wants=network-online.target etxr-xray.service
+
+[Service]
+Type=simple
+User=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ExecStart=${SING_BOX_BIN} run -c $(jq -r '.hysteria2.config_path' "$STATE_FILE")
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  cat <<EOF | run tee "$SYSTEMD_UNIT_DIR/etxr-limiter.service" >/dev/null
+[Unit]
+Description=ETXR per-user TCP/UDP bandwidth limiter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LoadCredential=limits.json:${LIMITER_CONFIG}
+ExecStart=${DATAPLANE_BIN} limiter --config %d/limits.json
+Restart=on-failure
+RestartSec=2s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  cat <<EOF | run tee "$SYSTEMD_UNIT_DIR/etxr-meter.service" >/dev/null
+[Unit]
+Description=ETXR per-user traffic meter
+After=etxr-xray.service etxr-sing-box.service
+Wants=etxr-xray.service
+
+[Service]
+Type=simple
+User=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=$(dirname "$USAGE_FILE")
+ExecStart=${DATAPLANE_BIN} meter --state ${STATE_FILE} --usage-file ${USAGE_FILE} --xray-bin ${XRAY_BIN} --interval 30
+Restart=always
+RestartSec=3s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  if [[ "$(jq -r '.easytier.enabled // false' "$STATE_FILE")" == "true" ]]; then
+    local et_ip et_name et_secret et_peer et_port et_hostname et_config_tmp
+    et_ip="$(jq -r '.easytier.ipv4' "$STATE_FILE")"
+    et_name="$(jq -r '.easytier.network_name' "$STATE_FILE")"
+    et_secret="$(jq -r '.easytier.network_secret' "$STATE_FILE")"
+    et_peer="$(jq -r '.easytier.peer // ""' "$STATE_FILE")"
+    et_port="$(jq -r '.easytier.tcp_port // 11010' "$STATE_FILE")"
+    et_hostname="$(jq -r '.node.name' "$STATE_FILE")"
+    valid_ipv4 "$et_ip" || die "Invalid EasyTier IPv4 in state"
+    valid_secret_value "$et_name" || die "Invalid EasyTier network name in state"
+    valid_secret_value "$et_secret" || die "Invalid EasyTier network secret in state"
+    valid_port "$et_port" || die "Invalid EasyTier TCP port in state"
+    valid_absolute_path "$EASYTIER_CONFIG" || die "Invalid EasyTier config path"
+    [[ -z "$et_peer" || "$et_peer" =~ ^[A-Za-z0-9.-]+:[0-9]+$ ]] ||
+      die "Invalid EasyTier peer in state"
+    et_config_tmp="$(mktemp)"
+    {
+      printf 'ipv4 = "%s"\n' "$et_ip"
+      printf 'hostname = "%s"\n' "$et_hostname"
+      if [[ -n "$et_peer" ]]; then
+        printf 'listeners = []\n'
+        printf '\n[[peer]]\n'
+        printf 'uri = "tcp://%s"\n' "$et_peer"
+      else
+        printf 'listeners = ["tcp://0.0.0.0:%s"]\n' "$et_port"
+      fi
+      printf '\n[network_identity]\n'
+      printf 'network_name = "%s"\n' "$et_name"
+      printf 'network_secret = "%s"\n' "$et_secret"
+      printf '\n[flags]\n'
+      printf 'private_mode = true\n'
+      printf 'enable_ipv6 = false\n'
+      printf 'enable_encryption = true\n'
+      printf 'encryption_algorithm = "aes-gcm"\n'
+    } >"$et_config_tmp"
+    chmod 600 "$et_config_tmp"
+    if [[ -x "$EASYTIER_CORE_BIN" ]]; then
+      "$EASYTIER_CORE_BIN" --check-config --config-file "$et_config_tmp" || {
+        rm -f "$et_config_tmp"
+        die "EasyTier 配置检查失败"
+      }
+    fi
+    ensure_parent "$EASYTIER_CONFIG"
+    run install -m 600 "$et_config_tmp" "$EASYTIER_CONFIG"
+    rm -f "$et_config_tmp"
+    cat <<EOF | run tee "$SYSTEMD_UNIT_DIR/etxr-easytier.service" >/dev/null
+[Unit]
+Description=ETXR EasyTier
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ExecStart=${EASYTIER_CORE_BIN} --config-file ${EASYTIER_CONFIG} --console-log-level warn
+Restart=always
+RestartSec=3s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  fi
+
+  if [[ "$(jq -r '.control.enabled // false' "$STATE_FILE")" == "true" ]]; then
+    cat <<EOF | run tee "$SYSTEMD_UNIT_DIR/etxr-control.service" >/dev/null
+[Unit]
+Description=ETXR WSS Control Hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ExecStart=/usr/bin/python3 ${CONTROL_HELPER} hub --state ${STATE_FILE} --control-dir ${CONTROL_DIR} --listen 127.0.0.1 --port $(jq -r '.control.port' "$STATE_FILE")
+Restart=always
+RestartSec=3s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  fi
+
+  if [[ "$(jq -r '.control.agent.enabled // false' "$STATE_FILE")" == "true" ]]; then
+    cat <<EOF | run tee "$SYSTEMD_UNIT_DIR/etxr-agent.service" >/dev/null
+[Unit]
+Description=ETXR WSS Configuration Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ExecStart=/usr/bin/python3 ${CONTROL_HELPER} agent --state ${STATE_FILE} --etxr-bin /usr/local/sbin/etxr --usage-file ${USAGE_FILE}
+Restart=always
+RestartSec=3s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  fi
+}
+
+configure_ufw_from_state() {
+  command -v ufw >/dev/null 2>&1 || return 0
+  ufw status 2>/dev/null | grep -q '^Status: active' || return 0
+  local role port source
+  local ufw_state="${RUNTIME_DIR}/ufw-rules.tsv"
+  if [[ -f "$ufw_state" ]]; then
+    while IFS=$'\t' read -r port source; do
+      [[ -n "$port" ]] || continue
+      if [[ "$source" == "udp" ]]; then
+        ufw delete allow "${port}/udp" >/dev/null 2>&1 || true
+      elif [[ "$source" == "tcp" ]]; then
+        ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true
+      else
+        ufw delete allow from "${source%/32}" to any port "$port" proto tcp \
+          >/dev/null 2>&1 || true
+      fi
+    done <"$ufw_state"
+  fi
+  ensure_parent "$ufw_state"
+  : >"$ufw_state"
+  ufw_add_tcp() {
+    local add_port="$1" add_source="${2:-}"
+    if [[ -n "$add_source" ]]; then
+      ufw allow from "${add_source%/32}" to any port "$add_port" proto tcp >/dev/null
+      printf '%s\t%s\n' "$add_port" "$add_source" >>"$ufw_state"
+    else
+      ufw allow "${add_port}/tcp" >/dev/null
+      printf '%s\ttcp\n' "$add_port" >>"$ufw_state"
+    fi
+  }
+  ufw_add_udp() {
+    local add_port="$1"
+    ufw allow "${add_port}/udp" >/dev/null
+    printf '%s\tudp\n' "$add_port" >>"$ufw_state"
+  }
+  role="$(jq -r '.node.role' "$STATE_FILE")"
+  if [[ "$(jq -r '.easytier.enabled // false' "$STATE_FILE")" == "true" &&
+        ( "$role" == "gateway" || "$role" == "hybrid" ) ]]; then
+    port="$(jq -r '.easytier.tcp_port // 11010' "$STATE_FILE")"
+    ufw_add_tcp "$port"
+  fi
+  while IFS=$'\t' read -r port source; do
+    [[ -n "$port" ]] || continue
+    if [[ -n "$source" ]]; then
+      ufw_add_tcp "$port" "$source"
+    else
+      ufw_add_tcp "$port"
+    fi
+  done < <(jq -r '.xray.relay_inbounds[]? |
+    select(.public == true) | [.port, (.allowed_source // "")] | @tsv' "$STATE_FILE")
+  while IFS= read -r port; do
+    [[ -n "$port" ]] || continue
+    ufw_add_tcp "$port"
+  done < <(jq -r '
+    .xray.reality_inbounds[]? |
+    if (.listen // "0.0.0.0") == "127.0.0.1" then empty
+    else .port end
+  ' "$STATE_FILE")
+  while IFS= read -r port; do
+    [[ -n "$port" ]] || continue
+    ufw_add_tcp "$port"
+  done < <(jq -r '.xray.routes[]? | select(.direct == true) | .port' "$STATE_FILE")
+  if [[ "$(jq -r '.hysteria2.enabled' "$STATE_FILE")" == "true" ]]; then
+    port="$(jq -r '.hysteria2.port' "$STATE_FILE")"
+    ufw_add_udp "$port"
+  fi
+}
+
+check_standalone_nginx_takeover() {
+  [[ "$(jq -r '.nginx.mode' "$STATE_FILE")" == "standalone" ]] || return 0
+  local target
+  target="$(jq -r '.nginx.standalone_path' "$STATE_FILE")"
+  if command -v grep >/dev/null 2>&1; then
+    local hits
+    local -a nginx_scan_dirs=()
+    [[ -d /etc/nginx ]] && nginx_scan_dirs+=(/etc/nginx)
+    [[ -d /www/server/panel/vhost/nginx ]] &&
+      nginx_scan_dirs+=(/www/server/panel/vhost/nginx)
+    if ((${#nginx_scan_dirs[@]})); then
+      hits="$(grep -RIlE '^[[:space:]]*listen[[:space:]].*(80|443)([[:space:];]|$)' \
+        "${nginx_scan_dirs[@]}" 2>/dev/null | grep -vFx "$target" || true)"
+    else
+      hits=""
+    fi
+    if [[ -n "$hits" && "$FORCE" -ne 1 ]]; then
+      printf '%s\n' "$hits" >&2
+      die "Existing nginx 443 vhosts found. Use snippet mode, or inspect and rerun with --force."
+    fi
+  fi
+}
+
+cmd_apply() {
+  need_root
+  require_state
+  state_lock_acquire
+  cmd_render --out "$GENERATED_DIR" ||
+    die "配置生成失败，已停止应用"
+  validate_state_semantics ||
+    die "状态语义检查失败，已停止应用"
+  check_standalone_nginx_takeover ||
+    die "nginx 接管检查失败，已停止应用"
+
+  local xray_config sing_config mode nginx_target nginx_paths_target="" nb
+  local nginx_stream_target="" nginx_previous="" nginx_paths_previous=""
+  local rollback_dir="" rollback_service
+  xray_config="$(jq -r '.xray.config_path' "$STATE_FILE")"
+  sing_config="$(jq -r '.hysteria2.config_path' "$STATE_FILE")"
+  mode="$(jq -r '.nginx.mode' "$STATE_FILE")"
+
+  if (( ! DRY_RUN )); then
+    rollback_dir="$(mktemp -d "$RUNTIME_DIR/.apply.XXXXXX")"
+    [[ ! -e "$xray_config" ]] || cp -a "$xray_config" "$rollback_dir/xray"
+    [[ ! -e "$sing_config" ]] || cp -a "$sing_config" "$rollback_dir/sing-box"
+    [[ ! -e "$LIMITER_CONFIG" ]] ||
+      cp -a "$LIMITER_CONFIG" "$rollback_dir/limits.json"
+    [[ ! -e "$EASYTIER_CONFIG" ]] ||
+      cp -a "$EASYTIER_CONFIG" "$rollback_dir/easytier.toml"
+    if [[ "$(jq -r '.nginx.shared_tcp443 // false' "$STATE_FILE")" == "true" ]]; then
+      nginx_stream_target="$(jq -r '.nginx.stream_path' "$STATE_FILE")"
+      [[ ! -e "$nginx_stream_target" ]] ||
+        cp -a "$nginx_stream_target" "$rollback_dir/nginx-stream"
+    fi
+    if [[ -d "$SUBSCRIPTION_DIR" ]]; then
+      : >"$rollback_dir/subscriptions.existed"
+      cp -a "$SUBSCRIPTION_DIR" "$rollback_dir/subscriptions"
+    fi
+    for rollback_service in etxr-easytier etxr-limiter etxr-xray etxr-sing-box etxr-meter etxr-control etxr-agent; do
+      if systemctl is-active --quiet "${rollback_service}.service" 2>/dev/null; then
+        : >"$rollback_dir/${rollback_service}.active"
+      fi
+      if systemctl is-enabled --quiet "${rollback_service}.service" 2>/dev/null; then
+        : >"$rollback_dir/${rollback_service}.enabled"
+      fi
+      if [[ -e "$SYSTEMD_UNIT_DIR/${rollback_service}.service" ]]; then
+        cp -a "$SYSTEMD_UNIT_DIR/${rollback_service}.service" \
+          "$rollback_dir/${rollback_service}.unit"
+      fi
+    done
+  fi
+
+  rollback_apply() {
+    (( DRY_RUN )) && return 0
+    if [[ -e "$rollback_dir/xray" ]]; then
+      rm -f "$xray_config"
+      cp -a "$rollback_dir/xray" "$xray_config"
+    else
+      rm -f "$xray_config"
+    fi
+    if [[ -e "$rollback_dir/sing-box" ]]; then
+      rm -f "$sing_config"
+      cp -a "$rollback_dir/sing-box" "$sing_config"
+    else
+      rm -f "$sing_config"
+    fi
+    if [[ -e "$rollback_dir/limits.json" ]]; then
+      rm -f "$LIMITER_CONFIG"
+      cp -a "$rollback_dir/limits.json" "$LIMITER_CONFIG"
+    else
+      rm -f "$LIMITER_CONFIG"
+    fi
+    if [[ -e "$rollback_dir/easytier.toml" ]]; then
+      rm -f "$EASYTIER_CONFIG"
+      cp -a "$rollback_dir/easytier.toml" "$EASYTIER_CONFIG"
+    else
+      rm -f "$EASYTIER_CONFIG"
+    fi
+    rm -rf "$SUBSCRIPTION_DIR"
+    if [[ -f "$rollback_dir/subscriptions.existed" &&
+          -d "$rollback_dir/subscriptions" ]]; then
+      cp -a "$rollback_dir/subscriptions" "$SUBSCRIPTION_DIR"
+    fi
+    if [[ -n "$nginx_target" ]]; then
+      if [[ -n "$nginx_previous" ]]; then
+        cp -a "$nginx_previous" "$nginx_target"
+      else
+        rm -f "$nginx_target"
+      fi
+    fi
+    if [[ -n "$nginx_paths_target" ]]; then
+      if [[ -n "$nginx_paths_previous" ]]; then
+        cp -a "$nginx_paths_previous" "$nginx_paths_target"
+      else
+        rm -f "$nginx_paths_target"
+      fi
+    fi
+    if [[ -n "$nginx_stream_target" ]]; then
+      if [[ -e "$rollback_dir/nginx-stream" ]]; then
+        cp -a "$rollback_dir/nginx-stream" "$nginx_stream_target"
+      else
+        rm -f "$nginx_stream_target"
+      fi
+    fi
+    systemctl daemon-reload 2>/dev/null || true
+    for rollback_service in etxr-easytier etxr-limiter etxr-xray etxr-sing-box etxr-meter etxr-control etxr-agent; do
+      if [[ -f "$rollback_dir/${rollback_service}.unit" ]]; then
+        cp -a "$rollback_dir/${rollback_service}.unit" \
+          "$SYSTEMD_UNIT_DIR/${rollback_service}.service"
+      else
+        rm -f "$SYSTEMD_UNIT_DIR/${rollback_service}.service"
+      fi
+    done
+    systemctl daemon-reload 2>/dev/null || true
+    for rollback_service in etxr-easytier etxr-limiter etxr-xray etxr-sing-box etxr-meter etxr-control etxr-agent; do
+      if [[ -f "$rollback_dir/${rollback_service}.enabled" ]]; then
+        systemctl enable "${rollback_service}.service" 2>/dev/null || true
+      else
+        systemctl disable "${rollback_service}.service" 2>/dev/null || true
+      fi
+      if [[ -f "$rollback_dir/${rollback_service}.active" ]]; then
+        systemctl restart "${rollback_service}.service" 2>/dev/null || true
+      else
+        systemctl stop "${rollback_service}.service" 2>/dev/null || true
+      fi
+    done
+    if [[ "$mode" != "disabled" && -n "${nb:-}" ]]; then
+      "$nb" -t >/dev/null 2>&1 && "$nb" -s reload >/dev/null 2>&1 || true
+    fi
+    rm -rf "$rollback_dir"
+    rollback_dir=""
+  }
+
+  [[ -x "$XRAY_BIN" ]] || die "Install Xray before apply"
+  "$XRAY_BIN" run -test -config "$GENERATED_DIR/xray.json" ||
+    die "Xray 配置检查失败，未写入 live 配置"
+  if [[ "$(jq -r '.hysteria2.enabled' "$STATE_FILE")" == "true" ]]; then
+    [[ -x "$SING_BOX_BIN" ]] || die "Install sing-box before enabling Hysteria2"
+    "$SING_BOX_BIN" check -c "$GENERATED_DIR/sing-box.json" ||
+      die "sing-box 配置检查失败，未写入 live 配置"
+  fi
+  if (( ! DRY_RUN )); then
+    install_data_helper
+  fi
+  if [[ "$(jq -r '(.control.enabled // false) or (.control.agent.enabled // false)' "$STATE_FILE")" == "true" ]] &&
+     (( ! DRY_RUN )); then
+    ensure_control_runtime
+  fi
+  if [[ "$mode" != "disabled" ]]; then
+    nb="$(nginx_bin)" || die "nginx not found"
+    if [[ "$(jq -r '.nginx.shared_tcp443 // false' "$STATE_FILE")" == "true" ]]; then
+      check_baota_shared_nginx_layout "$nb"
+    fi
+    "$nb" -t || die "现有 nginx 配置检查失败，已停止应用"
+  fi
+
+  cmd_backup
+  ensure_parent "$xray_config"
+  if [[ "$GENERATED_DIR/xray.json" != "$xray_config" ]]; then
+    run install -m 600 "$GENERATED_DIR/xray.json" "$xray_config" ||
+      { rollback_apply; die "写入 Xray live 配置失败"; }
+  fi
+
+  if [[ "$(jq -r '.hysteria2.enabled' "$STATE_FILE")" == "true" ]]; then
+    ensure_parent "$sing_config"
+    if [[ "$GENERATED_DIR/sing-box.json" != "$sing_config" ]]; then
+      run install -m 600 "$GENERATED_DIR/sing-box.json" "$sing_config" ||
+        { rollback_apply; die "写入 sing-box live 配置失败"; }
+    fi
+  fi
+  ensure_parent "$LIMITER_CONFIG"
+  if [[ "$GENERATED_DIR/limits.json" != "$LIMITER_CONFIG" ]]; then
+    run install -m 600 "$GENERATED_DIR/limits.json" "$LIMITER_CONFIG" ||
+      { rollback_apply; die "写入单用户限速配置失败"; }
+  fi
+
+  if [[ "$mode" == "disabled" ]]; then
+    nginx_target=""
+  elif [[ "$mode" == "snippet" ]]; then
+    nginx_target="$(jq -r '.nginx.snippet_path' "$STATE_FILE")"
+    [[ -n "$nginx_target" ]] || die "nginx.snippet_path is empty"
+    ensure_parent "$nginx_target"
+  else
+    nginx_target="$(jq -r '.nginx.standalone_path' "$STATE_FILE")"
+    nginx_paths_target="$(jq -r '.nginx.paths_path // "/etc/etxr/live/nginx-paths.conf"' "$STATE_FILE")"
+    ensure_parent "$nginx_target"
+    ensure_parent "$nginx_paths_target"
+  fi
+  if [[ "$(jq -r '.nginx.shared_tcp443 // false' "$STATE_FILE")" == "true" ]]; then
+    nginx_stream_target="$(jq -r '.nginx.stream_path' "$STATE_FILE")"
+    [[ -n "$nginx_stream_target" ]] || die "nginx.stream_path is empty"
+    ensure_parent "$nginx_stream_target"
+  fi
+
+  if [[ -n "$nginx_target" && -e "$nginx_target" ]]; then
+    nginx_previous="$(mktemp)"
+    cp -a "$nginx_target" "$nginx_previous"
+  fi
+  if [[ -n "$nginx_paths_target" && -e "$nginx_paths_target" ]]; then
+    nginx_paths_previous="$(mktemp)"
+    cp -a "$nginx_paths_target" "$nginx_paths_previous"
+  fi
+  if [[ "$mode" == "disabled" ]]; then
+    :
+  elif [[ "$mode" == "snippet" ]]; then
+    run install -m 600 "$GENERATED_DIR/nginx-paths.conf" "$nginx_target" ||
+      { rollback_apply; die "写入宝塔 nginx extension 配置失败"; }
+  else
+    run install -m 600 "$GENERATED_DIR/nginx-paths.conf" "$nginx_paths_target" ||
+      { rollback_apply; die "写入 nginx Path 配置失败"; }
+    run install -m 600 "$GENERATED_DIR/nginx-standalone.conf" "$nginx_target" ||
+      { rollback_apply; die "写入 nginx 站点配置失败"; }
+  fi
+  if [[ -n "$nginx_stream_target" ]]; then
+    run install -m 600 "$GENERATED_DIR/nginx-stream.conf" "$nginx_stream_target" ||
+      { rollback_apply; die "写入宝塔 nginx stream 配置失败"; }
+  fi
+
+  mkdir -p "$SUBSCRIPTION_DIR"
+  [[ -n "$SUBSCRIPTION_DIR" && "$SUBSCRIPTION_DIR" != "/" ]] ||
+    { rollback_apply; die "Unsafe subscription directory"; }
+  if (( ! DRY_RUN )); then
+    find "$SUBSCRIPTION_DIR" -mindepth 1 -maxdepth 1 -type f -delete
+  fi
+  run cp -a "$GENERATED_DIR/subscriptions/." "$SUBSCRIPTION_DIR/"
+  # Keep subscription contents private while allowing the nginx worker group
+  # to traverse and read the token-named files.
+  local subscription_group=www-data
+  getent passwd www >/dev/null 2>&1 && subscription_group=www
+  run chown root:"$subscription_group" "$(dirname "$SUBSCRIPTION_DIR")" "$SUBSCRIPTION_DIR" ||
+    { rollback_apply; die "设置订阅目录属主失败"; }
+  run chmod 751 "$(dirname "$SUBSCRIPTION_DIR")"
+  run chmod 750 "$SUBSCRIPTION_DIR" ||
+    { rollback_apply; die "设置订阅目录权限失败"; }
+  if (( ! DRY_RUN )); then
+    find "$SUBSCRIPTION_DIR" -mindepth 1 -maxdepth 1 -type f \
+      -exec chown root:"$subscription_group" {} + \
+      -exec chmod 640 {} + || { rollback_apply; die "设置订阅文件权限失败"; }
+  fi
+  write_systemd_units || { rollback_apply; die "写入 systemd 服务失败"; }
+
+  if (( ! DRY_RUN )); then
+    if [[ "$mode" != "disabled" ]] && ! "$nb" -t; then
+      warn "New nginx configuration is invalid; rolling back"
+      rollback_apply
+      "$nb" -t || true
+      die "nginx validation failed; previous configuration restored"
+    fi
+    systemctl daemon-reload
+    configure_ufw_from_state
+    if [[ "$(jq -r '.easytier.enabled // false' "$STATE_FILE")" == "true" ]]; then
+      [[ -x "$EASYTIER_CORE_BIN" ]] || die "Install EasyTier before apply"
+    fi
+    if [[ "$(jq -r '.easytier.enabled // false' "$STATE_FILE")" == "true" ]]; then
+      systemctl enable --now etxr-easytier.service ||
+        { rollback_apply; die "EasyTier 服务启动失败"; }
+      systemctl restart etxr-easytier.service ||
+        { rollback_apply; die "EasyTier 服务重启失败"; }
+      local et_ip wait_count
+      et_ip="$(jq -r '.easytier.ipv4' "$STATE_FILE")"
+      for ((wait_count=1; wait_count<=20; wait_count++)); do
+        ip address show 2>/dev/null | grep -qF "$et_ip" && break
+        sleep 1
+      done
+    fi
+    local limited_users_count
+    limited_users_count="$(jq '[
+      .users[] |
+      select(
+        .enabled == true and
+        (((.speed_limit.up_mbps // 0) > 0) or
+         ((.speed_limit.down_mbps // 0) > 0))
+      )
+    ] | length' "$STATE_FILE")"
+    if (( limited_users_count > 0 )); then
+      systemctl enable --now etxr-limiter.service ||
+        { rollback_apply; die "单用户限速服务启动失败"; }
+      systemctl restart etxr-limiter.service ||
+        { rollback_apply; die "单用户限速服务重启失败"; }
+    else
+      systemctl disable --now etxr-limiter.service 2>/dev/null || true
+    fi
+    systemctl enable --now etxr-xray.service ||
+      { rollback_apply; die "Xray 服务启动失败"; }
+    systemctl restart etxr-xray.service ||
+      { rollback_apply; die "Xray 服务重启失败"; }
+
+    if [[ "$(jq -r '.hysteria2.enabled' "$STATE_FILE")" == "true" ]]; then
+      systemctl enable --now etxr-sing-box.service ||
+        { rollback_apply; die "sing-box 服务启动失败"; }
+      systemctl restart etxr-sing-box.service ||
+        { rollback_apply; die "sing-box 服务重启失败"; }
+    else
+      systemctl disable --now etxr-sing-box.service 2>/dev/null || true
+    fi
+
+    mkdir -p "$(dirname "$USAGE_FILE")"
+    systemctl enable --now etxr-meter.service ||
+      { rollback_apply; die "单用户流量统计服务启动失败"; }
+    systemctl restart etxr-meter.service ||
+      { rollback_apply; die "单用户流量统计服务重启失败"; }
+
+    if [[ "$(jq -r '.control.enabled // false' "$STATE_FILE")" == "true" ]]; then
+      systemctl enable --now etxr-control.service ||
+        { rollback_apply; die "WSS 控制服务启动失败"; }
+      systemctl restart etxr-control.service ||
+        { rollback_apply; die "WSS 控制服务重启失败"; }
+    else
+      systemctl disable --now etxr-control.service 2>/dev/null || true
+    fi
+
+    if [[ "$(jq -r '.control.agent.enabled // false' "$STATE_FILE")" == "true" ]]; then
+      if [[ "${ETXR_AGENT_APPLY:-0}" != "1" ]]; then
+        systemctl enable --now etxr-agent.service ||
+          { rollback_apply; die "WSS 配置 Agent 启动失败"; }
+        systemctl restart etxr-agent.service ||
+          { rollback_apply; die "WSS 配置 Agent 重启失败"; }
+      fi
+    else
+      systemctl disable --now etxr-agent.service 2>/dev/null || true
+    fi
+
+    [[ "$mode" == "disabled" ]] || "$nb" -s reload ||
+      { rollback_apply; die "nginx reload 失败"; }
+  fi
+  [[ -z "$nginx_previous" ]] || rm -f "$nginx_previous"
+  [[ -z "$nginx_paths_previous" ]] || rm -f "$nginx_paths_previous"
+  [[ -z "$rollback_dir" ]] || rm -rf "$rollback_dir"
+  state_lock_release
+  log "Configuration applied"
+}
+
+detect_arch_xray() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo 64 ;;
+    aarch64|arm64) echo arm64-v8a ;;
+    *) die "Unsupported Xray architecture: $(uname -m)" ;;
+  esac
+}
+
+detect_arch_singbox() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo amd64 ;;
+    aarch64|arm64) echo arm64 ;;
+    *) die "Unsupported sing-box architecture: $(uname -m)" ;;
+  esac
+}
+
+detect_arch_easytier() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo x86_64 ;;
+    aarch64|arm64) echo aarch64 ;;
+    *) die "Unsupported EasyTier architecture: $(uname -m)" ;;
+  esac
+}
+
+detect_arch_dataplane() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo amd64 ;;
+    aarch64|arm64) echo arm64 ;;
+    *) die "Unsupported ETXR data-plane architecture: $(uname -m)" ;;
+  esac
+}
+
+archive_entry_safe() {
+  local entry="$1"
+  [[ -n "$entry" && "$entry" != /* && "$entry" != *\\* &&
+     "$entry" != *".."* && "$entry" != *$'\n'* ]]
+}
+
+verify_zip_entries() {
+  local archive="$1" entry
+  while IFS= read -r entry; do
+    archive_entry_safe "$entry" || die "Unsafe ZIP archive entry: $entry"
+  done < <(unzip -Z1 "$archive")
+}
+
+verify_tar_entries() {
+  local archive="$1" entry
+  while IFS= read -r entry; do
+    archive_entry_safe "$entry" || die "Unsafe TAR archive entry: $entry"
+  done < <(tar -tzf "$archive")
+  while IFS= read -r entry; do
+    case "${entry:0:1}" in
+      l|h) die "Unsafe TAR link entry: $entry" ;;
+    esac
+  done < <(LC_ALL=C tar -tvzf "$archive")
+}
+
+download_xray_release() {
+  local destination="$1"
+  local arch api version url dgst_url expected actual
+  arch="$(detect_arch_xray)"
+  api="$(curl --proto '=https' --tlsv1.2 -fsSL \
+    https://api.github.com/repos/XTLS/Xray-core/releases/latest)"
+  version="$(jq -r '.tag_name' <<<"$api")"
+  url="$(jq -r --arg n "Xray-linux-${arch}.zip" '.assets[] | select(.name == $n) | .browser_download_url' <<<"$api")"
+  dgst_url="$(jq -r --arg n "Xray-linux-${arch}.zip.dgst" '.assets[] | select(.name == $n) | .browser_download_url' <<<"$api")"
+  [[ -n "$url" && "$url" != "null" ]] || die "Xray release asset not found"
+  mkdir -p "$destination"
+  curl --proto '=https' --tlsv1.2 -fL "$url" -o "$destination/xray.zip"
+  if [[ -n "$dgst_url" && "$dgst_url" != "null" ]]; then
+    curl --proto '=https' --tlsv1.2 -fL "$dgst_url" -o "$destination/xray.zip.dgst"
+    expected="$(awk 'tolower($0) ~ /sha256/ {print $NF; exit}' "$destination/xray.zip.dgst")"
+    actual="$(sha256sum "$destination/xray.zip" | awk '{print $1}')"
+    [[ "$expected" =~ ^[0-9a-fA-F]{64}$ && "${expected,,}" == "${actual,,}" ]] ||
+      die "Xray SHA256 校验失败"
+  else
+    die "Xray release 没有 SHA256 校验文件"
+  fi
+  verify_zip_entries "$destination/xray.zip"
+  mkdir -p "$destination/unpacked"
+  unzip -q "$destination/xray.zip" -d "$destination/unpacked"
+  find "$destination/unpacked" -type l -print -quit |
+    grep -q . && die "Unsafe ZIP symlink entry"
+  printf '%s\n' "$version" >"$destination/VERSION"
+}
+
+install_xray() {
+  local tmp version
+  tmp="$(mktemp -d)"
+  download_xray_release "$tmp"
+  version="$(cat "$tmp/VERSION")"
+  install -m 755 "$tmp/unpacked/xray" "$XRAY_BIN"
+  mkdir -p /usr/local/share/xray
+  [[ ! -f "$tmp/unpacked/geoip.dat" ]] || install -m 644 "$tmp/unpacked/geoip.dat" /usr/local/share/xray/
+  [[ ! -f "$tmp/unpacked/geosite.dat" ]] || install -m 644 "$tmp/unpacked/geosite.dat" /usr/local/share/xray/
+  rm -rf "$tmp"
+  log "Installed Xray $version"
+}
+
+install_sing_box() {
+  local arch api version bare asset url checksums_url tmp expected actual
+  arch="$(detect_arch_singbox)"
+  api="$(curl --proto '=https' --tlsv1.2 -fsSL \
+    https://api.github.com/repos/SagerNet/sing-box/releases/latest)"
+  version="$(jq -r '.tag_name' <<<"$api")"
+  bare="${version#v}"
+  asset="sing-box-${bare}-linux-${arch}.tar.gz"
+  url="$(jq -r --arg n "$asset" '.assets[] | select(.name == $n) | .browser_download_url' <<<"$api")"
+  checksums_url="$(jq -r '.assets[] | select(.name | test("checksums.*txt$")) | .browser_download_url' <<<"$api" | head -n1)"
+  [[ -n "$url" && "$url" != "null" ]] || die "sing-box release asset not found"
+  tmp="$(mktemp -d)"
+  curl --proto '=https' --tlsv1.2 -fL "$url" -o "$tmp/$asset"
+  if [[ -n "$checksums_url" && "$checksums_url" != "null" ]]; then
+    curl --proto '=https' --tlsv1.2 -fL "$checksums_url" -o "$tmp/checksums.txt"
+    expected="$(awk -v n="$asset" '$2 == n {print $1}' "$tmp/checksums.txt")"
+    actual="$(sha256sum "$tmp/$asset" | awk '{print $1}')"
+    [[ "$expected" =~ ^[0-9a-fA-F]{64}$ && "${expected,,}" == "${actual,,}" ]] ||
+      die "sing-box SHA256 校验失败"
+  else
+    die "sing-box release 没有 SHA256 校验文件"
+  fi
+  verify_tar_entries "$tmp/$asset"
+  tar -xzf "$tmp/$asset" -C "$tmp"
+  find "$tmp/sing-box-${bare}-linux-${arch}" -type l -print -quit |
+    grep -q . && die "Unsafe TAR symlink entry"
+  install -m 755 "$tmp/sing-box-${bare}-linux-${arch}/sing-box" "$SING_BOX_BIN"
+  rm -rf "$tmp"
+  log "Installed sing-box $version"
+}
+
+install_easytier() {
+  local arch api version bare asset url digest expected actual tmp core cli
+  arch="$(detect_arch_easytier)"
+  api="$(curl --proto '=https' --tlsv1.2 -fsSL \
+    https://api.github.com/repos/EasyTier/EasyTier/releases/latest)"
+  version="$(jq -r '.tag_name' <<<"$api")"
+  bare="${version#v}"
+  asset="easytier-linux-${arch}-v${bare}.zip"
+  url="$(jq -r --arg n "$asset" '.assets[] | select(.name == $n) | .browser_download_url' <<<"$api")"
+  digest="$(jq -r --arg n "$asset" '.assets[] | select(.name == $n) | .digest // ""' <<<"$api")"
+  [[ -n "$url" && "$url" != "null" ]] || die "EasyTier release asset not found"
+  tmp="$(mktemp -d)"
+  curl --proto '=https' --tlsv1.2 -fL "$url" -o "$tmp/easytier.zip"
+  if [[ "$digest" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; then
+    expected="${digest#sha256:}"
+    actual="$(sha256sum "$tmp/easytier.zip" | awk '{print $1}')"
+    [[ "${expected,,}" == "${actual,,}" ]] || die "EasyTier SHA256 mismatch"
+  else
+    die "EasyTier release 没有 SHA256 摘要"
+  fi
+  verify_zip_entries "$tmp/easytier.zip"
+  unzip -q "$tmp/easytier.zip" -d "$tmp/unpacked"
+  find "$tmp/unpacked" -type l -print -quit |
+    grep -q . && die "Unsafe ZIP symlink entry"
+  core="$(find "$tmp/unpacked" -type f -name easytier-core | head -n1)"
+  cli="$(find "$tmp/unpacked" -type f -name easytier-cli | head -n1)"
+  [[ -n "$core" && -n "$cli" ]] || die "EasyTier binaries not found in release"
+  install -m 755 "$core" "$EASYTIER_CORE_BIN"
+  install -m 755 "$cli" "$EASYTIER_CLI_BIN"
+  rm -rf "$tmp"
+  log "Installed EasyTier $version"
+}
+
+cmd_install() {
+  local components="xray,sing-box,easytier,dataplane,nginx"
+  while (($#)); do
+    case "$1" in
+      --components) components="$2"; shift 2 ;;
+      --help) echo "Usage: etxr install [--components xray,sing-box,easytier,dataplane,nginx]"; return ;;
+      *) die "Unknown install option: $1" ;;
+    esac
+  done
+  if (( DRY_RUN )); then
+    log "Would install base packages: ca-certificates curl jq openssl unzip tar uuid-runtime python3 python3-aiohttp"
+    [[ ",$components," != *,nginx,* ]] || log "Would install Debian nginx"
+    [[ ",$components," != *,xray,* ]] || log "Would download and verify official latest Xray"
+    [[ ",$components," != *,sing-box,* ]] || log "Would download and verify official latest sing-box"
+    [[ ",$components," != *,easytier,* ]] || log "Would download and verify official latest EasyTier"
+    [[ ",$components," != *,dataplane,* ]] || log "Would download and verify ETXR Go data plane ${VERSION}"
+    log "Would install this script as /usr/local/sbin/etxr"
+    return
+  fi
+  need_root
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y ca-certificates curl jq openssl unzip tar uuid-runtime \
+    python3 python3-aiohttp
+  [[ ",$components," != *,nginx,* ]] || apt-get install -y nginx
+  [[ ",$components," != *,xray,* ]] || install_xray
+  [[ ",$components," != *,sing-box,* ]] || install_sing_box
+  [[ ",$components," != *,easytier,* ]] || install_easytier
+  [[ ",$components," != *,dataplane,* ]] || install_data_helper
+  if [[ "$(readlink -f "$0")" != "$(readlink -f /usr/local/sbin/etxr 2>/dev/null || true)" ]]; then
+    install -m 755 "$0" /usr/local/sbin/etxr
+  else
+    chmod 755 /usr/local/sbin/etxr
+  fi
+  install_control_helper
+  mkdir -p "$RUNTIME_DIR" "$GENERATED_DIR" "$BACKUP_DIR" "$SUBSCRIPTION_DIR"
+  log "Installed etxr command"
+}
+
+xray_current_version() {
+  if [[ -x "$XRAY_BIN" ]]; then
+    "$XRAY_BIN" version 2>/dev/null | awk 'NR == 1 {print $2}'
+  else
+    printf '未安装'
+  fi
+}
+
+xray_latest_version() {
+  need_cmd curl
+  need_jq
+  curl --proto '=https' --tlsv1.2 -fsSL \
+    https://api.github.com/repos/XTLS/Xray-core/releases/latest |
+    jq -r '.tag_name | ltrimstr("v")'
+}
+
+cmd_xray_status() {
+  printf '%sXray 版本：%s%s\n' "$C_CYAN" "$(xray_current_version)" "$C_RESET"
+  if command -v systemctl >/dev/null 2>&1; then
+    local active enabled pid
+    active="$(systemctl is-active etxr-xray.service 2>/dev/null || true)"
+    enabled="$(systemctl is-enabled etxr-xray.service 2>/dev/null || true)"
+    pid="$(systemctl show etxr-xray.service -p MainPID --value 2>/dev/null || printf '0')"
+    printf '服务状态：%s\n开机启动：%s\n主进程 PID：%s\n' \
+      "${active:-unknown}" "${enabled:-unknown}" "${pid:-0}"
+    if [[ "${pid:-0}" =~ ^[1-9][0-9]*$ ]]; then
+      ps -p "$pid" -o pid,ppid,user,%cpu,%mem,rss,etime,args --no-headers 2>/dev/null || true
+    fi
+  fi
+  if command -v ss >/dev/null 2>&1; then
+    printf '\n%sXray 监听端口：%s\n' "$C_CYAN" "$C_RESET"
+    ss -lntup 2>/dev/null | grep -E 'xray|etxr' || printf '未发现 Xray 监听端口\n'
+  fi
+}
+
+cmd_xray_service_action() {
+  local action="$1"
+  need_root
+  need_cmd systemctl
+  case "$action" in
+    start)
+      systemctl enable --now etxr-xray.service
+      ;;
+    stop)
+      systemctl stop etxr-xray.service
+      ;;
+    restart)
+      if [[ -f "$STATE_FILE" ]]; then
+        require_state
+        local config
+        config="$(jq -r '.xray.config_path' "$STATE_FILE")"
+        [[ ! -f "$config" ]] || "$XRAY_BIN" run -test -config "$config"
+      fi
+      systemctl restart etxr-xray.service
+      ;;
+    *) die "Unknown Xray service action: $action" ;;
+  esac
+  cmd_xray_status
+}
+
+cmd_xray_logs() {
+  local lines="${1:-80}"
+  need_cmd journalctl
+  journalctl -u etxr-xray.service -n "$lines" --no-pager
+}
+
+cmd_xray_follow() {
+  need_cmd journalctl
+  printf '%s按 Ctrl+C 退出实时日志%s\n' "$C_YELLOW" "$C_RESET"
+  journalctl -u etxr-xray.service -f
+}
+
+xray_monitor_snapshot() {
+  local active pid established=0
+  active="$(systemctl is-active etxr-xray.service 2>/dev/null || true)"
+  pid="$(systemctl show etxr-xray.service -p MainPID --value 2>/dev/null || printf '0')"
+  printf '%s%sXray 实时监控%s  %s\n' "$C_BOLD" "$C_CYAN" "$C_RESET" "$(date '+%F %T')"
+  printf '服务：%-10s 版本：%s  PID：%s\n' "${active:-unknown}" "$(xray_current_version)" "${pid:-0}"
+  if [[ "${pid:-0}" =~ ^[1-9][0-9]*$ ]]; then
+    ps -p "$pid" -o 'pid=,user=,%cpu=,%mem=,rss=,etime=,cmd=' 2>/dev/null || true
+    if command -v ss >/dev/null 2>&1; then
+      established="$(ss -ntpH state established 2>/dev/null |
+        awk -v p="pid=${pid}," 'index($0,p) {n++} END {print n+0}')"
+      printf '活动 TCP 连接：%s\n' "$established"
+      printf '\n监听端口：\n'
+      ss -lntup 2>/dev/null | grep -E 'xray|etxr' || true
+    fi
+  fi
+  printf '\n最近日志：\n'
+  journalctl -u etxr-xray.service -n 12 --no-pager 2>/dev/null || true
+}
+
+cmd_xray_monitor() {
+  need_cmd systemctl
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    xray_monitor_snapshot
+    return
+  fi
+  local key=""
+  while true; do
+    clear_screen
+    xray_monitor_snapshot
+    printf '\n%s每 2 秒刷新，按 q 返回%s\n' "$C_YELLOW" "$C_RESET"
+    if read -r -s -n 1 -t 2 key; then
+      [[ "$key" != "q" && "$key" != "Q" ]] || break
+    fi
+  done
+}
+
+cmd_xray_check_update() {
+  local current latest
+  current="$(xray_current_version)"
+  latest="$(xray_latest_version)"
+  printf '当前版本：%s\n最新版本：%s\n' "$current" "$latest"
+  if [[ "$current" == "$latest" ]]; then
+    printf '%s已经是最新版本。%s\n' "$C_GREEN" "$C_RESET"
+  else
+    printf '%s发现可更新版本。%s\n' "$C_YELLOW" "$C_RESET"
+  fi
+}
+
+cmd_xray_update() {
+  need_root
+  need_cmd curl
+  need_cmd unzip
+  need_cmd sha256sum
+  need_jq
+  local current tmp latest candidate config="" stamp backup="" was_active=0
+  current="$(xray_current_version)"
+  tmp="$(mktemp -d)"
+  download_xray_release "$tmp"
+  latest="$(sed 's/^v//' "$tmp/VERSION")"
+  candidate="$tmp/unpacked/xray"
+  "$candidate" version >/dev/null
+
+  printf '当前版本：%s\n目标版本：%s\n' "$current" "$latest"
+  if [[ "$current" == "$latest" && "$FORCE" -ne 1 ]]; then
+    rm -rf "$tmp"
+    log "Xray is already up to date"
+    return
+  fi
+  confirm "确认更新 Xray" || {
+    rm -rf "$tmp"
+    return
+  }
+
+  if [[ -f "$STATE_FILE" ]]; then
+    require_state
+    config="$(jq -r '.xray.config_path' "$STATE_FILE")"
+    if [[ -f "$config" ]]; then
+      "$candidate" run -test -config "$config"
+    elif [[ -f "$GENERATED_DIR/xray.json" ]]; then
+      "$candidate" run -test -config "$GENERATED_DIR/xray.json"
+    fi
+  fi
+
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  mkdir -p "$BACKUP_DIR/xray-binary"
+  if [[ -x "$XRAY_BIN" ]]; then
+    backup="$BACKUP_DIR/xray-binary/xray-${current}-${stamp}"
+    install -m 755 "$XRAY_BIN" "$backup"
+  fi
+  if systemctl is-active --quiet etxr-xray.service 2>/dev/null; then
+    was_active=1
+  fi
+
+  ensure_parent "$XRAY_BIN"
+  install -m 755 "$candidate" "${XRAY_BIN}.new"
+  mv -f "${XRAY_BIN}.new" "$XRAY_BIN"
+  mkdir -p /usr/local/share/xray
+  [[ ! -f "$tmp/unpacked/geoip.dat" ]] ||
+    install -m 644 "$tmp/unpacked/geoip.dat" /usr/local/share/xray/
+  [[ ! -f "$tmp/unpacked/geosite.dat" ]] ||
+    install -m 644 "$tmp/unpacked/geosite.dat" /usr/local/share/xray/
+
+  if (( was_active )); then
+    if ! systemctl restart etxr-xray.service; then
+      warn "Xray restart failed; rolling back binary"
+      [[ -n "$backup" ]] || die "Xray update failed and no previous binary exists"
+      install -m 755 "$backup" "$XRAY_BIN"
+      systemctl restart etxr-xray.service || true
+      rm -rf "$tmp"
+      die "Xray update rolled back"
+    fi
+  fi
+  rm -rf "$tmp"
+  log "Xray updated: $current -> $latest"
+  cmd_xray_status
+}
+
+cmd_xray() {
+  local action="${1:-status}"; shift || true
+  case "$action" in
+    status) cmd_xray_status ;;
+    start|stop|restart) cmd_xray_service_action "$action" ;;
+    logs) cmd_xray_logs "${1:-80}" ;;
+    follow) cmd_xray_follow ;;
+    monitor) cmd_xray_monitor ;;
+    check-update) cmd_xray_check_update ;;
+    update) cmd_xray_update ;;
+    version) xray_current_version; printf '\n' ;;
+    *) die "Usage: etxr xray status|start|stop|restart|logs|follow|monitor|check-update|update|version" ;;
+  esac
+}
+
+base64url_encode() {
+  base64 -w 0 | tr '+/' '-_' | tr -d '='
+}
+
+base64url_decode() {
+  local input="$1" padding
+  padding=$(( (4 - ${#input} % 4) % 4 ))
+  {
+    printf '%s' "$input"
+    printf '%*s' "$padding" '' | tr ' ' '='
+  } | tr '_-' '/+'
+}
+
+ensure_pair_signing_key() {
+  need_cmd openssl
+  mkdir -p "$PAIR_KEY_DIR"
+  chmod 700 "$PAIR_KEY_DIR"
+  if [[ ! -s "$PAIR_PRIVATE_KEY" || ! -s "$PAIR_PUBLIC_KEY" ]]; then
+    local tmp_dir
+    tmp_dir="$(mktemp -d "$PAIR_KEY_DIR/.pair-key.XXXXXX")"
+    openssl genpkey -algorithm ED25519 -out "$tmp_dir/private" >/dev/null 2>&1 ||
+      die "生成 Pair 签名私钥失败"
+    openssl pkey -in "$tmp_dir/private" -pubout -out "$tmp_dir/public" >/dev/null 2>&1 ||
+      die "生成 Pair 签名公钥失败"
+    chmod 600 "$tmp_dir/private"
+    chmod 644 "$tmp_dir/public"
+    mv -f "$tmp_dir/private" "$PAIR_PRIVATE_KEY"
+    mv -f "$tmp_dir/public" "$PAIR_PUBLIC_KEY"
+    rmdir "$tmp_dir" 2>/dev/null || true
+  fi
+  chmod 600 "$PAIR_PRIVATE_KEY"
+  chmod 644 "$PAIR_PUBLIC_KEY"
+}
+
+pair_public_fingerprint() {
+  ensure_pair_signing_key
+  openssl pkey -pubin -in "$PAIR_PUBLIC_KEY" -outform DER 2>/dev/null |
+    sha256sum | awk '{print toupper(substr($1,1,32))}'
+}
+
+pair_encode() {
+  local json="$1" payload public signature checksum tmp_dir
+  ensure_pair_signing_key
+  tmp_dir="$(mktemp -d)"
+  printf '%s' "$json" | gzip -9 -c | base64url_encode >"$tmp_dir/payload"
+  payload="$(cat "$tmp_dir/payload")"
+  printf '%s' "$payload" >"$tmp_dir/payload.raw"
+  openssl pkeyutl -sign -rawin -inkey "$PAIR_PRIVATE_KEY" \
+    -in "$tmp_dir/payload.raw" -out "$tmp_dir/signature" >/dev/null 2>&1 ||
+    die "生成 Pair 签名失败"
+  public="$(base64url_encode <"$PAIR_PUBLIC_KEY")"
+  signature="$(base64url_encode <"$tmp_dir/signature")"
+  checksum="$(printf '%s.%s.%s' "$payload" "$public" "$signature" |
+    sha256sum | awk '{print substr($1,1,24)}')"
+  rm -rf "$tmp_dir"
+  printf 'ER2.%s.%s.%s.%s\n' "$payload" "$public" "$signature" "$checksum"
+}
+
+pair_decode() {
+  local pairing_id="$1" trusted_fingerprint="${2:-}"
+  local prefix payload public signature checksum actual fingerprint tmp_dir
+  local gzip_status bundle_size
+  (( ${#pairing_id} <= PAIR_ID_MAX_BYTES )) ||
+    die "Pair ID 超过大小限制"
+  IFS='.' read -r prefix payload public signature checksum <<<"$pairing_id"
+  [[ "$prefix" == "ER2" && -n "$payload" && -n "$public" &&
+     -n "$signature" && -n "$checksum" ]] ||
+    die "无效的配对 ID 格式；请使用新的 ER2 配对 ID"
+  [[ "$payload" =~ ^[A-Za-z0-9_-]+$ && "$public" =~ ^[A-Za-z0-9_-]+$ &&
+     "$signature" =~ ^[A-Za-z0-9_-]+$ && "$checksum" =~ ^[0-9a-fA-F]{24}$ ]] ||
+    die "配对 ID 含有无效字符"
+  (( ${#public} <= 4096 && ${#signature} <= 4096 )) ||
+    die "Pair ID 公钥或签名超过大小限制"
+  actual="$(printf '%s.%s.%s' "$payload" "$public" "$signature" |
+    sha256sum | awk '{print substr($1,1,24)}')"
+  [[ "${actual,,}" == "${checksum,,}" ]] ||
+    die "配对 ID 校验失败，可能复制不完整"
+  tmp_dir="$(mktemp -d)"
+  if ! base64url_decode "$payload" | base64 -d >"$tmp_dir/bundle.gz" ||
+     ! base64url_decode "$public" | base64 -d >"$tmp_dir/public" ||
+     ! base64url_decode "$signature" | base64 -d >"$tmp_dir/signature"; then
+    rm -rf "$tmp_dir"
+    die "配对 ID 解码失败"
+  fi
+  printf '%s' "$payload" >"$tmp_dir/payload"
+  if ! openssl pkeyutl -verify -rawin -pubin -inkey "$tmp_dir/public" \
+      -in "$tmp_dir/payload" -sigfile "$tmp_dir/signature" >/dev/null 2>&1; then
+    rm -rf "$tmp_dir"
+    die "Pair ID 签名验证失败"
+  fi
+  fingerprint="$(openssl pkey -pubin -in "$tmp_dir/public" -outform DER 2>/dev/null |
+    sha256sum | awk '{print toupper(substr($1,1,32))}')"
+  [[ -n "$fingerprint" ]] || {
+    rm -rf "$tmp_dir"
+    die "无法读取 Pair 签名指纹"
+  }
+  if [[ -n "$trusted_fingerprint" &&
+        "${trusted_fingerprint^^}" != "$fingerprint" ]]; then
+    rm -rf "$tmp_dir"
+    die "Pair 签名指纹不匹配；请核对主服务器显示的指纹"
+  fi
+  # Do not parse attacker-controlled compressed content before authentication.
+  set +o pipefail
+  gzip -dc "$tmp_dir/bundle.gz" 2>/dev/null |
+    head -c "$((PAIR_BUNDLE_MAX_BYTES + 1))" >"$tmp_dir/bundle"
+  gzip_status="${PIPESTATUS[0]}"
+  set -o pipefail
+  bundle_size="$(wc -c <"$tmp_dir/bundle")"
+  if (( gzip_status != 0 && gzip_status != 141 )); then
+    rm -rf "$tmp_dir"
+    die "Pair ID 压缩数据无效"
+  fi
+  if (( bundle_size > PAIR_BUNDLE_MAX_BYTES )); then
+    rm -rf "$tmp_dir"
+    die "Pair ID 解压后的配置超过大小限制"
+  fi
+  cat "$tmp_dir/bundle"
+  rm -rf "$tmp_dir"
+}
+
+validate_pair_bundle() {
+  jq -e '
+    (.version == 2) and
+    (.expires_at | type == "number") and
+    (.worker.name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")) and
+    (.worker.easytier_ip | type == "string" and test("^10\\.100\\.0\\.[0-9]{1,3}$")) and
+    (.worker.public_host | type == "string" and length <= 253 and
+      (length == 0 or test("^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$"))) and
+    (.master.address | type == "string" and test("^[A-Za-z0-9.-]+$")) and
+    (.master.tcp_port | type == "number" and floor == . and . >= 1 and . <= 65535) and
+    (.master.source_cidr | type == "string" and test("^(|[0-9]{1,3}(\\.[0-9]{1,3}){3}/32)$")) and
+    (.easytier.network_name | type == "string" and test("^[A-Za-z0-9._:-]{1,64}$")) and
+    (.easytier.network_secret | type == "string" and test("^[A-Za-z0-9._:@+-]{1,256}$")) and
+    (.control.base_url | type == "string" and test("^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._~/-]*)?$")) and
+    (.control.node_id == .worker.name) and
+    (.control.token | type == "string" and test("^[0-9a-fA-F]{64}$")) and
+    (.users | type == "array") and
+    (([.users[].name] | length) == ([.users[].name] | unique | length)) and
+    (([.users[].uuid] | length) == ([.users[].uuid] | unique | length)) and
+    (([.users[].subscription_token] | length) ==
+      ([.users[].subscription_token] | unique | length)) and
+    all(.users[];
+      (.name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")) and
+      (.uuid | type == "string" and test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$")) and
+      (.hy2_password | type == "string" and length <= 512) and
+      (.enabled | type == "boolean") and
+      (.expires_at == null or (.expires_at | type == "string")) and
+      (.routes | type == "array" and all(.[]; type == "string" and test("^\\*?$|^[A-Za-z0-9._-]{1,64}$"))) and
+      (.subscription_prefix | type == "string" and test("^[0-9a-fA-F]{8}$")) and
+      (.subscription_token | type == "string" and test("^[0-9a-fA-F]{40}$")) and
+      ((.speed_limit // {up_mbps: 0, down_mbps: 0}) |
+        type == "object" and
+        (.up_mbps | type == "number" and floor == . and . >= 0 and . <= 100000) and
+        (.down_mbps | type == "number" and floor == . and . >= 0 and . <= 100000)) and
+      ((.usage_epoch // "") | type == "string" and length <= 128)
+    ) and
+    (.relay.uuid | type == "string" and test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$")) and
+    (.relay.private_port | type == "number" and floor == . and . >= 1 and . <= 65535) and
+    (.relay.public_port | type == "number" and floor == . and . >= 1 and . <= 65535) and
+    (.relay.listen_port | type == "number" and floor == . and . >= 1 and . <= 65535) and
+    (.direct.user_uuid | type == "string" and test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$")) and
+    (.direct.xhttp.enabled | type == "boolean") and
+    (.direct.xhttp.public_port | type == "number" and floor == . and . >= 1 and . <= 65535) and
+    (.direct.xhttp.listen_port | type == "number" and floor == . and . >= 1 and . <= 65535) and
+    (.direct.xhttp.path | type == "string" and test("^/[A-Za-z0-9._~/-]+$") and (contains("//") | not) and (contains("..") | not)) and
+    (.direct.reality.enabled | type == "boolean") and
+    (.direct.reality.port | type == "number" and floor == . and . >= 1 and . <= 65535) and
+    (.direct.reality.path | type == "string" and test("^/[A-Za-z0-9._~/-]+$") and (contains("//") | not) and (contains("..") | not)) and
+    (.direct.reality.target | type == "string" and test("^[A-Za-z0-9.-]+:[0-9]{1,5}$")) and
+    (.direct.reality.server_name | type == "string" and test("^[A-Za-z0-9.-]+$")) and
+    (.direct.reality.short_id | type == "string" and test("^[0-9a-fA-F]{2,32}$")) and
+    (.direct.hysteria2.enabled | type == "boolean") and
+    (.direct.hysteria2.port | type == "number" and floor == . and . >= 1 and . <= 65535) and
+    (.direct.hysteria2.password | type == "string" and length <= 512) and
+    (.direct.hysteria2.obfs_password | type == "string" and length <= 512) and
+    (.direct.hysteria2.masquerade | type == "string" and test("^https?://[^[:space:]]+$")) and
+    ([
+      .relay.private_port,
+      (if .relay.public_enabled then .relay.listen_port else empty end),
+      (if .direct.xhttp.enabled then .direct.xhttp.listen_port else empty end),
+      (if .direct.reality.enabled then .direct.reality.port else empty end)
+    ] | length == (unique | length))
+  ' <<<"$1" >/dev/null
+}
+
+resolve_ipv4_cidr() {
+  local host="$1" ip=""
+  if valid_ipv4 "$host"; then
+    ip="$host"
+  elif command -v getent >/dev/null 2>&1; then
+    ip="$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR==1 {print $1}')"
+  fi
+  [[ -z "$ip" ]] || valid_ipv4 "$ip" || return 0
+  [[ -z "$ip" ]] || printf '%s/32' "$ip"
+}
+
+generate_vlessenc_x25519_pair() {
+  [[ -x "$XRAY_BIN" ]] || die "请先安装 Xray"
+  local output
+  output="$("$XRAY_BIN" vlessenc)"
+  # Xray may print multiple suites; use the final recommended pair
+  # (currently the ML-KEM authenticated profile).
+  PAIR_DECRYPTION="$(awk -F'"' '/"decryption"/ {v=$4} END {print v}' <<<"$output")"
+  PAIR_ENCRYPTION="$(awk -F'"' '/"encryption"/ {v=$4} END {print v}' <<<"$output")"
+  [[ -n "$PAIR_DECRYPTION" && -n "$PAIR_ENCRYPTION" ]] ||
+    die "无法解析 xray vlessenc 输出"
+}
+
+cmd_cluster_master_init() {
+  require_state
+  [[ "$(jq -r '.node.role' "$STATE_FILE")" == "gateway" ||
+     "$(jq -r '.node.role' "$STATE_FILE")" == "hybrid" ]] ||
+    die "Only a gateway/hybrid node can initialize the EasyTier master"
+  local ip="10.100.0.1" port=11010 endpoint="" network_name="" network_secret=""
+  while (($#)); do
+    case "$1" in
+      --ip) ip="$2"; shift 2 ;;
+      --port) port="$2"; shift 2 ;;
+      --endpoint) endpoint="$2"; shift 2 ;;
+      --network-name) network_name="$2"; shift 2 ;;
+      --network-secret) network_secret="$2"; shift 2 ;;
+      --help)
+        echo "Usage: etxr cluster master-init [--ip 10.100.0.1] [--port 11010] [--endpoint A_IP_OR_DOMAIN]"
+        return ;;
+      *) die "Unknown master-init option: $1" ;;
+    esac
+  done
+  endpoint="${endpoint:-$(jq -r '.node.address' "$STATE_FILE")}"
+  network_name="${network_name:-er-$(random_hex 8)}"
+  network_secret="${network_secret:-$(random_hex 24)}"
+  valid_ipv4 "$ip" || die "Invalid EasyTier overlay IPv4 address"
+  valid_hostname "$endpoint" || die "Invalid EasyTier public endpoint"
+  valid_port "$port" || die "Invalid EasyTier TCP port"
+  valid_secret_value "$network_name" || die "Invalid EasyTier network name"
+  valid_secret_value "$network_secret" || die "Invalid EasyTier network secret"
+  state_update '
+    .easytier = {
+      enabled: true,
+      ipv4: $ip,
+      public_endpoint: $endpoint,
+      network_name: $name,
+      network_secret: $secret,
+      peer: "",
+      tcp_port: $port
+    } |
+    .paired_nodes = (.paired_nodes // []) |
+    .xray.relay_inbounds = (.xray.relay_inbounds // [])
+  ' --arg ip "$ip" --arg endpoint "$endpoint" \
+    --arg name "$network_name" --arg secret "$network_secret" \
+    --argjson port "$port"
+  log "EasyTier master initialized at $ip, public TCP ${endpoint}:$port"
+}
+
+next_easytier_worker_ip() {
+  require_state
+  local octet
+  for ((octet=11; octet<=250; octet++)); do
+    if ! jq -e --arg ip "10.100.0.${octet}" \
+      '.paired_nodes[]? | select(.easytier_ip == $ip)' "$STATE_FILE" >/dev/null; then
+      printf '10.100.0.%s' "$octet"
+      return
+    fi
+  done
+  die "EasyTier address pool exhausted"
+}
+
+cmd_pair_create() {
+  require_state
+  ensure_control_state
+  [[ "$(jq -r '.easytier.enabled // false' "$STATE_FILE")" == "true" ]] ||
+    die "请先运行 cluster master-init"
+  [[ -z "$(jq -r '.easytier.peer // ""' "$STATE_FILE")" ]] ||
+    die "只能在主服务器创建从服务器配对 ID"
+  local name="" public_host="" backup_port=29000 backup_listen_port=29000
+  local reality_port=18443 hy2_port=28443
+  local reality_sni="aod.itunes.apple.com" reality_target="aod.itunes.apple.com:443"
+  local xhttp_enabled=false reality_enabled=true hy2_enabled=true
+  local xhttp_port=18000 xhttp_listen_port=18000 xhttp_path=""
+  local reality_path="" hy2_masquerade="https://www.cloudflare.com"
+  local relay_uuid="" user_uuid="" hy2_password="" hy2_obfs="" reality_short=""
+  local relay_private_port=19000
+  local hy2_up=0 hy2_down=0
+  local expires_minutes=30 expires_at
+  while (($#)); do
+    case "$1" in
+      --name) name="$2"; shift 2 ;;
+      --public-host) public_host="$2"; shift 2 ;;
+      --public-relay-port) backup_port="$2"; shift 2 ;;
+      --public-listen-port) backup_listen_port="$2"; shift 2 ;;
+      --private-relay-port) relay_private_port="$2"; shift 2 ;;
+      --xhttp-enabled) xhttp_enabled=true; shift ;;
+      --no-xhttp) xhttp_enabled=false; shift ;;
+      --xhttp-port) xhttp_port="$2"; shift 2 ;;
+      --xhttp-listen-port) xhttp_listen_port="$2"; shift 2 ;;
+      --xhttp-path) xhttp_path="$2"; shift 2 ;;
+      --reality-enabled) reality_enabled=true; shift ;;
+      --no-reality) reality_enabled=false; shift ;;
+      --reality-port) reality_port="$2"; shift 2 ;;
+      --reality-path) reality_path="$2"; shift 2 ;;
+      --hy2-enabled) hy2_enabled=true; shift ;;
+      --no-hy2) hy2_enabled=false; shift ;;
+      --hy2-port) hy2_port="$2"; shift 2 ;;
+      --hy2-masquerade) hy2_masquerade="$2"; shift 2 ;;
+      --hy2-up-mbps) hy2_up="$2"; shift 2 ;;
+      --hy2-down-mbps) hy2_down="$2"; shift 2 ;;
+      --relay-uuid) relay_uuid="$2"; shift 2 ;;
+      --user-uuid) user_uuid="$2"; shift 2 ;;
+      --hy2-password) hy2_password="$2"; shift 2 ;;
+      --hy2-obfs-password) hy2_obfs="$2"; shift 2 ;;
+      --reality-short-id) reality_short="$2"; shift 2 ;;
+      --reality-sni) reality_sni="$2"; shift 2 ;;
+      --reality-target) reality_target="$2"; shift 2 ;;
+      --expires-minutes) expires_minutes="$2"; shift 2 ;;
+      --expires-hours)
+        [[ "${2:-}" =~ ^[0-9]+$ ]] || die "Invalid expiry hours"
+        expires_minutes="$((10#$2 * 60))"
+        shift 2
+        ;;
+      --help)
+        cat <<'EOF'
+Usage:
+  etxr pair create --name worker1 [--public-host PUBLIC_HOST]
+    [--public-relay-port EXTERNAL_PORT] [--public-listen-port INTERNAL_PORT]
+    [--reality-port 18443] [--hy2-port 28443]
+    [--expires-minutes 30]
+
+When --public-host is set, the public relay is primary and EasyTier is the
+automatic fallback. Without --public-host, traffic uses EasyTier only. For a
+NAT mapping, EXTERNAL_PORT maps to the worker's INTERNAL_PORT over TCP.
+EOF
+        return ;;
+      *) die "Unknown pair create option: $1" ;;
+    esac
+  done
+  [[ -n "$name" ]] || die "--name is required"
+  valid_name "$name" || die "Invalid worker name"
+  [[ -z "$public_host" ]] || valid_hostname "$public_host" || die "Invalid public host"
+  [[ "$expires_minutes" =~ ^[0-9]+$ ]] ||
+    die "Invalid expiry minutes"
+  (( 10#$expires_minutes >= 1 && 10#$expires_minutes <= 525600 )) ||
+    die "Expiry must be between 1 minute and 525600 minutes"
+  expires_minutes="$((10#$expires_minutes))"
+  expires_at="$(( $(date +%s) + expires_minutes * 60 ))"
+  valid_port "$backup_port" || die "Invalid backup port"
+  valid_port "$backup_listen_port" || die "Invalid backup listen port"
+  valid_port "$relay_private_port" || die "Invalid private relay port"
+  valid_port "$xhttp_port" || die "Invalid XHTTP public port"
+  valid_port "$xhttp_listen_port" || die "Invalid XHTTP listen port"
+  valid_port "$reality_port" || die "Invalid Reality port"
+  valid_port "$hy2_port" || die "Invalid Hysteria2 port"
+  valid_mbps "$hy2_up" || die "Invalid Hysteria2 upload Mbps"
+  valid_mbps "$hy2_down" || die "Invalid Hysteria2 download Mbps"
+  [[ "$xhttp_enabled" == "true" || "$xhttp_enabled" == "false" ]] ||
+    die "Invalid XHTTP enabled flag"
+  [[ "$reality_enabled" == "true" || "$reality_enabled" == "false" ]] ||
+    die "Invalid Reality enabled flag"
+  [[ "$hy2_enabled" == "true" || "$hy2_enabled" == "false" ]] ||
+    die "Invalid Hysteria2 enabled flag"
+  xhttp_path="${xhttp_path:-/${name}-xhttp-$(random_hex 8)}"
+  reality_path="${reality_path:-/${name}-reality-$(random_hex 8)}"
+  xhttp_path="$(normalize_path "$xhttp_path")"
+  reality_path="$(normalize_path "$reality_path")"
+  valid_http_path "$xhttp_path" || die "Invalid XHTTP Path"
+  valid_http_path "$reality_path" || die "Invalid Reality Path"
+  valid_url "$hy2_masquerade" || die "Invalid Hysteria2 masquerade URL"
+  jq -e --arg n "$name" '
+    (.paired_nodes[]? | select(.name == $n)),
+    (.xray.routes[]? | select(.name == $n)),
+    (.xray.exits[]? | select(.name == $n))
+  ' "$STATE_FILE" >/dev/null && die "Worker, route, or exit already exists: $name"
+
+  local worker_ip master_ip master_address master_port master_source
+  local reality_keys reality_private reality_public
+  local bundle pairing_id route_port route_path control_token control_url
+  worker_ip="$(next_easytier_worker_ip)"
+  master_ip="$(jq -r '.easytier.ipv4' "$STATE_FILE")"
+  master_address="$(jq -r '.easytier.public_endpoint // .node.address' "$STATE_FILE")"
+  master_port="$(jq -r '.easytier.tcp_port' "$STATE_FILE")"
+  master_source="$(resolve_ipv4_cidr "$master_address" || true)"
+  if [[ -n "$public_host" && -z "$master_source" ]]; then
+    die "启用公网直连时必须能把主服务器的 EasyTier 公网地址解析为 IPv4；请用主服务器公网 IP 重新初始化 cluster"
+  fi
+  relay_uuid="${relay_uuid:-$(random_uuid)}"
+  user_uuid="${user_uuid:-$(random_uuid)}"
+  hy2_password="${hy2_password:-$(random_password)}"
+  hy2_obfs="${hy2_obfs:-$(random_password)}"
+  reality_short="${reality_short:-$(random_hex 8)}"
+  valid_uuid "$relay_uuid" || die "Invalid relay UUID"
+  valid_uuid "$user_uuid" || die "Invalid direct user UUID"
+  generate_vlessenc_x25519_pair
+  reality_keys="$("$XRAY_BIN" x25519)"
+  reality_private="$(awk -F': ' '/^PrivateKey:/ {print $2}' <<<"$reality_keys")"
+  reality_public="$(awk -F': ' '/^Password/ {print $2; exit}' <<<"$reality_keys")"
+  if [[ -z "$reality_public" ]]; then
+    reality_public="$(awk -F': ' '/^PublicKey:/ {print $2; exit}' <<<"$reality_keys")"
+  fi
+  [[ -n "$reality_private" && -n "$reality_public" ]] ||
+    die "无法解析 xray x25519 输出"
+  route_port="$(next_route_port)"
+  route_path="/${name}-$(random_hex 10)"
+  control_token="$(random_hex 32)"
+  control_url="$(control_base_url)"
+
+  bundle="$(jq -n \
+    --argjson expires "$expires_at" \
+    --arg name "$name" --arg worker_ip "$worker_ip" \
+    --arg master_ip "$master_ip" --arg master_address "$master_address" \
+    --arg network_name "$(jq -r '.easytier.network_name' "$STATE_FILE")" \
+    --arg network_secret "$(jq -r '.easytier.network_secret' "$STATE_FILE")" \
+    --argjson master_port "$master_port" \
+    --arg master_source "$master_source" \
+    --arg public_host "$public_host" \
+    --arg relay_uuid "$relay_uuid" \
+    --arg decryption "$PAIR_DECRYPTION" --arg encryption "$PAIR_ENCRYPTION" \
+    --argjson relay_private_port "$relay_private_port" \
+    --argjson backup_port "$backup_port" \
+    --argjson backup_listen_port "$backup_listen_port" \
+    --argjson xhttp_enabled "$xhttp_enabled" \
+    --argjson xhttp_port "$xhttp_port" \
+    --argjson xhttp_listen_port "$xhttp_listen_port" \
+    --arg xhttp_path "$xhttp_path" \
+    --argjson reality_enabled "$reality_enabled" \
+    --arg reality_private "$reality_private" --arg reality_public "$reality_public" \
+    --arg reality_short "$reality_short" --arg reality_sni "$reality_sni" \
+    --arg reality_target "$reality_target" --arg reality_path "$reality_path" \
+    --argjson reality_port "$reality_port" --argjson hy2_enabled "$hy2_enabled" \
+    --arg user_uuid "$user_uuid" --arg hy2_password "$hy2_password" \
+    --arg hy2_obfs "$hy2_obfs" --argjson hy2_port "$hy2_port" \
+    --arg hy2_masquerade "$hy2_masquerade" \
+    --argjson hy2_up "$hy2_up" --argjson hy2_down "$hy2_down" \
+    --arg control_url "$control_url" --arg control_token "$control_token" \
+    --argjson users "$(jq '.users' "$STATE_FILE")" '
+    {
+      version: 2,
+      expires_at: $expires,
+      worker: {
+        name: $name,
+        easytier_ip: $worker_ip,
+        public_host: $public_host
+      },
+      master: {
+        easytier_ip: $master_ip,
+        address: $master_address,
+        tcp_port: $master_port,
+        source_cidr: $master_source
+      },
+      easytier: {
+        network_name: $network_name,
+        network_secret: $network_secret
+      },
+      control: {
+        base_url: $control_url,
+        node_id: $name,
+        token: $control_token
+      },
+      users: $users,
+      relay: {
+        uuid: $relay_uuid,
+        private_port: $relay_private_port,
+        public_enabled: ($public_host != ""),
+        public_port: $backup_port,
+        listen_port: $backup_listen_port,
+        decryption: $decryption,
+        encryption: $encryption,
+        flow: "xtls-rprx-vision",
+        network: "raw"
+      },
+      direct: {
+        user_uuid: $user_uuid,
+        xhttp: {
+          enabled: $xhttp_enabled,
+          public_port: $xhttp_port,
+          listen_port: $xhttp_listen_port,
+          path: $xhttp_path
+        },
+        reality: {
+          enabled: $reality_enabled,
+          port: $reality_port,
+          target: $reality_target,
+          server_name: $reality_sni,
+          private_key: $reality_private,
+          public_key: $reality_public,
+          short_id: $reality_short,
+          path: $reality_path
+        },
+        hysteria2: {
+          enabled: $hy2_enabled,
+          port: $hy2_port,
+          password: $hy2_password,
+          obfs_password: $hy2_obfs,
+          masquerade: $hy2_masquerade,
+          up_mbps: $hy2_up,
+          down_mbps: $hy2_down
+        }
+      }
+    }')"
+  pairing_id="$(pair_encode "$bundle")"
+  local pair_fingerprint
+  pair_fingerprint="$(pair_public_fingerprint)"
+
+  state_update '
+    .xray.exits += [{
+      name: $name,
+      address: (if $public_host != "" then $public_host else $worker_ip end),
+      port: (if $public_host != "" then $public_port else $private_port end),
+      backup_address: (if $public_host != "" then $worker_ip else "" end),
+      backup_port: $private_port,
+      connection_preference: (if $public_host != "" then "public-primary" else "easytier-only" end),
+      network: "raw",
+      transport: "none",
+      path: "",
+      host: "",
+      server_name: "",
+      uuid: $uuid,
+      encryption: $encryption,
+      flow: "xtls-rprx-vision",
+      fingerprint: "chrome"
+    }] |
+    .xray.routes += [{
+      name: $name,
+      path: $route_path,
+      listen: "127.0.0.1",
+      port: $route_port,
+      target: $name,
+      profile: "plain",
+      host: "",
+      decryption: "none",
+      client_encryption: "none",
+      flow: ""
+    }] |
+    .paired_nodes += [{
+      name: $name,
+      easytier_ip: $worker_ip,
+      public_host: $public_host,
+      connection_preference: (if $public_host != "" then "public-primary" else "easytier-only" end),
+      public_port: $public_port,
+      public_listen_port: $public_listen_port,
+      private_relay_port: $private_port,
+      control_token: $control_token,
+      route_path: $route_path,
+      route_port: $route_port,
+      created_at: $created,
+      expires_at: $expires
+    }]
+  ' --arg name "$name" --arg worker_ip "$worker_ip" --arg public_host "$public_host" \
+    --arg control_token "$control_token" \
+    --arg uuid "$relay_uuid" --arg encryption "$PAIR_ENCRYPTION" \
+    --arg route_path "$route_path" --arg created "$(date -u +%FT%TZ)" \
+    --argjson private_port "$relay_private_port" \
+    --argjson public_port "$backup_port" \
+    --argjson public_listen_port "$backup_listen_port" \
+    --argjson backup_port "$backup_port" \
+    --argjson backup_listen_port "$backup_listen_port" \
+    --argjson route_port "$route_port" \
+    --argjson expires "$expires_at"
+
+  mkdir -p "$RUNTIME_DIR/pairs"
+  printf '%s\n' "$pairing_id" | atomic_write "$RUNTIME_DIR/pairs/${name}.id"
+  printf '\n%s配对 ID（请完整复制到从服务器）：%s\n\n%s\n\n' \
+    "$C_GREEN" "$C_RESET" "$pairing_id"
+  printf 'Pair 签名指纹（从服务器加入时必须核对）： %s\n' "$pair_fingerprint"
+  printf '主服务器客户端 Path：%s\n从服务器 EasyTier IP：%s\n' "$route_path" "$worker_ip"
+  if [[ -n "$public_host" ]]; then
+    printf '公网主线路：%s:%s -> 从服务器 TCP %s（仅允许主服务器）\n' \
+      "$public_host" "$backup_port" "$backup_listen_port"
+    printf '故障回退：EasyTier %s:%s\n' "$worker_ip" "$relay_private_port"
+  else
+    printf '连接方式：仅 EasyTier %s:%s\n' "$worker_ip" "$relay_private_port"
+  fi
+  printf '%s该 ID 包含组网密钥，有效期 %s 分钟，请勿公开；指纹用于防止 Pair ID 被篡改。%s\n' \
+    "$C_YELLOW" "$expires_minutes" "$C_RESET"
+}
+
+generate_self_signed_cert() {
+  local name="$1" san="${2:-$1}" cert_dir san_arg
+  cert_dir="$RUNTIME_DIR/certs/$name"
+  if valid_ipv4 "$san"; then
+    san_arg="IP:${san}"
+  else
+    san_arg="DNS:${san}"
+  fi
+  mkdir -p "$cert_dir"
+  openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+    -subj "/CN=$name" \
+    -addext "subjectAltName=${san_arg}" \
+    -keyout "$cert_dir/privkey.pem" \
+    -out "$cert_dir/fullchain.pem" >/dev/null 2>&1
+  chmod 600 "$cert_dir/privkey.pem"
+  printf '%s\n%s\n' "$cert_dir/fullchain.pem" "$cert_dir/privkey.pem"
+}
+
+detect_public_ipv4() {
+  local ip=""
+  ip="$(curl -4 --proto '=https' --tlsv1.2 -fsS --max-time 8 \
+    https://api.ipify.org 2>/dev/null || true)"
+  if [[ ! "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  fi
+  printf '%s' "$ip"
+}
+
+cmd_pair_join() {
+  local pairing_id="" trusted_fingerprint="" prepare_only=0
+  while (($#)); do
+    case "$1" in
+      --prepare-only) prepare_only=1; shift ;;
+      --fingerprint) trusted_fingerprint="${2:-}"; shift 2 ;;
+      --help)
+        echo "Usage: etxr pair join [--prepare-only] --fingerprint SHA256_PREFIX PAIRING_ID"
+        return ;;
+      *)
+        [[ -z "$pairing_id" ]] || die "Only one pairing ID is allowed"
+        pairing_id="$1"
+        shift ;;
+    esac
+  done
+  [[ -n "$pairing_id" ]] || die "Usage: etxr pair join PAIRING_ID"
+  [[ "$trusted_fingerprint" =~ ^[0-9a-fA-F]{32}$ ]] ||
+    die "必须提供主服务器显示的 32 位 Pair 签名指纹"
+  need_jq
+  need_cmd openssl
+  need_cmd gzip
+  need_cmd base64
+  need_cmd sha256sum
+  local bundle now name public_host domain cert key cert_info
+  bundle="$(pair_decode "$pairing_id" "$trusted_fingerprint")"
+  validate_pair_bundle "$bundle" ||
+    die "Pair ID 字段校验失败，未安装软件、未覆盖现有状态"
+  now="$(date +%s)"
+  (( now <= $(jq -r '.expires_at' <<<"$bundle") )) || die "配对 ID 已过期，请在主服务器重新生成"
+  name="$(jq -r '.worker.name' <<<"$bundle")"
+  public_host="$(jq -r '.worker.public_host' <<<"$bundle")"
+  public_host="${public_host:-$(detect_public_ipv4)}"
+  domain="$public_host"
+  [[ -n "$domain" ]] || domain="${name}.local"
+  valid_hostname "$domain" || die "Pair ID 中的从服务器域名无效"
+  if (( ! prepare_only )); then
+    need_root
+    # Validate the complete signed bundle before installing any dependency.
+    cmd_install --components xray,sing-box,easytier
+  fi
+  cert_info="$(generate_self_signed_cert "$name" "$domain")"
+  cert="$(sed -n '1p' <<<"$cert_info")"
+  key="$(sed -n '2p' <<<"$cert_info")"
+
+  FORCE=1
+  cmd_init --name "$name" --role exit --domain "$domain" --address "$public_host" \
+    --nginx-mode disabled --cert "$cert" --key "$key"
+  FORCE=0
+  local private_relay public_relay='[]' xhttp_routes='[]' reality_inbounds='[]'
+  local worker_users
+  private_relay="$(jq -c '{
+    name: (.worker.name + "-private"),
+    listen: .worker.easytier_ip,
+    port: .relay.private_port,
+    public: false,
+    allowed_source: "",
+    uuid: .relay.uuid,
+    decryption: .relay.decryption,
+    flow: .relay.flow
+  }' <<<"$bundle")"
+  if [[ "$(jq -r '.relay.public_enabled' <<<"$bundle")" == "true" ]]; then
+    public_relay="$(jq -c '[{
+      name: (.worker.name + "-public"),
+      listen: "0.0.0.0",
+      port: (.relay.listen_port // .relay.public_port),
+      public: true,
+      allowed_source: .master.source_cidr,
+      uuid: .relay.uuid,
+      decryption: .relay.decryption,
+      flow: .relay.flow
+    }]' <<<"$bundle")"
+  fi
+  if [[ "$(jq -r '.direct.xhttp.enabled // false' <<<"$bundle")" == "true" ]]; then
+    xhttp_routes="$(jq -c --arg cert "$cert" --arg key "$key" '[{
+      name: (.worker.name + "-xhttp"),
+      listen: "0.0.0.0",
+      port: .direct.xhttp.listen_port,
+      public_port: .direct.xhttp.public_port,
+      path: .direct.xhttp.path,
+      target: "direct",
+      profile: "plain",
+      host: "",
+      decryption: "none",
+      client_encryption: "none",
+      flow: "",
+      direct: true,
+       security: "tls",
+       certificate: $cert,
+       certificate_key: $key,
+       allow_insecure: true
+    }]' <<<"$bundle")"
+  fi
+  if [[ "$(jq -r '.direct.reality.enabled // true' <<<"$bundle")" == "true" ]]; then
+    reality_inbounds="$(jq -c '[{
+      name: "direct",
+      listen: "0.0.0.0",
+      port: .direct.reality.port,
+      path: .direct.reality.path,
+      target: .direct.reality.target,
+      server_names: [.direct.reality.server_name],
+      private_key: .direct.reality.private_key,
+      public_key: .direct.reality.public_key,
+      short_ids: [.direct.reality.short_id]
+    }]' <<<"$bundle")"
+  fi
+  worker_users="$(jq -c --arg prefix "$(sha1_prefix admin)" \
+    --arg token "$(random_hex 20)" '
+    if ((.users // []) | length) > 0 then
+      .users
+    else [{
+      name: "admin",
+      uuid: .direct.user_uuid,
+      hy2_password: .direct.hysteria2.password,
+      enabled: true,
+      expires_at: null,
+      routes: ["*"],
+      subscription_prefix: $prefix,
+      subscription_token: $token,
+      speed_limit: {up_mbps: 0, down_mbps: 0},
+      usage_epoch: ""
+    }] end
+  ' <<<"$bundle")"
+
+  state_update '
+    .easytier = {
+      enabled: true,
+      ipv4: $et_ip,
+      network_name: $et_name,
+      network_secret: $et_secret,
+      peer: ($master + ":" + ($et_port | tostring)),
+      tcp_port: $et_port
+    } |
+    .xray.relay_inbounds = ([$private] + $public) |
+    .xray.routes = $xhttp_routes |
+    .xray.reality_inbounds = $reality_inbounds |
+    .hysteria2.enabled = $hy2_enabled |
+    .hysteria2.port = $hy2_port |
+    .hysteria2.up_mbps = $hy2_up |
+    .hysteria2.down_mbps = $hy2_down |
+    .hysteria2.obfs = "salamander" |
+    .hysteria2.obfs_password = $hy2_obfs |
+    .hysteria2.masquerade = $hy2_masquerade |
+    .hysteria2.certificate = $cert |
+    .hysteria2.certificate_key = $key |
+     .hysteria2.insecure = true |
+    .control = {
+      enabled: false,
+      base_path: "",
+      listen: "127.0.0.1",
+      port: 18180,
+      agent: {
+        enabled: true,
+        base_url: $control_url,
+        node_id: $control_node,
+        token: $control_token
+      }
+    } |
+    .users = $users
+  ' --arg et_ip "$(jq -r '.worker.easytier_ip' <<<"$bundle")" \
+    --arg et_name "$(jq -r '.easytier.network_name' <<<"$bundle")" \
+    --arg et_secret "$(jq -r '.easytier.network_secret' <<<"$bundle")" \
+    --arg master "$(jq -r '.master.address' <<<"$bundle")" \
+    --argjson et_port "$(jq -r '.master.tcp_port' <<<"$bundle")" \
+    --argjson private "$private_relay" --argjson public "$public_relay" \
+    --argjson xhttp_routes "$xhttp_routes" \
+    --argjson reality_inbounds "$reality_inbounds" \
+    --argjson hy2_enabled "$(jq -r '.direct.hysteria2.enabled // true' <<<"$bundle")" \
+    --argjson hy2_port "$(jq -r '.direct.hysteria2.port' <<<"$bundle")" \
+    --argjson hy2_up "$(jq -r '.direct.hysteria2.up_mbps // 0' <<<"$bundle")" \
+    --argjson hy2_down "$(jq -r '.direct.hysteria2.down_mbps // 0' <<<"$bundle")" \
+    --arg hy2_obfs "$(jq -r '.direct.hysteria2.obfs_password' <<<"$bundle")" \
+    --arg hy2_masquerade "$(jq -r '.direct.hysteria2.masquerade // "https://www.cloudflare.com"' <<<"$bundle")" \
+    --arg control_url "$(jq -r '.control.base_url' <<<"$bundle")" \
+    --arg control_node "$(jq -r '.control.node_id' <<<"$bundle")" \
+    --arg control_token "$(jq -r '.control.token' <<<"$bundle")" \
+    --arg cert "$cert" --arg key "$key" \
+    --argjson users "$worker_users"
+
+  if (( prepare_only )); then
+    cmd_render
+    printf '\n%s从服务器 %s 配置已生成但未安装服务。%s\n' "$C_GREEN" "$name" "$C_RESET"
+  else
+    cmd_apply
+    printf '\n%s从服务器 %s 已完成一键安装。%s\n' "$C_GREEN" "$name" "$C_RESET"
+  fi
+  printf 'EasyTier：%s -> %s:%s\n' \
+    "$(jq -r '.worker.easytier_ip' <<<"$bundle")" \
+    "$(jq -r '.master.address' <<<"$bundle")" \
+    "$(jq -r '.master.tcp_port' <<<"$bundle")"
+  cmd_subscription "$(jq -r '.[0].name' <<<"$worker_users")"
+}
+
+cmd_pair_list() {
+  require_state
+  jq -r '(.paired_nodes // [])[] |
+    "\(.name)\tET=\(.easytier_ip)\tpublic=\(.public_host // "-")\tpath=\(.route_path)"' "$STATE_FILE"
+}
+
+cmd_pair_remove() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "Worker name required"
+  valid_name "$name" || die "Invalid worker name"
+  require_state
+  state_update '
+    .paired_nodes |= map(select(.name != $name)) |
+    .xray.routes |= map(select(.name != $name)) |
+    .xray.exits |= map(select(.name != $name))
+  ' --arg name "$name"
+  rm -f "$RUNTIME_DIR/pairs/${name}.id"
+  rm -f "$CONTROL_DIR/nodes/${name}.json" "$CONTROL_DIR/reports/${name}.json"
+  log "Removed paired worker $name"
+}
+
+cmd_control_apply() {
+  local prepare_only=0 payload
+  if [[ "${1:-}" == "--prepare-only" ]]; then
+    prepare_only=1
+    shift
+  fi
+  (( prepare_only )) || need_root
+  require_state
+  [[ "$(jq -r '.node.role' "$STATE_FILE")" == "exit" ]] ||
+    die "control apply 只允许在从服务器执行"
+  payload="$(cat)"
+  jq -e '
+    type == "array" and
+    (map(.name) | length == (unique | length)) and
+    (map(.uuid) | length == (unique | length)) and
+    (map(.subscription_token) | length == (unique | length)) and
+    all(.[];
+      (.name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")) and
+      (.uuid | type == "string" and test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$")) and
+      (.hy2_password | type == "string" and length <= 512 and (test("[\u0000-\u001f\u007f]") | not)) and
+      (.enabled | type == "boolean") and
+      (.expires_at == null or (.expires_at | type == "string")) and
+      (.routes | type == "array" and all(.[]; type == "string" and test("^[A-Za-z0-9._-]{1,64}$|^\\*$"))) and
+      (.subscription_prefix | type == "string" and test("^[0-9a-fA-F]{8}$")) and
+      (.subscription_token | type == "string" and test("^[0-9a-fA-F]{40}$")) and
+      ((.speed_limit // {up_mbps: 0, down_mbps: 0}) |
+        type == "object" and
+        (.up_mbps | type == "number" and floor == . and . >= 0 and . <= 100000) and
+        (.down_mbps | type == "number" and floor == . and . >= 0 and . <= 100000)) and
+      ((.usage_epoch // "") | type == "string" and length <= 128)
+    )
+  ' <<<"$payload" >/dev/null || die "Invalid WSS configuration payload"
+  state_update '.users = $users' --argjson users "$payload"
+  if (( prepare_only )); then
+    cmd_render
+  else
+    cmd_apply
+  fi
+  log "WSS configuration applied for $(jq 'length' <<<"$payload") users"
+}
+
+cmd_control_status() {
+  require_state
+  local role node name desired report
+  role="$(jq -r '.node.role' "$STATE_FILE")"
+  if [[ "$role" == "exit" ]]; then
+    printf 'Agent：%s\n' "$(systemctl is-active etxr-agent.service 2>/dev/null || true)"
+    printf '当前版本：%s\n' "$(cat "$RUNTIME_DIR/control-version" 2>/dev/null || printf '-')"
+    printf '控制地址：%s\n' "$(jq -r '.control.agent.base_url' "$STATE_FILE")"
+    return
+  fi
+  render_control_desired
+  printf '从服务器\t目标版本\t已应用版本\t状态\t最后回报\n'
+  while IFS= read -r node; do
+    [[ -n "$node" ]] || continue
+    name="$(jq -r '.name' <<<"$node")"
+    desired="$(jq -r '.version' "$CONTROL_DIR/nodes/${name}.json")"
+    report="$CONTROL_DIR/reports/${name}.json"
+    if [[ -f "$report" ]]; then
+      printf '%s\t%s\t%s\t%s\t%s\n' \
+        "$name" "${desired:0:12}" \
+        "$(jq -r '.version // "-"' "$report" | cut -c1-12)" \
+        "$(jq -r '.status // "-"' "$report")" \
+        "$(jq -r '.received_at // "-"' "$report")"
+    else
+      printf '%s\t%s\t-\t等待连接\t-\n' "$name" "${desired:0:12}"
+    fi
+  done < <(jq -c '(.paired_nodes // [])[]' "$STATE_FILE")
+}
+
+cmd_control() {
+  local action="${1:-}"; shift || true
+  case "$action" in
+    apply) cmd_control_apply "$@" ;;
+    status) cmd_control_status ;;
+    helper) install_control_helper ;;
+    data-helper) install_data_helper ;;
+    *) die "Usage: etxr control apply|status" ;;
+  esac
+}
+
+cmd_cluster() {
+  local action="${1:-}"; shift || true
+  case "$action" in
+    master-init) cmd_cluster_master_init "$@" ;;
+    *) die "Usage: etxr cluster master-init" ;;
+  esac
+}
+
+cmd_pair() {
+  local action="${1:-}"; shift || true
+  case "$action" in
+    create) cmd_pair_create "$@" ;;
+    join) cmd_pair_join "$@" ;;
+    list) cmd_pair_list ;;
+    remove) cmd_pair_remove "$@" ;;
+    decode)
+      local fingerprint="" id="${1:-}"
+      [[ "$id" != "--fingerprint" ]] || {
+        fingerprint="${2:-}"
+        id="${3:-}"
+      }
+      pair_decode "$id" "$fingerprint" | jq .
+      ;;
+    *) die "Usage: etxr pair create|join|list|remove" ;;
+  esac
+}
+
+cmd_subscription() {
+  local name="${1:-}"; [[ -n "$name" ]] || die "Usage: etxr subscription USER"
+  require_state
+  local user token prefix domain
+  user="$(active_user_json "$name")" || die "Enabled user not found: $name"
+  subscription_plain "$name"
+  token="$(jq -r '.subscription_token' <<<"$user")"
+  prefix="$(jq -r '.subscription_prefix' <<<"$user")"
+  domain="$(jq -r '.node.domain' "$STATE_FILE")"
+  if [[ "$(jq -r '.nginx.mode' "$STATE_FILE")" != "disabled" ]]; then
+    local port suffix=""
+    port="$(jq -r '.nginx.tls_port' "$STATE_FILE")"
+    [[ "$port" == "443" ]] || suffix=":${port}"
+    printf '\nSubscription URL: https://%s%s/%s/%s\n' "$domain" "$suffix" "$prefix" "$token"
+  fi
+}
+
+cmd_client() {
+  local name="${1:-}" route_name="" socks_port=10808 out=""
+  [[ -n "$name" ]] || die "Usage: etxr client USER --route ROUTE [--socks-port 10808] [--out FILE]"
+  shift || true
+  while (($#)); do
+    case "$1" in
+      --route) route_name="$2"; shift 2 ;;
+      --socks-port) socks_port="$2"; shift 2 ;;
+      --out) out="$2"; shift 2 ;;
+      --help)
+        echo "Usage: etxr client USER --route ROUTE [--socks-port 10808] [--out FILE]"
+        return ;;
+      *) die "Unknown client option: $1" ;;
+    esac
+  done
+  require_state
+  [[ -n "$route_name" ]] || die "--route is required"
+  valid_port "$socks_port" || die "Invalid SOCKS port"
+  local user route domain address tls_port result
+  user="$(active_user_json "$name")" || die "Enabled user not found: $name"
+  route="$(jq -ce --arg name "$route_name" '.xray.routes[] | select(.name == $name)' "$STATE_FILE")" ||
+    die "Route not found: $route_name"
+  jq -e --arg route "$route_name" '
+    (.routes | index("*")) != null or (.routes | index($route)) != null
+  ' <<<"$user" >/dev/null || die "User $name is not allowed on route $route_name"
+  domain="$(jq -r '.node.domain' "$STATE_FILE")"
+  address="$(jq -r '.node.address' "$STATE_FILE")"
+  tls_port="$(jq -r '.nginx.tls_port' "$STATE_FILE")"
+
+  result="$(jq -n \
+    --argjson user "$user" --argjson route "$route" \
+    --arg domain "$domain" --arg address "$address" \
+    --argjson tls_port "$tls_port" --argjson socks_port "$socks_port" '
+    {
+      log: {loglevel: "warning"},
+      inbounds: [{
+        tag: "socks-in",
+        listen: "127.0.0.1",
+        port: $socks_port,
+        protocol: "socks",
+        settings: {udp: true}
+      }],
+      outbounds: [{
+        tag: ("gateway-" + $route.name),
+        protocol: "vless",
+        settings: {
+          vnext: [{
+            address: $address,
+            port: $tls_port,
+            users: [{
+              id: $user.uuid,
+              encryption: ($route.client_encryption // "none"),
+              level: 0
+            } + (if ($route.flow // "") == "" then {} else {flow: $route.flow} end)]
+          }]
+        },
+        streamSettings: {
+          network: "xhttp",
+          security: "tls",
+          tlsSettings: {
+            serverName: $domain,
+            allowInsecure: false,
+            alpn: ["h2"],
+            fingerprint: "chrome"
+          },
+          xhttpSettings: {
+            host: (if ($route.host // "") == "" then $domain else $route.host end),
+            path: $route.path,
+            mode: "auto",
+            extra: {
+              noGRPCHeader: false,
+              scMaxEachPostBytes: 1000000,
+              scMinPostsIntervalMs: 30,
+              xPaddingBytes: "100-1000",
+              xmux: {
+                maxConcurrency: "16-32",
+                maxConnections: 0,
+                cMaxReuseTimes: "64-128",
+                cMaxLifetimeMs: 0,
+                hMaxRequestTimes: "800-900",
+                hKeepAlivePeriod: 0
+              }
+            }
+          },
+          sockopt: {
+            tcpFastOpen: true,
+            tcpNoDelay: true
+          }
+        }
+      }]
+    }')"
+  if [[ -n "$out" ]]; then
+    printf '%s\n' "$result" | atomic_write "$out"
+    log "Client config written to $out"
+  else
+    printf '%s\n' "$result"
+  fi
+}
+
+cmd_status() {
+  require_state
+  jq '{
+    node,
+    nginx: {
+      mode: .nginx.mode,
+      tls_port: .nginx.tls_port,
+      shared_tcp443: (.nginx.shared_tcp443 // false),
+      https_listen_port: (.nginx.https_listen_port // .nginx.tls_port)
+    },
+    users: (.users | length),
+    easytier: {
+      enabled: (.easytier.enabled // false),
+      ipv4: (.easytier.ipv4 // ""),
+      endpoint: (.easytier.public_endpoint // ""),
+      peer: (.easytier.peer // "")
+    },
+    paired_nodes: [(.paired_nodes // [])[] | {
+      name, easytier_ip, public_host, route_path
+    }],
+    routes: [.xray.routes[] | {name,path,port,target,profile}],
+    exits: [.xray.exits[] | {name,address,port,transport}],
+    reality: [.xray.reality_inbounds[] |
+      {name, public_port: .port, listen_port: (.listen_port // .port), path}],
+    hysteria2: {enabled: .hysteria2.enabled, port: .hysteria2.port}
+  }' "$STATE_FILE"
+  command -v systemctl >/dev/null 2>&1 || return 0
+  systemctl --no-pager --full status etxr-easytier.service 2>/dev/null | sed -n '1,8p' || true
+  systemctl --no-pager --full status etxr-limiter.service 2>/dev/null | sed -n '1,8p' || true
+  systemctl --no-pager --full status etxr-xray.service 2>/dev/null | sed -n '1,8p' || true
+  systemctl --no-pager --full status etxr-sing-box.service 2>/dev/null | sed -n '1,8p' || true
+  systemctl --no-pager --full status etxr-meter.service 2>/dev/null | sed -n '1,8p' || true
+  systemctl --no-pager --full status etxr-control.service 2>/dev/null | sed -n '1,8p' || true
+  systemctl --no-pager --full status etxr-agent.service 2>/dev/null | sed -n '1,8p' || true
+}
+
+menu_exec() {
+  if ( "$@" ); then
+    return 0
+  else
+    local rc=$?
+    printf '%s操作失败，返回码：%s%s\n' "$C_RED" "$rc" "$C_RESET" >&2
+    return "$rc"
+  fi
+}
+
+menu_apply_prompt() {
+  printf '\n%s正在自动保存并检查配置，请稍候……%s\n' "$C_CYAN" "$C_RESET"
+  if menu_exec cmd_apply; then
+    printf '%s✓ 已保存并生效，不需要再做其他操作。%s\n' "$C_GREEN" "$C_RESET"
+  else
+    printf '%s✗ 配置没有生效，旧服务仍会尽量保持不变。%s\n' "$C_RED" "$C_RESET"
+    printf '请在主菜单选择“一键检查”，查看具体原因。\n'
+    return 1
+  fi
+}
+
+service_badge() {
+  local service="$1" state
+  state="$(systemctl is-active "$service" 2>/dev/null || true)"
+  if [[ "$state" == "active" ]]; then
+    printf '%s正常%s' "$C_GREEN" "$C_RESET"
+  elif [[ "$state" == "inactive" ]]; then
+    printf '%s已停止%s' "$C_YELLOW" "$C_RESET"
+  else
+    printf '%s异常%s' "$C_RED" "$C_RESET"
+  fi
+}
+
+friendly_role() {
+  case "$1" in
+    gateway) printf '主服务器' ;;
+    exit) printf '从服务器' ;;
+    hybrid) printf '主从混合服务器' ;;
+    *) printf '未初始化' ;;
+  esac
+}
+
+menu_header() {
+  clear_screen
+  printf '%s%s╔════════════════════════════════════════════════════╗%s\n' "$C_BOLD" "$C_BLUE" "$C_RESET"
+  printf '%s%s║       ETXR 简易管理面板  v%-15s║%s\n' \
+    "$C_BOLD" "$C_CYAN" "$VERSION" "$C_RESET"
+  printf '%s%s╚════════════════════════════════════════════════════╝%s\n' "$C_BOLD" "$C_BLUE" "$C_RESET"
+  if [[ -f "$STATE_FILE" ]] && command -v jq >/dev/null 2>&1; then
+    local node role domain users routes peers control_service
+    node="$(jq -r '.node.name // "-"' "$STATE_FILE" 2>/dev/null || printf '-')"
+    role="$(jq -r '.node.role // "-"' "$STATE_FILE" 2>/dev/null || printf '-')"
+    domain="$(jq -r '.node.domain // "-"' "$STATE_FILE" 2>/dev/null || printf '-')"
+    users="$(jq -r '.users | length' "$STATE_FILE" 2>/dev/null || printf '0')"
+    routes="$(jq -r '.xray.routes | length' "$STATE_FILE" 2>/dev/null || printf '0')"
+    peers="$(jq -r '(.paired_nodes // []) | length' "$STATE_FILE" 2>/dev/null || printf '0')"
+    if [[ "$role" == "exit" ]]; then
+      control_service="etxr-agent.service"
+    else
+      control_service="etxr-control.service"
+    fi
+    printf ' 当前机器：%s（%s）\n' "$node" "$(friendly_role "$role")"
+    printf ' 连接域名：%s\n' "$domain"
+    printf ' 运行状态：Xray [%s]  组网 [%s]  HY2 [%s]\n' \
+      "$(service_badge etxr-xray.service)" \
+      "$(service_badge etxr-easytier.service)" \
+      "$(service_badge etxr-sing-box.service)"
+    printf ' 配置下发：%s [%s]\n' \
+      "$([[ "$role" == "exit" ]] && printf '接收端' || printf '主控端')" \
+      "$(service_badge "$control_service")"
+    printf ' 用户统计：[%s]\n' "$(service_badge etxr-meter.service)"
+    printf ' 已有配置：%s 个用户 / %s 条线路 / %s 台从服务器\n' \
+      "$users" "$routes" "$peers"
+  else
+    printf ' %s这台机器还没有安装，请选择下面的 1 或 2。%s\n' \
+      "$C_YELLOW" "$C_RESET"
+  fi
+  printf '%s\n' '──────────────────────────────────────────────────────'
+}
+
+menu_quick_init() {
+  clear_screen
+  printf '%s%s【主服务器安装向导】%s\n\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+  printf '每一项都提供默认值，直接回车即可使用；填写后会立即检查格式。\n'
+  printf '本机端口会检查是否已占用，宝塔 nginx 共用的 HTTPS 端口除外。\n\n'
+  local is_baota=0 install_components="xray,sing-box,easytier,nginx"
+  if [[ -x /www/server/nginx/sbin/nginx ]]; then
+    is_baota=1
+    install_components="xray,sing-box,easytier"
+    printf '%s✓ 已检测到宝塔，将复用宝塔 nginx 和证书。%s\n' "$C_GREEN" "$C_RESET"
+    printf '  不会修改其他网站，也不会安装第二套 nginx。\n'
+  else
+    printf '%s提示：未检测到宝塔，将自动安装独立 nginx。%s\n' "$C_YELLOW" "$C_RESET"
+  fi
+
+  if [[ -f "$STATE_FILE" ]]; then
+    printf '\n%s注意：这台机器已经初始化过。%s\n' "$C_RED" "$C_RESET"
+    printf '继续会重建本脚本的用户和线路；其他宝塔网站不受影响。\n'
+    if ! menu_confirm "确定要重新初始化"; then
+      return
+    fi
+    FORCE=1
+  fi
+
+  local role="gateway" name domain address mode cert key snippet=""
+  local xhttp_enabled reality_enabled hy2_enabled tls_port route_port route_path
+  local shared_tcp443=false https_listen_port=8443 reality_listen_port
+  local reality_port reality_path reality_target reality_sni
+  local hy2_port hy2_obfs_password hy2_masquerade hy2_up hy2_down
+  local et_ip et_endpoint et_port et_name et_secret
+  local username user_uuid user_password user_up user_down
+  local value default_uuid default_password
+  printf '\n'
+  name="$(prompt_name_value '给这台机器起个短名字' 'hk')"
+  domain="$(prompt_hostname_value '填写已解析到本机的域名' 'hk.example.com')"
+  address="$domain"
+
+  if (( is_baota )); then
+    mode="snippet"
+    cert="/www/server/panel/vhost/cert/${domain}/fullchain.pem"
+    key="/www/server/panel/vhost/cert/${domain}/privkey.pem"
+    snippet="/www/server/panel/vhost/nginx/extension/${domain}/etxr.conf"
+  else
+    mode="standalone"
+    cert="/etc/letsencrypt/live/${domain}/fullchain.pem"
+    key="/etc/letsencrypt/live/${domain}/privkey.pem"
+  fi
+
+  if [[ -f "$cert" && -f "$key" ]]; then
+    printf '%s✓ 已找到域名证书，不需要手动填写路径。%s\n' "$C_GREEN" "$C_RESET"
+  else
+    printf '%s没有在默认位置找到证书。%s\n' "$C_YELLOW" "$C_RESET"
+    cert="$(prompt_value '证书文件路径' "$cert")"
+    key="$(prompt_value '证书私钥路径' "$key")"
+  fi
+
+  printf '\n%s【入口协议】%s\n' "$C_BOLD" "$C_RESET"
+  xhttp_enabled="$(prompt_bool '启用 HTTPS/XHTTP 主入口' y)"
+  if [[ "$xhttp_enabled" == "y" ]]; then
+    while true; do
+      tls_port="$(prompt_port_value 'HTTPS/XHTTP TCP 端口' '443')"
+      if port_is_listening tcp "$tls_port"; then
+        if (( is_baota )) && port_is_nginx_owned tcp "$tls_port"; then
+          printf '%s✓ TCP %s 已由宝塔 nginx 监听，将安全共用。%s\n' \
+            "$C_GREEN" "$tls_port" "$C_RESET"
+          break
+        fi
+        warn "TCP 端口 $tls_port 已被其他程序占用"
+        continue
+      fi
+      break
+    done
+    route_port="$(prompt_port_checked 'Xray XHTTP 本地端口' '18001' tcp)"
+    route_path="$(prompt_path_value 'XHTTP Path' "/$(random_hex 12)")"
+  else
+    tls_port=443
+    route_port=18001
+    route_path="/$(random_hex 12)"
+  fi
+
+  reality_enabled="$(prompt_bool '启用 Reality + XHTTP 入口' n)"
+  if [[ "$reality_enabled" == "y" ]]; then
+    if (( is_baota )) && [[ "$xhttp_enabled" == "y" ]]; then
+      shared_tcp443="$(prompt_bool 'Reality 与宝塔网站共用 TCP 443' y)"
+    fi
+    if [[ "$shared_tcp443" == "y" ]]; then
+      tls_port=443
+      https_listen_port="$(prompt_port_checked '宝塔 HTTPS 内部监听 TCP 端口' '8443' tcp)"
+      reality_port=443
+      reality_listen_port="$(prompt_port_checked 'Reality 本地监听 TCP 端口' '18443' tcp)"
+      printf '%s共享 TCP 443 需要把宝塔所有 HTTPS vhost 改为 127.0.0.1:%s；脚本不会自动修改其他网站。%s\n' \
+        "$C_YELLOW" "$https_listen_port" "$C_RESET"
+    else
+      reality_port="$(prompt_port_checked 'Reality TCP 端口' '18443' tcp)"
+      reality_listen_port="$reality_port"
+    fi
+    reality_path="$(prompt_path_value 'Reality XHTTP Path' "/$(random_hex 12)")"
+    reality_target="$(prompt_target_value 'Reality 伪装网站（目标）' 'aod.itunes.apple.com:443')"
+    reality_sni="$(prompt_hostname_value 'Reality 伪装域名（SNI）' "${reality_target%%:*}")"
+  else
+    reality_port=18443
+    reality_listen_port=18443
+    reality_path="/$(random_hex 12)"
+    reality_target="aod.itunes.apple.com:443"
+    reality_sni="aod.itunes.apple.com"
+  fi
+
+  hy2_enabled="$(prompt_bool '启用 Hysteria2' y)"
+  if [[ "$hy2_enabled" == "y" ]]; then
+    hy2_port="$(prompt_port_checked 'Hysteria2 UDP 端口' '8443' udp)"
+    hy2_up="$(prompt_mbps 'Hysteria2 服务器总上传 Mbps，0 表示不限' '0')"
+    hy2_down="$(prompt_mbps 'Hysteria2 服务器总下载 Mbps，0 表示不限' '0')"
+    hy2_obfs_password="$(prompt_secret_default 'Hysteria2 混淆密码' "$(random_password)")"
+    hy2_masquerade="$(prompt_url_value 'Hysteria2 伪装网站' "https://${domain}")"
+  else
+    hy2_port=8443
+    hy2_up=0
+    hy2_down=0
+    hy2_obfs_password="$(random_password)"
+    hy2_masquerade="https://${domain}"
+  fi
+
+  printf '\n%s【管理员账号】%s\n' "$C_BOLD" "$C_RESET"
+  username="$(prompt_name_value '管理员用户名' 'admin')"
+  default_uuid="$(random_uuid)"
+  default_password="$(random_password)"
+  user_uuid="$(prompt_uuid_value '管理员 UUID' "$default_uuid")"
+  user_password="$(prompt_secret_default '管理员 Hysteria2 密码' "$default_password")"
+  user_up="$(prompt_mbps '管理员上传限速 Mbps（0 表示不限速）' '0')"
+  user_down="$(prompt_mbps '管理员下载限速 Mbps（0 表示不限速）' '0')"
+  [[ -n "$user_password" ]] || {
+    warn "密码不能为空"
+    FORCE=0
+    return
+  }
+
+  printf '\n%s【主从组网】%s\n' "$C_BOLD" "$C_RESET"
+  et_ip="$(prompt_ipv4_value '主服务器 EasyTier 私网 IP' '10.100.0.1')"
+  et_endpoint="$(detect_public_ipv4)"
+  et_endpoint="${et_endpoint:-$address}"
+  et_endpoint="$(prompt_hostname_value '主服务器公网 IP 或域名' "$et_endpoint")"
+  et_port="$(prompt_port_checked '主从组网 TCP 端口' '11010' tcp)"
+  et_name="$(prompt_name_value 'EasyTier 网络名称' "er-$(random_hex 8)")"
+  et_secret="$(prompt_secret_default 'EasyTier 网络密钥' "$(random_hex 24)")"
+
+  if [[ "$shared_tcp443" == "y" ]]; then
+    shared_tcp443=true
+  else
+    shared_tcp443=false
+  fi
+  printf '\n%s【配置确认】%s\n' "$C_BOLD" "$C_RESET"
+  printf '  • HTTPS/XHTTP：%s' "$([[ "$xhttp_enabled" == "y" ]] && printf '开启' || printf '关闭')"
+  [[ "$xhttp_enabled" != "y" ]] || printf '，TCP %s，本地 %s，Path %s' "$tls_port" "$route_port" "$route_path"
+  printf '\n  • Reality：%s' "$([[ "$reality_enabled" == "y" ]] && printf '开启' || printf '关闭')"
+  [[ "$reality_enabled" != "y" ]] || printf '，公网 TCP %s，本地 %s，SNI %s' \
+    "$reality_port" "$reality_listen_port" "$reality_sni"
+  printf '\n  • Hysteria2：%s' "$([[ "$hy2_enabled" == "y" ]] && printf '开启' || printf '关闭')"
+  [[ "$hy2_enabled" != "y" ]] || printf '，UDP %s，伪装 %s' "$hy2_port" "$hy2_masquerade"
+  printf '\n  • 主从组网：TCP %s，私网 IP %s\n' "$et_port" "$et_ip"
+  printf '  • 管理员：%s，上传 %s，下载 %s\n\n' \
+    "$username" \
+    "$([[ "$user_up" == "0" ]] && printf '不限速' || printf '%s Mbps' "$user_up")" \
+    "$([[ "$user_down" == "0" ]] && printf '不限速' || printf '%s Mbps' "$user_down")"
+  if ! menu_confirm "确认开始安装"; then
+    FORCE=0
+    return
+  fi
+
+  printf '\n正在安装所需组件，通常需要 1～3 分钟……\n'
+  menu_exec cmd_install --components "$install_components" || {
+    FORCE=0
+    menu_pause
+    return
+  }
+  need_jq
+  need_cmd openssl
+
+  local -a args=(
+    --name "$name" --role "$role" --domain "$domain" --address "$address"
+    --nginx-mode "$mode" --cert "$cert" --key "$key" --tls-port "$tls_port"
+    --nginx-shared-tcp443 "$shared_tcp443"
+    --nginx-https-listen-port "$https_listen_port"
+  )
+  [[ "$mode" != "snippet" ]] || args+=(--snippet "$snippet")
+  menu_exec cmd_init "${args[@]}" || {
+    FORCE=0
+    menu_pause
+    return
+  }
+  FORCE=0
+  local route_name reality_keys reality_private reality_public reality_short
+  menu_exec cmd_cluster_master_init --ip "$et_ip" --endpoint "$et_endpoint" \
+    --port "$et_port" --network-name "$et_name" --network-secret "$et_secret" || {
+    menu_pause
+    return
+  }
+
+  menu_exec cmd_user_add --name "$username" --uuid "$user_uuid" \
+    --password "$user_password" --up-mbps "$user_up" \
+    --down-mbps "$user_down" || {
+    menu_pause
+    return
+  }
+
+  route_name="$name"
+  if [[ "$xhttp_enabled" == "y" ]]; then
+    menu_exec cmd_route_add --name "$route_name" --path "$route_path" \
+      --port "$route_port" --target direct || {
+        menu_pause
+        return
+      }
+  fi
+
+  if [[ "$reality_enabled" == "y" ]]; then
+    reality_keys="$("$XRAY_BIN" x25519)"
+    reality_private="$(awk -F': ' '/^PrivateKey:/ {print $2; exit}' <<<"$reality_keys")"
+    reality_public="$(awk -F': ' '/^Password/ {print $2; exit}' <<<"$reality_keys")"
+    if [[ -z "$reality_public" ]]; then
+      reality_public="$(awk -F': ' '/^PublicKey:/ {print $2; exit}' <<<"$reality_keys")"
+    fi
+    [[ -n "$reality_private" && -n "$reality_public" ]] || {
+      warn "无法解析 Xray Reality 密钥输出"
+      menu_pause
+      return
+    }
+    reality_short="$(random_hex 8)"
+    menu_exec cmd_reality_add --name reality --port "$reality_port" \
+      --listen-port "$reality_listen_port" \
+      --listen-address "$([[ "$shared_tcp443" == "true" ]] && printf '127.0.0.1' || printf '0.0.0.0')" \
+      --path "$reality_path" --target "$reality_target" \
+      --server-names "$reality_sni" --private-key "$reality_private" \
+      --public-key "$reality_public" --short-ids "$reality_short" || {
+        menu_pause
+        return
+      }
+  fi
+
+  if [[ "$hy2_enabled" == "y" ]]; then
+    menu_exec cmd_hy2_enable --port "$hy2_port" --up-mbps "$hy2_up" \
+      --down-mbps "$hy2_down" --obfs salamander \
+      --obfs-password "$hy2_obfs_password" --masquerade "$hy2_masquerade" || {
+        menu_pause
+        return
+      }
+  fi
+  printf '\n%s✓ 基础配置已经生成。%s\n' "$C_GREEN" "$C_RESET"
+  if [[ ! -f "$cert" || ! -f "$key" ]]; then
+    printf '%s证书文件不存在，暂时没有启动。先在面板申请证书，再选择“一键检查与修复”。%s\n' \
+      "$C_YELLOW" "$C_RESET"
+  elif menu_apply_prompt; then
+    printf '\n%s客户端订阅如下，请复制保存：%s\n' "$C_BOLD" "$C_RESET"
+    menu_exec cmd_subscription "$username" || true
+  fi
+  menu_pause
+}
+
+menu_users() {
+  local choice name route socks out uuid password default_name up_mbps down_mbps
+  if [[ ! -f "$STATE_FILE" ]]; then
+    warn "请先执行一键安装与初始化"
+    menu_pause
+    return
+  fi
+  while true; do
+    menu_header
+    printf '%s【用户和订阅】%s\n' "$C_BOLD" "$C_RESET"
+    printf '1. 新增一个用户          （逐项确认名称、UUID、密码）\n'
+    printf '2. 复制用户订阅          （手机/电脑直接导入）\n'
+    printf '3. 查看所有用户\n'
+    printf '4. 暂停一个用户          （以后可以恢复）\n'
+    printf '5. 恢复一个用户\n'
+    printf '6. 永久删除用户\n'
+    printf '7. 查看用户流量          （主从服务器自动汇总）\n'
+    printf '8. 设置用户限速          （0 表示不限速）\n'
+    printf '9. 清零用户流量\n'
+    printf '10. 导出单线路配置       （高级功能）\n'
+    printf '0. 返回主菜单\n\n'
+    read -r -p '请选择: ' choice
+    case "$choice" in
+      1)
+        default_name="user$(( $(jq '.users | length' "$STATE_FILE") + 1 ))"
+        name="$(prompt_name_value '用户名' "$default_name")"
+        uuid="$(prompt_uuid_value '用户 UUID' "$(random_uuid)")"
+        password="$(prompt_secret_default 'Hysteria2 用户密码' "$(random_password)")"
+        up_mbps="$(prompt_mbps '上传限速 Mbps（0 表示不限速）' '0')"
+        down_mbps="$(prompt_mbps '下载限速 Mbps（0 表示不限速）' '0')"
+        if menu_exec cmd_user_add --name "$name" --uuid "$uuid" \
+          --password "$password" --up-mbps "$up_mbps" \
+          --down-mbps "$down_mbps"; then
+          if menu_apply_prompt; then
+            printf '\n%s下面就是该用户的订阅：%s\n' "$C_BOLD" "$C_RESET"
+            menu_exec cmd_subscription "$name" || true
+          fi
+        fi
+        menu_pause
+        ;;
+      2)
+        cmd_user_list || true
+        name="$(prompt_value '要查看哪个用户的订阅')"
+        menu_exec cmd_subscription "$name" || true
+        menu_pause
+        ;;
+      3) menu_exec cmd_user_list || true; menu_pause ;;
+      4)
+        cmd_user_list || true
+        name="$(prompt_value '要暂停的用户名')"
+        if menu_exec cmd_user disable "$name"; then menu_apply_prompt || true; fi
+        menu_pause
+        ;;
+      5)
+        cmd_user_list || true
+        name="$(prompt_value '要恢复的用户名')"
+        if menu_exec cmd_user enable "$name"; then menu_apply_prompt || true; fi
+        menu_pause
+        ;;
+      6)
+        cmd_user_list || true
+        name="$(prompt_value '要删除的用户名')"
+        if menu_confirm "永久删除 ${name}，确定继续"; then
+          if menu_exec cmd_user_remove "$name"; then menu_apply_prompt || true; fi
+        fi
+        menu_pause
+        ;;
+      7)
+        menu_exec cmd_user_usage || true
+        menu_pause
+        ;;
+      8)
+        cmd_user_list || true
+        name="$(prompt_value '要设置哪个用户')"
+        up_mbps="$(jq -r --arg name "$name" \
+          '.users[] | select(.name == $name) | (.speed_limit.up_mbps // 0)' \
+          "$STATE_FILE" 2>/dev/null || printf '0')"
+        down_mbps="$(jq -r --arg name "$name" \
+          '.users[] | select(.name == $name) | (.speed_limit.down_mbps // 0)' \
+          "$STATE_FILE" 2>/dev/null || printf '0')"
+        up_mbps="$(prompt_mbps '上传限速 Mbps（0 表示不限速）' "${up_mbps:-0}")"
+        down_mbps="$(prompt_mbps '下载限速 Mbps（0 表示不限速）' "${down_mbps:-0}")"
+        if menu_exec cmd_user_limit "$name" --up-mbps "$up_mbps" \
+          --down-mbps "$down_mbps"; then
+          menu_apply_prompt || true
+        fi
+        menu_pause
+        ;;
+      9)
+        cmd_user_usage || true
+        name="$(prompt_value '要清零哪个用户（全部用户填 all）')"
+        if menu_confirm "清零 ${name} 在主从所有服务器上的累计流量，确定继续"; then
+          if menu_exec cmd_user_reset_usage "$name"; then
+            menu_apply_prompt || true
+          fi
+        fi
+        menu_pause
+        ;;
+      10)
+        name="$(prompt_value '用户名称')"
+        cmd_route_list || true
+        route="$(prompt_value '线路名称')"
+        socks="$(prompt_value '本地 SOCKS 端口' '10808')"
+        out="$(prompt_value '输出文件' "/root/${name}-${route}-client.json")"
+        menu_exec cmd_client "$name" --route "$route" --socks-port "$socks" --out "$out" || true
+        menu_pause
+        ;;
+      0) return ;;
+      *) warn "无效选项"; sleep 1 ;;
+    esac
+  done
+}
+
+next_route_port() {
+  require_state
+  jq -r '[.xray.routes[].port] | (max // 18000) + 1' "$STATE_FILE"
+}
+
+generate_vlessenc_pair() {
+  if [[ ! -x "$XRAY_BIN" ]]; then
+    warn "请先安装 Xray"
+    return 1
+  fi
+  local output
+  output="$("$XRAY_BIN" vlessenc)"
+  VLESSENC_DECRYPTION="$(awk -F'"' '/"decryption"/ {v=$4} END {print v}' <<<"$output")"
+  VLESSENC_ENCRYPTION="$(awk -F'"' '/"encryption"/ {v=$4} END {print v}' <<<"$output")"
+  if [[ -z "$VLESSENC_DECRYPTION" || -z "$VLESSENC_ENCRYPTION" ]]; then
+    warn "无法解析 xray vlessenc 输出"
+    return 1
+  fi
+}
+
+menu_routes() {
+  local choice name path port target
+  if [[ ! -f "$STATE_FILE" ]]; then
+    warn "请先执行一键安装与初始化"
+    menu_pause
+    return
+  fi
+  while true; do
+    menu_header
+    printf '%s入口 Path 管理%s\n' "$C_BOLD" "$C_RESET"
+    printf '1. 查看 Path\n'
+    printf '2. 添加普通 TLS/XHTTP Path\n'
+    printf '3. 添加 VLESS Encryption + Vision + XMUX Path\n'
+    printf '4. 删除 Path\n'
+    printf '0. 返回主菜单\n\n'
+    read -r -p '请选择: ' choice
+    case "$choice" in
+      1) menu_exec cmd_route_list || true; menu_pause ;;
+      2|3)
+        name="$(prompt_value '线路名称')"
+        path="$(prompt_value '入口 Path' "/$(random_hex 12)")"
+        port="$(prompt_value 'Xray 本地端口' "$(next_route_port)")"
+        cmd_exit_list || true
+        target="$(prompt_value '出口名称，direct 表示本机' 'direct')"
+        if [[ "$choice" == "3" ]]; then
+          if generate_vlessenc_pair; then
+            menu_exec cmd_route_add --name "$name" --path "$path" --port "$port" \
+              --target "$target" --profile vlessenc-vision \
+              --decryption "$VLESSENC_DECRYPTION" \
+              --client-encryption "$VLESSENC_ENCRYPTION" || true
+          fi
+        else
+          menu_exec cmd_route_add --name "$name" --path "$path" --port "$port" \
+            --target "$target" || true
+        fi
+        menu_apply_prompt || true
+        menu_pause
+        ;;
+      4)
+        cmd_route_list || true
+        name="$(prompt_value '要删除的线路名称')"
+        if menu_confirm "确认删除 ${name}"; then
+          menu_exec cmd_route_remove "$name" || true
+          menu_apply_prompt || true
+        fi
+        menu_pause
+        ;;
+      0) return ;;
+      *) warn "无效选项"; sleep 1 ;;
+    esac
+  done
+}
+
+menu_exits() {
+  local choice name address port server_name host path uuid public_key short_id
+  if [[ ! -f "$STATE_FILE" ]]; then
+    warn "请先执行一键安装与初始化"
+    menu_pause
+    return
+  fi
+  while true; do
+    menu_header
+    printf '%s远程出口管理%s\n' "$C_BOLD" "$C_RESET"
+    printf '1. 查看远程出口\n'
+    printf '2. 添加 TLS/XHTTP 出口\n'
+    printf '3. 添加 Reality/XHTTP 出口\n'
+    printf '4. 添加私网 VLESS Encryption 出口\n'
+    printf '5. 删除出口\n'
+    printf '0. 返回主菜单\n\n'
+    read -r -p '请选择: ' choice
+    case "$choice" in
+      1) menu_exec cmd_exit_list || true; menu_pause ;;
+      2)
+        name="$(prompt_value '出口名称，例如 tw/us')"
+        address="$(prompt_value '出口域名或地址')"
+        server_name="$(prompt_value 'TLS SNI' "$address")"
+        host="$(prompt_value 'XHTTP Host' "$server_name")"
+        port="$(prompt_value '公网端口' '443')"
+        path="$(prompt_value '出口机中继 Path' "/$(random_hex 12)")"
+        uuid="$(prompt_value '出口机中继 UUID，留空自动生成')"
+        uuid="${uuid:-$(random_uuid)}"
+        menu_exec cmd_exit_add --name "$name" --address "$address" --port "$port" \
+          --transport tls --server-name "$server_name" --host "$host" \
+          --path "$path" --uuid "$uuid" || true
+        printf '\n请在出口机创建：UUID=%s  Path=%s\n' "$uuid" "$path"
+        menu_pause
+        ;;
+      3)
+        name="$(prompt_value '出口名称')"
+        address="$(prompt_value '出口 IP 或域名')"
+        port="$(prompt_value 'Reality 端口' '443')"
+        server_name="$(prompt_value 'Reality SNI')"
+        path="$(prompt_value 'Reality XHTTP Path' "/$(random_hex 12)")"
+        uuid="$(prompt_value '中继 UUID，留空自动生成')"
+        uuid="${uuid:-$(random_uuid)}"
+        public_key="$(prompt_value 'Reality 公钥')"
+        short_id="$(prompt_value 'Reality Short ID')"
+        menu_exec cmd_exit_add --name "$name" --address "$address" --port "$port" \
+          --transport reality --server-name "$server_name" --path "$path" \
+          --uuid "$uuid" --public-key "$public_key" --short-id "$short_id" || true
+        menu_pause
+        ;;
+      4)
+        name="$(prompt_value '出口名称')"
+        address="$(prompt_value 'EasyTier/WireGuard 私网地址')"
+        port="$(prompt_value '私网端口' '18000')"
+        path="$(prompt_value 'XHTTP Path' "/$(random_hex 12)")"
+        uuid="$(prompt_value '中继 UUID，留空自动生成')"
+        uuid="${uuid:-$(random_uuid)}"
+        if generate_vlessenc_pair; then
+          menu_exec cmd_exit_add --name "$name" --address "$address" --port "$port" \
+            --transport none --path "$path" --uuid "$uuid" \
+            --encryption "$VLESSENC_ENCRYPTION" --flow xtls-rprx-vision || true
+          printf '\n%s出口机需要保存以下服务端 decryption：%s\n%s\n' \
+            "$C_YELLOW" "$C_RESET" "$VLESSENC_DECRYPTION"
+          printf 'UUID=%s  Path=%s\n' "$uuid" "$path"
+        fi
+        menu_pause
+        ;;
+      5)
+        cmd_exit_list || true
+        name="$(prompt_value '要删除的出口名称')"
+        if menu_confirm "确认删除 ${name}"; then
+          menu_exec cmd_exit_remove "$name" || true
+        fi
+        menu_pause
+        ;;
+      0) return ;;
+      *) warn "无效选项"; sleep 1 ;;
+    esac
+  done
+}
+
+menu_add_reality() {
+  if [[ ! -x "$XRAY_BIN" ]]; then
+    warn "请先安装 Xray"
+    return 1
+  fi
+  local output private_key public_key short_id name port listen_port path target sni
+  output="$("$XRAY_BIN" x25519)"
+  private_key="$(awk -F': ' '/^PrivateKey:/ {print $2}' <<<"$output")"
+  public_key="$(awk -F': ' '/^Password/ {print $2}' <<<"$output")"
+  short_id="$(random_hex 8)"
+  name="$(prompt_value 'Reality 名称' 'reality')"
+  if [[ "$(jq -r '.nginx.shared_tcp443 // false' "$STATE_FILE")" == "true" ]]; then
+    port=443
+    listen_port="$(prompt_port_value 'Reality 本地监听 TCP 端口' '18443')"
+  else
+    port="$(prompt_value 'Reality TCP 端口' '8444')"
+    listen_port="$port"
+  fi
+  path="$(prompt_value 'Reality XHTTP Path' "/$(random_hex 12)")"
+  target="$(prompt_value 'Reality 目标' 'aod.itunes.apple.com:443')"
+  sni="$(prompt_value 'Reality SNI' "${target%%:*}")"
+  menu_exec cmd_reality_add --name "$name" --port "$port" \
+    --listen-port "$listen_port" --path "$path" \
+    --target "$target" --server-names "$sni" \
+    --private-key "$private_key" --public-key "$public_key" \
+    --short-ids "$short_id" || return
+  printf '\nReality 公钥：%s\nReality Short ID：%s\n' "$public_key" "$short_id"
+}
+
+menu_protocols() {
+  local choice port up down masquerade name
+  if [[ ! -f "$STATE_FILE" ]]; then
+    warn "请先执行一键安装与初始化"
+    menu_pause
+    return
+  fi
+  while true; do
+    menu_header
+    printf '%s独立协议管理%s\n' "$C_BOLD" "$C_RESET"
+    printf '1. 查看 Reality 入站\n'
+    printf '2. 自动添加 Reality + XHTTP 入站\n'
+    printf '3. 删除 Reality 入站\n'
+    printf '4. 启用/修改 Hysteria2\n'
+    printf '5. 禁用 Hysteria2\n'
+    printf '6. 查看 Hysteria2 配置\n'
+    printf '0. 返回主菜单\n\n'
+    read -r -p '请选择: ' choice
+    case "$choice" in
+      1) menu_exec cmd_reality_list || true; menu_pause ;;
+      2) menu_add_reality || true; menu_apply_prompt || true; menu_pause ;;
+      3)
+        cmd_reality_list || true
+        name="$(prompt_value '要删除的 Reality 名称')"
+        menu_exec cmd_reality_remove "$name" || true
+        menu_apply_prompt || true
+        menu_pause
+        ;;
+      4)
+        port="$(prompt_value 'Hysteria2 UDP 端口' '8443')"
+        up="$(prompt_value '服务器上传 Mbps，0 表示不限' '0')"
+        down="$(prompt_value '服务器下载 Mbps，0 表示不限' '0')"
+        masquerade="$(prompt_value '伪装网址' 'https://www.cloudflare.com')"
+        menu_exec cmd_hy2_enable --port "$port" --up-mbps "$up" \
+          --down-mbps "$down" --obfs salamander --masquerade "$masquerade" || true
+        menu_apply_prompt || true
+        menu_pause
+        ;;
+      5)
+        menu_exec cmd_hy2 disable || true
+        menu_apply_prompt || true
+        menu_pause
+        ;;
+      6) menu_exec cmd_hy2 show || true; menu_pause ;;
+      0) return ;;
+      *) warn "无效选项"; sleep 1 ;;
+    esac
+  done
+}
+
+menu_config_actions() {
+  local choice
+  if [[ ! -f "$STATE_FILE" ]]; then
+    warn "请先执行一键安装与初始化"
+    menu_pause
+    return
+  fi
+  while true; do
+    menu_header
+    printf '%s配置生成与应用%s\n' "$C_BOLD" "$C_RESET"
+    printf '1. 生成配置\n'
+    printf '2. 检查配置\n'
+    printf '3. 备份并应用配置\n'
+    printf '4. 备份当前配置\n'
+    printf '0. 返回主菜单\n\n'
+    read -r -p '请选择: ' choice
+    case "$choice" in
+      1) menu_exec cmd_render || true; menu_pause ;;
+      2) menu_exec cmd_validate || true; menu_pause ;;
+      3) menu_exec cmd_apply || true; menu_pause ;;
+      4) menu_exec cmd_backup || true; menu_pause ;;
+      0) return ;;
+      *) warn "无效选项"; sleep 1 ;;
+    esac
+  done
+}
+
+menu_xray() {
+  local choice
+  while true; do
+    menu_header
+    printf '%sXray 管理%s\n' "$C_BOLD" "$C_RESET"
+    printf '1. 查看状态与资源占用\n'
+    printf '2. 启动 Xray\n'
+    printf '3. 停止 Xray\n'
+    printf '4. 重启 Xray\n'
+    printf '5. 查看最近日志\n'
+    printf '6. 查看实时日志\n'
+    printf '7. 实时连接监控\n'
+    printf '8. 检查 Xray 更新\n'
+    printf '9. 更新 Xray（自动备份与回滚）\n'
+    printf '0. 返回主菜单\n\n'
+    read -r -p '请选择: ' choice
+    case "$choice" in
+      1) menu_exec cmd_xray_status || true; menu_pause ;;
+      2) menu_exec cmd_xray_service_action start || true; menu_pause ;;
+      3) menu_exec cmd_xray_service_action stop || true; menu_pause ;;
+      4) menu_exec cmd_xray_service_action restart || true; menu_pause ;;
+      5) menu_exec cmd_xray_logs 100 || true; menu_pause ;;
+      6) menu_exec cmd_xray_follow || true ;;
+      7) menu_exec cmd_xray_monitor || true ;;
+      8) menu_exec cmd_xray_check_update || true; menu_pause ;;
+      9) menu_exec cmd_xray_update || true; menu_pause ;;
+      0) return ;;
+      *) warn "无效选项"; sleep 1 ;;
+    esac
+  done
+}
+
+menu_worker_join() {
+  clear_screen
+  printf '%s%s【从服务器加入向导】%s\n\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+  printf '把主服务器生成的配对 ID 和签名指纹粘贴到下面，然后回车。\n'
+  printf 'Xray、EasyTier、Hysteria2 和所有密钥都会自动安装。\n'
+  printf '%s粘贴时屏幕不会显示字符，这是正常的。%s\n\n' "$C_YELLOW" "$C_RESET"
+  local pairing_id fingerprint
+  pairing_id="$(prompt_secret '请粘贴配对 ID')"
+  [[ -n "$pairing_id" ]] || {
+    warn "配对 ID 为空"
+    menu_pause
+    return
+  }
+  fingerprint="$(prompt_value '请输入主服务器显示的 32 位签名指纹')"
+  [[ "$fingerprint" =~ ^[0-9a-fA-F]{32}$ ]] || {
+    warn "签名指纹必须是 32 位十六进制字符"
+    menu_pause
+    return
+  }
+  if [[ -f "$STATE_FILE" ]]; then
+    printf '%s这台机器已有本脚本配置，继续会替换旧的 ETXR 配置。%s\n' \
+      "$C_YELLOW" "$C_RESET"
+    menu_confirm "确定继续" || {
+      menu_pause
+      return
+    }
+  fi
+  printf '\n正在自动安装并连接主服务器，通常需要 1～3 分钟……\n'
+  if menu_exec cmd_pair_join --fingerprint "$fingerprint" "$pairing_id"; then
+    printf '\n%s✓ 从服务器已加入成功。现在可以回到主服务器复制订阅测试。%s\n' \
+      "$C_GREEN" "$C_RESET"
+  fi
+  menu_pause
+}
+
+menu_pair_create() {
+  if [[ ! -f "$STATE_FILE" ]]; then
+    warn "请先完成主服务器一键初始化"
+    menu_pause
+    return
+  fi
+  if [[ "$(jq -r '.node.role' "$STATE_FILE")" == "exit" ]]; then
+    warn "这台是从服务器。请回到主服务器执行【添加从服务器】。"
+    menu_pause
+    return
+  fi
+  local name public_host="" backup_port=29000 backup_listen_port=29000
+  local relay_private_port=19000 mode_choice
+  local xhttp_enabled reality_enabled hy2_enabled xhttp_port xhttp_listen_port xhttp_path
+  local reality_port reality_path reality_target reality_sni reality_short
+  local hy2_port hy2_password hy2_obfs hy2_masquerade hy2_up hy2_down
+  local relay_uuid user_uuid pair_expires_minutes
+  clear_screen
+  printf '%s%s【给主服务器添加从服务器】%s\n\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+  printf '有公网中继端口时默认公网直连；没有可用端口时自动使用 EasyTier。\n\n'
+  name="$(prompt_name_value '给从服务器起个短名字' 'tw1')"
+  pair_expires_minutes="$(prompt_value '配对 ID 有效期（分钟）' '30')"
+  if [[ ! "$pair_expires_minutes" =~ ^[0-9]+$ ]] ||
+     (( 10#$pair_expires_minutes < 1 || 10#$pair_expires_minutes > 525600 )); then
+    warn "有效期必须是 1 到 525600 分钟之间的整数"
+    menu_pause
+    return
+  fi
+  printf '\n从服务器属于哪种情况？\n'
+  printf '1. 普通/NAT/被墙机器   （没有可用端口，使用 EasyTier）\n'
+  printf '2. 有独立公网入口      （公网直连，EasyTier 自动备用）\n'
+  printf '3. 普通/NAT/被墙机器   （有端口映射，公网直连并自动备用）\n'
+  read -r -p '请选择 [1]: ' mode_choice
+  mode_choice="${mode_choice:-1}"
+  if [[ "$mode_choice" == "2" ]]; then
+    public_host="$(prompt_hostname_value '从服务器的公网 IP 或域名' "${name}.example.com")"
+  elif [[ "$mode_choice" == "3" ]]; then
+    public_host="$(prompt_hostname_value '公网映射地址（IP 或域名）' "${name}.example.com")"
+  elif [[ "$mode_choice" != "1" ]]; then
+    warn "选项无效"
+    menu_pause
+    return
+  fi
+
+  printf '\n%s【主从中继参数】%s\n' "$C_BOLD" "$C_RESET"
+  relay_private_port="$(prompt_port_value 'EasyTier 私网中继 TCP 端口' '19000')"
+  relay_uuid="$(prompt_uuid_value '主从中继 UUID' "$(random_uuid)")"
+  if [[ "$mode_choice" == "2" || "$mode_choice" == "3" ]]; then
+    backup_port="$(prompt_port_value '公网主线路 TCP 端口' '29000')"
+    backup_listen_port="$(prompt_port_value '从服务器公网中继监听 TCP 端口' '29000')"
+  fi
+
+  printf '\n%s【从服务器独立入口】%s\n' "$C_BOLD" "$C_RESET"
+  printf '这里只设置客户端直接连接从服务器的入口；主服务器转发不受影响。\n'
+  xhttp_enabled="$(prompt_bool '启用从服务器 XHTTP + TLS 入口' n)"
+  reality_enabled="$(prompt_bool '启用从服务器 Reality + XHTTP 入口' y)"
+  hy2_enabled="$(prompt_bool '启用从服务器 Hysteria2 入口' y)"
+  user_uuid="$(prompt_uuid_value '从服务器直接入口 UUID' "$(random_uuid)")"
+
+  xhttp_port=18000
+  xhttp_listen_port=18000
+  xhttp_path="/${name}-xhttp-$(random_hex 8)"
+  if [[ "$xhttp_enabled" == "y" ]]; then
+    xhttp_port="$(prompt_port_value 'XHTTP 公网 TCP 端口' '18000')"
+    xhttp_listen_port="$(prompt_port_value 'XHTTP 内部监听 TCP 端口' "$xhttp_port")"
+    xhttp_path="$(prompt_path_value 'XHTTP Path' "$xhttp_path")"
+  fi
+
+  reality_port=18443
+  reality_path="/${name}-reality-$(random_hex 8)"
+  reality_target="aod.itunes.apple.com:443"
+  reality_sni="aod.itunes.apple.com"
+  reality_short="$(random_hex 8)"
+  if [[ "$reality_enabled" == "y" ]]; then
+    reality_port="$(prompt_port_value 'Reality TCP 端口' '18443')"
+    reality_path="$(prompt_path_value 'Reality XHTTP Path' "$reality_path")"
+    reality_target="$(prompt_target_value 'Reality 伪装网站（目标）' 'aod.itunes.apple.com:443')"
+    reality_sni="$(prompt_hostname_value 'Reality 伪装域名（SNI）' "${reality_target%%:*}")"
+    reality_short="$(prompt_value 'Reality Short ID' "$reality_short")"
+    [[ "$reality_short" =~ ^[0-9a-fA-F]{2,32}$ ]] || {
+      warn "Reality Short ID 必须是 2 到 32 位十六进制字符"
+      menu_pause
+      return
+    }
+  fi
+
+  hy2_port=28443
+  hy2_password="$(random_password)"
+  hy2_obfs="$(random_password)"
+  hy2_masquerade="https://www.cloudflare.com"
+  hy2_up=0
+  hy2_down=0
+  if [[ "$hy2_enabled" == "y" ]]; then
+    hy2_port="$(prompt_port_value 'Hysteria2 UDP 端口' '28443')"
+    hy2_password="$(prompt_secret_default 'Hysteria2 用户密码' "$hy2_password")"
+    hy2_obfs="$(prompt_secret_default 'Hysteria2 混淆密码' "$hy2_obfs")"
+    hy2_masquerade="$(prompt_url_value 'Hysteria2 伪装网站' "$hy2_masquerade")"
+    hy2_up="$(prompt_mbps 'Hysteria2 服务器总上传 Mbps，0 表示不限' '0')"
+    hy2_down="$(prompt_mbps 'Hysteria2 服务器总下载 Mbps，0 表示不限' '0')"
+  fi
+
+  printf '\n%s从服务器端口只检查格式，不检查占用；配对加入时会由从服务器实际验证。%s\n' \
+    "$C_YELLOW" "$C_RESET"
+  if [[ "$mode_choice" == "3" ]]; then
+    printf 'NAT 主线路映射：%s:%s -> 从服务器:%s TCP\n' \
+      "$public_host" "$backup_port" "$backup_listen_port"
+    [[ "$xhttp_enabled" != "y" ]] ||
+      printf 'NAT XHTTP 映射：%s:%s -> 从服务器:%s TCP\n' \
+        "$public_host" "$xhttp_port" "$xhttp_listen_port"
+    [[ "$reality_enabled" != "y" ]] ||
+      printf 'NAT Reality 映射：%s:%s -> 从服务器:%s TCP\n' \
+        "$public_host" "$reality_port" "$reality_port"
+    [[ "$hy2_enabled" != "y" ]] ||
+      printf 'NAT Hysteria2 映射：%s:%s -> 从服务器:%s UDP\n' \
+        "$public_host" "$hy2_port" "$hy2_port"
+  fi
+
+  local -a args=(
+    --name "$name"
+    --private-relay-port "$relay_private_port"
+    --relay-uuid "$relay_uuid"
+    --user-uuid "$user_uuid"
+    --public-relay-port "$backup_port"
+    --public-listen-port "$backup_listen_port"
+    --xhttp-port "$xhttp_port"
+    --xhttp-listen-port "$xhttp_listen_port"
+    --xhttp-path "$xhttp_path"
+    --reality-port "$reality_port"
+    --reality-path "$reality_path"
+    --reality-target "$reality_target"
+    --reality-sni "$reality_sni"
+    --reality-short-id "$reality_short"
+    --hy2-port "$hy2_port"
+    --hy2-password "$hy2_password"
+    --hy2-obfs-password "$hy2_obfs"
+    --hy2-masquerade "$hy2_masquerade"
+    --hy2-up-mbps "$hy2_up"
+    --hy2-down-mbps "$hy2_down"
+    --expires-minutes "$pair_expires_minutes"
+  )
+  [[ "$xhttp_enabled" == "y" ]] && args+=(--xhttp-enabled) || args+=(--no-xhttp)
+  [[ "$reality_enabled" == "y" ]] && args+=(--reality-enabled) || args+=(--no-reality)
+  [[ "$hy2_enabled" == "y" ]] && args+=(--hy2-enabled) || args+=(--no-hy2)
+  [[ -z "$public_host" ]] || args+=(--public-host "$public_host")
+  if menu_exec cmd_pair_create "${args[@]}"; then
+    printf '\n%s下一步只有一件事：%s\n' "$C_BOLD" "$C_RESET"
+     printf '%s把上面的 ER2 开头配对 ID 和签名指纹完整复制到从服务器，并选择主菜单第 2 项。%s\n' \
+      "$C_GREEN" "$C_RESET"
+    menu_apply_prompt || true
+  fi
+  menu_pause
+}
+
+menu_pair_manage() {
+  if [[ ! -f "$STATE_FILE" ]]; then
+    warn "尚未初始化"
+    menu_pause
+    return
+  fi
+  local choice name
+  while true; do
+    menu_header
+    printf '%s主从节点管理%s\n' "$C_BOLD" "$C_RESET"
+    printf '1. 查看所有从服务器\n'
+    printf '2. 添加从服务器并生成配对 ID\n'
+    printf '3. 再次显示某个从服务器的配对 ID\n'
+    printf '4. 删除从服务器\n'
+    printf '5. 查看 EasyTier 节点\n'
+    printf '6. 查看配置下发状态\n'
+    printf '0. 返回主菜单\n\n'
+    read -r -p '请选择: ' choice
+    case "$choice" in
+      1) menu_exec cmd_pair_list || true; menu_pause ;;
+      2) menu_pair_create ;;
+      3)
+        name="$(prompt_value '从服务器 ID')"
+        if [[ -f "$RUNTIME_DIR/pairs/${name}.id" ]]; then
+          cat "$RUNTIME_DIR/pairs/${name}.id"
+          printf '\n'
+        else
+          warn "未找到该配对 ID"
+        fi
+        menu_pause
+        ;;
+      4)
+        name="$(prompt_value '要删除的从服务器 ID')"
+        if menu_confirm "确认删除 ${name} 的线路与出口"; then
+          menu_exec cmd_pair_remove "$name" || true
+          menu_apply_prompt || true
+        fi
+        menu_pause
+        ;;
+      5)
+        if [[ -x "$EASYTIER_CLI_BIN" ]]; then
+          "$EASYTIER_CLI_BIN" peer || true
+          "$EASYTIER_CLI_BIN" route || true
+        else
+          warn "EasyTier 尚未安装"
+        fi
+        menu_pause
+        ;;
+      6) menu_exec cmd_control_status || true; menu_pause ;;
+      0) return ;;
+      *) warn "无效选项"; sleep 1 ;;
+    esac
+  done
+}
+
+health_result() {
+  local ok="$1" label="$2" detail="${3:-}"
+  if [[ "$ok" == "1" ]]; then
+    printf '  %s✓%s %-22s %s\n' "$C_GREEN" "$C_RESET" "$label" "$detail"
+  else
+    printf '  %s✗%s %-22s %s\n' "$C_RED" "$C_RESET" "$label" "$detail"
+  fi
+}
+
+menu_health_check() {
+  clear_screen
+  printf '%s%s【一键检查】%s\n\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+  if [[ ! -f "$STATE_FILE" ]]; then
+    health_result 0 "基础配置" "尚未安装"
+    printf '\n请返回主菜单，选择 1（主服务器）或 2（从服务器）开始安装。\n'
+    menu_pause
+    return
+  fi
+
+  local failures=0 xray_config sing_config cert key mode nb role limited_count
+  xray_config="$(jq -r '.xray.config_path' "$STATE_FILE")"
+  sing_config="$(jq -r '.hysteria2.config_path' "$STATE_FILE")"
+  cert="$(jq -r '.nginx.certificate' "$STATE_FILE")"
+  key="$(jq -r '.nginx.certificate_key' "$STATE_FILE")"
+  mode="$(jq -r '.nginx.mode' "$STATE_FILE")"
+  role="$(jq -r '.node.role' "$STATE_FILE")"
+  limited_count="$(jq '[
+    .users[] |
+    select(
+      .enabled == true and
+      (((.speed_limit.up_mbps // 0) > 0) or
+       ((.speed_limit.down_mbps // 0) > 0))
+    )
+  ] | length' "$STATE_FILE")"
+
+  if jq -e '.schema_version == 1' "$STATE_FILE" >/dev/null 2>&1; then
+    health_result 1 "基础配置" "正常"
+  else
+    health_result 0 "基础配置" "state.json 损坏"
+    ((failures+=1))
+  fi
+
+  if systemctl is-active --quiet etxr-easytier.service; then
+    health_result 1 "主从组网" "正在运行"
+  else
+    health_result 0 "主从组网" "服务未运行"
+    ((failures+=1))
+  fi
+
+  if systemctl is-active --quiet etxr-xray.service; then
+    health_result 1 "Xray 核心" "正在运行"
+  else
+    health_result 0 "Xray 核心" "服务未运行"
+    ((failures+=1))
+  fi
+
+  if systemctl is-active --quiet etxr-meter.service; then
+    health_result 1 "用户流量统计" "正在运行"
+  else
+    health_result 0 "用户流量统计" "服务未运行"
+    ((failures+=1))
+  fi
+
+  if (( limited_count > 0 )); then
+    if systemctl is-active --quiet etxr-limiter.service; then
+      health_result 1 "单用户限速" "${limited_count} 个用户已启用"
+    else
+      health_result 0 "单用户限速" "有限速用户，但服务未运行"
+      ((failures+=1))
+    fi
+  else
+    health_result 1 "单用户限速" "未设置（不是故障）"
+  fi
+
+  if [[ "$role" == "exit" ]]; then
+    if [[ "$(jq -r '.control.agent.enabled // false' "$STATE_FILE")" == "true" ]] &&
+       systemctl is-active --quiet etxr-agent.service; then
+      health_result 1 "配置接收 Agent" "WSS 已启动"
+    else
+      health_result 0 "配置接收 Agent" "服务未运行或未配置"
+      ((failures+=1))
+    fi
+  else
+    if [[ "$(jq -r '.control.enabled // false' "$STATE_FILE")" == "true" ]] &&
+       systemctl is-active --quiet etxr-control.service; then
+      health_result 1 "配置下发服务" "本机 127.0.0.1:$(jq -r '.control.port' "$STATE_FILE")"
+    else
+      health_result 0 "配置下发服务" "服务未运行或未配置"
+      ((failures+=1))
+    fi
+  fi
+
+  if [[ -s "$xray_config" ]] &&
+     "$XRAY_BIN" run -test -config "$xray_config" >/dev/null 2>&1; then
+    health_result 1 "Xray 配置" "检查通过"
+  else
+    health_result 0 "Xray 配置" "配置为空或检查失败"
+    ((failures+=1))
+  fi
+
+  if [[ "$(jq -r '.hysteria2.enabled' "$STATE_FILE")" == "true" ]]; then
+    if systemctl is-active --quiet etxr-sing-box.service &&
+       [[ -s "$sing_config" ]] &&
+       "$SING_BOX_BIN" check -c "$sing_config" >/dev/null 2>&1; then
+      health_result 1 "Hysteria2" "正在运行"
+    else
+      health_result 0 "Hysteria2" "服务或配置异常"
+      ((failures+=1))
+    fi
+  else
+    health_result 1 "Hysteria2" "未启用（不是故障）"
+  fi
+
+  if [[ "$mode" == "disabled" ]]; then
+    health_result 1 "nginx/证书" "从服务器无需 nginx"
+  else
+    if [[ -f "$cert" && -f "$key" ]]; then
+      health_result 1 "TLS 证书" "文件存在"
+    else
+      health_result 0 "TLS 证书" "证书或私钥不存在"
+      ((failures+=1))
+    fi
+    if nb="$(nginx_bin 2>/dev/null)" && "$nb" -t >/dev/null 2>&1; then
+      health_result 1 "nginx 配置" "检查通过"
+    else
+      health_result 0 "nginx 配置" "检查失败"
+      ((failures+=1))
+    fi
+  fi
+
+  printf '\n'
+  if (( failures == 0 )); then
+    printf '%s✓ 所有关键项目都正常，可以直接使用。%s\n' "$C_GREEN" "$C_RESET"
+  else
+    printf '%s发现 %s 个问题。%s\n' "$C_RED" "$failures" "$C_RESET"
+    if menu_confirm "是否立即尝试重新生成配置并启动服务"; then
+      menu_apply_prompt || true
+    else
+      printf '可进入“高级设置 → 查看日志”了解详细原因。\n'
+    fi
+  fi
+
+  if [[ -x "$EASYTIER_CLI_BIN" ]]; then
+    printf '\n当前主从连接：\n'
+    "$EASYTIER_CLI_BIN" peer 2>/dev/null || true
+  fi
+  menu_pause
+}
+
+menu_quick_subscription() {
+  if [[ ! -f "$STATE_FILE" ]]; then
+    warn "这台机器还没有安装"
+    menu_pause
+    return
+  fi
+  local count username
+  count="$(jq -r '[.users[] | select(.enabled == true)] | length' "$STATE_FILE")"
+  if (( count == 0 )); then
+    warn "还没有可用用户，请先进入【用户和订阅】新增用户"
+  elif (( count == 1 )); then
+    username="$(jq -r '.users[] | select(.enabled == true) | .name' "$STATE_FILE")"
+    printf '%s当前唯一用户：%s%s\n\n' "$C_CYAN" "$username" "$C_RESET"
+    menu_exec cmd_subscription "$username" || true
+  else
+    cmd_user_list || true
+    username="$(prompt_value '要复制哪个用户的订阅')"
+    menu_exec cmd_subscription "$username" || true
+  fi
+  menu_pause
+}
+
+menu_advanced() {
+  local choice
+  while true; do
+    menu_header
+    printf '%s【高级设置】%s\n' "$C_BOLD" "$C_RESET"
+    printf '%s一般使用不需要进入这里。%s\n\n' "$C_YELLOW" "$C_RESET"
+    printf '1. 管理主服务器的 XHTTP Path\n'
+    printf '2. 管理 Reality / Hysteria2\n'
+    printf '3. 生成、检查、备份和应用配置\n'
+    printf '4. Xray 启停、日志、监控和更新\n'
+    printf '5. 查看完整节点状态\n'
+    printf '6. 管理从服务器（查看 ID / 删除 / 连接详情）\n'
+    printf '7. 手动管理远程出口\n'
+    printf '0. 返回新手首页\n\n'
+    read -r -p '请输入数字: ' choice
+    case "$choice" in
+      1) menu_routes ;;
+      2) menu_protocols ;;
+      3) menu_config_actions ;;
+      4) menu_xray ;;
+      5) menu_exec cmd_status || true; menu_pause ;;
+      6) menu_pair_manage ;;
+      7) menu_exits ;;
+      0) return ;;
+      *) warn "请输入菜单中已有的数字"; sleep 1 ;;
+    esac
+  done
+}
+
+cmd_menu() {
+  [[ -t 0 && -t 1 ]] || die "交互菜单需要在终端中运行"
+  local choice
+  while true; do
+    menu_header
+    printf '%s常用功能%s\n' "$C_BOLD" "$C_RESET"
+    printf '1. 🚀 第一次安装：这台是主服务器\n'
+    printf '2. 🔗 第一次安装：这台是从服务器\n'
+    printf '3. ➕ 给主服务器添加从服务器\n'
+    printf '4. 👤 用户和订阅\n'
+    printf '5. 📋 直接复制当前订阅\n'
+    printf '6. 🩺 一键检查与修复\n'
+    printf '7. ⚙  高级设置             （一般不用）\n'
+    printf '0. 退出\n\n'
+    read -r -p '请输入数字: ' choice
+    case "$choice" in
+      1) menu_quick_init ;;
+      2) menu_worker_join ;;
+      3) menu_pair_create ;;
+      4) menu_users ;;
+      5) menu_quick_subscription ;;
+      6) menu_health_check ;;
+      7) menu_advanced ;;
+      0)
+        printf '%s已退出。%s\n' "$C_GREEN" "$C_RESET"
+        return
+        ;;
+      *) warn "请输入 0～7 之间的数字"; sleep 1 ;;
+    esac
+  done
+}
+
+main() {
+  parse_common_flags "$@"
+  set -- "${REMAINING_ARGS[@]}"
+  local command="${1:-}"
+  shift || true
+  if [[ -z "$command" ]]; then
+    if [[ -t 0 && -t 1 ]]; then
+      cmd_menu
+    else
+      usage
+    fi
+    return
+  fi
+  case "$command" in
+    menu) cmd_menu ;;
+    init) cmd_init "$@" ;;
+    user) cmd_user "$@" ;;
+    route) cmd_route "$@" ;;
+    exit) cmd_exit "$@" ;;
+    reality) cmd_reality "$@" ;;
+    hy2) cmd_hy2 "$@" ;;
+    keys) cmd_keys "$@" ;;
+    render) cmd_render "$@" ;;
+    validate) cmd_validate "$@" ;;
+    apply) cmd_apply "$@" ;;
+    install) cmd_install "$@" ;;
+    subscription|sub) cmd_subscription "$@" ;;
+    client) cmd_client "$@" ;;
+    backup) cmd_backup "$@" ;;
+    status) cmd_status "$@" ;;
+    xray) cmd_xray "$@" ;;
+    cluster) cmd_cluster "$@" ;;
+    pair) cmd_pair "$@" ;;
+    control) cmd_control "$@" ;;
+    version) echo "$VERSION" ;;
+    help|-h|--help) usage ;;
+    *) usage; die "Unknown command: $command" ;;
+  esac
+}
+
+main "$@"

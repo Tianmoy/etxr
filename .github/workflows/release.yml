@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq python3-aiohttp shellcheck
+      - name: Validate tag and sources
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          test "$version" = "$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' etxr.sh)"
+          bash -n etxr.sh
+          shellcheck -x -e SC2016 etxr.sh examples/*.sh tests/*.sh
+          test -z "$(gofmt -l cmd internal)"
+          go vet ./...
+          go test -race ./...
+          python3 tests/static-test.py
+          python3 tests/menu-smoke-test.py
+          python3 tests/control-e2e-test.py
+          python3 tests/data-plane-test.py
+          JQ=jq tests/runtime-test.sh
+      - name: Build static Linux data-plane binaries
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist package
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
+              go build -buildvcs=false -trimpath \
+                -ldflags "-s -w -X main.version=${version}" \
+                -o "dist/etxr-dataplane-linux-${arch}" \
+                ./cmd/etxr-dataplane
+          done
+          (
+            cd dist
+            sha256sum etxr-dataplane-linux-amd64 \
+              etxr-dataplane-linux-arm64 > checksums.txt
+          )
+          cp etxr.sh README.md go.mod package/
+          cp -a cmd internal examples tests .github package/
+          (
+            cd package
+            zip -qr "../dist/etxr-v${version}-release.zip" .
+          )
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/etxr-dataplane-linux-amd64 \
+            dist/etxr-dataplane-linux-arm64 \
+            dist/checksums.txt \
+            "dist/etxr-${GITHUB_REF_NAME}-release.zip" \
+            --verify-tag \
+            --generate-notes \
+            --title "ETXR ${GITHUB_REF_NAME}"
