@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -41,4 +45,4 @@ jobs:
       - name: Run protocol integration test
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: JQ=jq tests/runtime-test.sh
+        run: timeout --signal=TERM --kill-after=10s 6m env JQ=jq tests/runtime-test.sh
