@@ -56,7 +56,7 @@ jobs:
             sha256sum etxr-dataplane-linux-amd64 \
               etxr-dataplane-linux-arm64 > checksums.txt
           )
-          cp etxr.sh README.md go.mod package/
+          cp etxr.sh README.md LICENSE go.mod package/
           cp -a cmd internal examples tests .github package/
           (
             cd package
