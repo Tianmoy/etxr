@@ -91,7 +91,9 @@ EOF
 }
 
 clear_screen() {
-  [[ -t 1 ]] && printf '\033[2J\033[H' || true
+  if [[ -t 1 ]]; then
+    printf '\033[2J\033[H'
+  fi
 }
 
 menu_pause() {
@@ -3555,7 +3557,9 @@ cmd_apply() {
       fi
     done
     if [[ "$mode" != "disabled" && -n "${nb:-}" ]]; then
-      "$nb" -t >/dev/null 2>&1 && "$nb" -s reload >/dev/null 2>&1 || true
+      if "$nb" -t >/dev/null 2>&1; then
+        "$nb" -s reload >/dev/null 2>&1 || true
+      fi
     fi
     rm -rf "$rollback_dir"
     rollback_dir=""
