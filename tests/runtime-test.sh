@@ -40,6 +40,7 @@ need unzip
 need tar
 need openssl
 need "$JQ"
+JQ="$(readlink -f "$(command -v "$JQ")")"
 
 curl_download() {
   curl --fail --silent --show-error --location \
