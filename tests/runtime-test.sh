@@ -9,12 +9,26 @@ XRAY="${XRAY:-${TOOLS}/xray}"
 SING_BOX="${SING_BOX:-${TOOLS}/sing-box}"
 
 TEST_PIDS=()
-cleanup() {
+stop_test_processes() {
   local pid
+  if ((${#TEST_PIDS[@]} == 0)); then
+    return 0
+  fi
   for pid in "${TEST_PIDS[@]}"; do
     kill "$pid" >/dev/null 2>&1 || true
   done
+  sleep 1
+  for pid in "${TEST_PIDS[@]}"; do
+    if kill -0 "$pid" >/dev/null 2>&1; then
+      kill -KILL "$pid" >/dev/null 2>&1 || true
+    fi
+  done
   wait "${TEST_PIDS[@]}" >/dev/null 2>&1 || true
+  TEST_PIDS=()
+}
+
+cleanup() {
+  stop_test_processes
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -26,6 +40,12 @@ need unzip
 need tar
 need openssl
 need "$JQ"
+
+curl_download() {
+  curl --fail --silent --show-error --location \
+    --connect-timeout 15 --max-time 120 \
+    --retry 3 --retry-delay 2 --retry-max-time 180 "$@"
+}
 
 free_tcp_port() {
   python3 - <<'PY'
@@ -50,20 +70,20 @@ wait_tcp() {
 }
 
 if [[ ! -x "$XRAY" ]]; then
-  api="$(curl -fsSL https://api.github.com/repos/XTLS/Xray-core/releases/latest)"
+  api="$(curl_download https://api.github.com/repos/XTLS/Xray-core/releases/latest)"
   url="$("$JQ" -r '.assets[] | select(.name=="Xray-linux-64.zip") | .browser_download_url' <<<"$api")"
-  curl -fsSL "$url" -o "$TOOLS/xray.zip"
+  curl_download "$url" -o "$TOOLS/xray.zip"
   unzip -p "$TOOLS/xray.zip" xray >"$XRAY"
   chmod 755 "$XRAY"
 fi
 
 if [[ ! -x "$SING_BOX" ]]; then
-  api="$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest)"
+  api="$(curl_download https://api.github.com/repos/SagerNet/sing-box/releases/latest)"
   tag="$("$JQ" -r '.tag_name' <<<"$api")"
   ver="${tag#v}"
   asset="sing-box-${ver}-linux-amd64.tar.gz"
   url="$("$JQ" -r --arg n "$asset" '.assets[] | select(.name==$n) | .browser_download_url' <<<"$api")"
-  curl -fsSL "$url" -o "$TOOLS/$asset"
+  curl_download "$url" -o "$TOOLS/$asset"
   tar -xzf "$TOOLS/$asset" -C "$TOOLS"
   cp "$TOOLS/sing-box-${ver}-linux-amd64/sing-box" "$SING_BOX"
   chmod 755 "$SING_BOX"
@@ -348,11 +368,7 @@ curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${SOCKS_PORT}" \
 "$JQ" -e '.users.alice |
   (.uplink > 0) and (.downlink > 0)
 ' "$TMP/usage.json" >/dev/null
-for pid in "${TEST_PIDS[@]}"; do
-  kill "$pid" >/dev/null 2>&1 || true
-done
-wait "${TEST_PIDS[@]}" >/dev/null 2>&1 || true
-TEST_PIDS=()
+stop_test_processes
 
 "$EDGE" subscription alice >"$TMP/subscription.txt"
 grep -Eq 'Subscription URL: https://hk\.example\.com/522b276a/[0-9a-f]{40}$' \
