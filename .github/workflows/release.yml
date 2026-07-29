@@ -41,6 +41,7 @@ jobs:
           go test -race ./...
           python3 tests/static-test.py
           python3 tests/menu-smoke-test.py
+          tests/xray-checksum-test.sh
           python3 tests/control-e2e-test.py
           python3 tests/data-plane-test.py
           timeout --signal=TERM --kill-after=10s 6m env JQ=jq tests/runtime-test.sh

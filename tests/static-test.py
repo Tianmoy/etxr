@@ -15,7 +15,7 @@ def main() -> int:
     text = SCRIPT.read_text(encoding="utf-8")
     assert text.startswith("#!/usr/bin/env bash\n")
     assert "set -Eeuo pipefail" in text
-    assert 'VERSION="0.12.0"' in text
+    assert 'VERSION="0.12.1"' in text
     assert "local expires_minutes=30 expires_at" in text
     assert "--expires-minutes" in text
 
@@ -57,6 +57,8 @@ def main() -> int:
     assert "配置下发服务" in text
     assert "cmd_xray_update()" in text
     assert "download_xray_release()" in text
+    assert "parse_xray_sha256_dgst()" in text
+    assert 'key == "SHA256" || key == "SHA2256"' in text
     assert "prompt_port_checked()" in text
     assert "第一次安装：这台是主服务器" in text
     assert "第一次安装：这台是从服务器" in text

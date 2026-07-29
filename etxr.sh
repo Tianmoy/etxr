@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.12.0"
+VERSION="0.12.1"
 
 STATE_FILE="${ETXR_STATE:-/etc/etxr/state.json}"
 RUNTIME_DIR="${ETXR_RUNTIME:-/etc/etxr}"
@@ -4215,27 +4215,59 @@ verify_tar_entries() {
   done < <(LC_ALL=C tar -tvzf "$archive")
 }
 
+parse_xray_sha256_dgst() {
+  local digest_file="$1"
+  awk -F '=' '
+    {
+      key = toupper($1)
+      gsub(/[[:space:]-]/, "", key)
+      if (key == "SHA256" || key == "SHA2256") {
+        digest = $2
+        gsub(/[[:space:]]/, "", digest)
+        print digest
+        exit
+      }
+    }
+  ' "$digest_file"
+}
+
 download_xray_release() {
   local destination="$1"
-  local arch api version url dgst_url expected actual
+  local arch api version asset_name url dgst_url api_digest
+  local expected="" sidecar_expected="" actual
   arch="$(detect_arch_xray)"
   api="$(curl --proto '=https' --tlsv1.2 -fsSL \
     https://api.github.com/repos/XTLS/Xray-core/releases/latest)"
   version="$(jq -r '.tag_name' <<<"$api")"
-  url="$(jq -r --arg n "Xray-linux-${arch}.zip" '.assets[] | select(.name == $n) | .browser_download_url' <<<"$api")"
-  dgst_url="$(jq -r --arg n "Xray-linux-${arch}.zip.dgst" '.assets[] | select(.name == $n) | .browser_download_url' <<<"$api")"
+  asset_name="Xray-linux-${arch}.zip"
+  url="$(jq -r --arg n "$asset_name" '.assets[] | select(.name == $n) | .browser_download_url' <<<"$api")"
+  api_digest="$(jq -r --arg n "$asset_name" '.assets[] | select(.name == $n) | .digest // ""' <<<"$api")"
+  dgst_url="$(jq -r --arg n "${asset_name}.dgst" '.assets[] | select(.name == $n) | .browser_download_url' <<<"$api")"
   [[ -n "$url" && "$url" != "null" ]] || die "Xray release asset not found"
   mkdir -p "$destination"
   curl --proto '=https' --tlsv1.2 -fL "$url" -o "$destination/xray.zip"
+  if [[ "$api_digest" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; then
+    expected="${api_digest#sha256:}"
+  fi
   if [[ -n "$dgst_url" && "$dgst_url" != "null" ]]; then
     curl --proto '=https' --tlsv1.2 -fL "$dgst_url" -o "$destination/xray.zip.dgst"
-    expected="$(awk 'tolower($0) ~ /sha256/ {print $NF; exit}' "$destination/xray.zip.dgst")"
-    actual="$(sha256sum "$destination/xray.zip" | awk '{print $1}')"
-    [[ "$expected" =~ ^[0-9a-fA-F]{64}$ && "${expected,,}" == "${actual,,}" ]] ||
-      die "Xray SHA256 校验失败"
-  else
-    die "Xray release 没有 SHA256 校验文件"
+    sidecar_expected="$(parse_xray_sha256_dgst "$destination/xray.zip.dgst")"
+    if [[ "$sidecar_expected" =~ ^[0-9a-fA-F]{64}$ ]]; then
+      if [[ -n "$expected" && "${expected,,}" != "${sidecar_expected,,}" ]]; then
+        die "Xray release API 与 .dgst 的 SHA256 不一致"
+      fi
+      expected="$sidecar_expected"
+    elif [[ -z "$expected" ]]; then
+      die "Xray .dgst 中没有有效的 SHA2-256"
+    else
+      warn "Xray .dgst 格式无法识别，改用 GitHub release API 的 SHA256"
+    fi
   fi
+  [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] ||
+    die "Xray release 没有可用的 SHA256 摘要"
+  actual="$(sha256sum "$destination/xray.zip" | awk '{print $1}')"
+  [[ "${expected,,}" == "${actual,,}" ]] ||
+    die "Xray SHA256 校验失败"
   verify_zip_entries "$destination/xray.zip"
   mkdir -p "$destination/unpacked"
   unzip -q "$destination/xray.zip" -d "$destination/unpacked"

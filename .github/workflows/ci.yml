@@ -34,6 +34,7 @@ jobs:
           python3 -m compileall -q tests
           python3 tests/static-test.py
           python3 tests/menu-smoke-test.py
+          tests/xray-checksum-test.sh
           tests/nginx-quic-test.sh
       - name: Check Go data plane
         run: |
