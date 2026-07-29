@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.12.2"
+VERSION="0.13.0"
 
 STATE_FILE="${ETXR_STATE:-/etc/etxr/state.json}"
 RUNTIME_DIR="${ETXR_RUNTIME:-/etc/etxr}"
@@ -38,6 +38,8 @@ STATE_LOCK_HELD=0
 STATE_LOCK_DEPTH=0
 LAST_BACKUP_DIR=""
 NGINX_QUIC_CHANGED=0
+NGINX_TCP443_CHANGED=0
+WORKER_DIRECT_CONFIG=""
 
 if [[ -t 1 && "${TERM:-dumb}" != "dumb" ]]; then
   C_RED=$'\033[31m'
@@ -349,6 +351,97 @@ nginx_quic_restore_backup() {
     cp -a -- "$backup/files/$key" "$tmp"
     mv -f -- "$tmp" "$file"
   done <"$backup/manifest"
+}
+
+nginx_tcp443_file_has_active() {
+  local file="$1"
+  awk '
+    {
+      lower = tolower($0)
+      if (lower ~ /^[ \t]*#/ || lower ~ /^[ \t]*$/) next
+      if (lower ~ /^[ \t]*listen[ \t]+(0\.0\.0\.0:)?443([ \t;]|$)/ &&
+          lower !~ /(^|[ \t])quic([ \t;]|$)/) {
+        found = 1
+        exit
+      }
+    }
+    END { exit(found ? 0 : 1) }
+  ' "$file"
+}
+
+nginx_tcp443_active_manifest() {
+  local manifest="$1" candidate
+  : >"$manifest"
+  while IFS= read -r -d '' candidate; do
+    if [[ -z "${ETXR_NGINX_SCAN_ROOTS:-}" ]]; then
+      [[ "$candidate" == /www/server/panel/vhost/nginx/* ]] || continue
+      [[ "$candidate" != /www/server/panel/vhost/nginx/tcp/* ]] || continue
+    fi
+    if nginx_tcp443_file_has_active "$candidate"; then
+      printf '%s\0' "$candidate" >>"$manifest"
+    fi
+  done < <(nginx_config_candidates)
+}
+
+nginx_tcp443_rewrite_file() {
+  local file="$1" internal_port="$2" tmp output
+  tmp="$(mktemp "$(dirname "$file")/.etxr-nginx.XXXXXX")"
+  output="$(mktemp "$(dirname "$file")/.etxr-nginx-output.XXXXXX")"
+  if ! awk -v port="$internal_port" '
+    {
+      line = $0
+      lower = tolower(line)
+      if (lower ~ /^[ \t]*#/ || lower ~ /^[ \t]*$/) {
+        print line
+        next
+      }
+      if (lower ~ /^[ \t]*listen[ \t]+(0\.0\.0\.0:)?443([ \t;]|$)/ &&
+          lower !~ /(^|[ \t])quic([ \t;]|$)/) {
+        sub(/listen[ \t]+(0\.0\.0\.0:)?443/, "listen 127.0.0.1:" port, line)
+        print line " # etxr-tcp443: was public 443"
+        next
+      }
+      print line
+    }
+  ' "$file" >"$output"; then
+    rm -f "$tmp" "$output"
+    return 2
+  fi
+  if cmp -s "$file" "$output"; then
+    rm -f "$tmp" "$output"
+    return 1
+  fi
+  rm -f "$tmp"
+  cp -a -- "$file" "$tmp" || {
+    rm -f "$tmp" "$output"
+    return 2
+  }
+  cat "$output" >"$tmp" || {
+    rm -f "$tmp" "$output"
+    return 2
+  }
+  rm -f "$output"
+  mv -f -- "$tmp" "$file"
+}
+
+nginx_tcp443_rebind_manifest() {
+  local manifest="$1" backup="$2" internal_port="$3" file rc
+  NGINX_TCP443_CHANGED=0
+  mkdir -p "$backup"
+  : >"$backup/manifest"
+  while IFS= read -r -d '' file; do
+    nginx_quic_backup_file "$file" "$backup"
+    if nginx_tcp443_rewrite_file "$file" "$internal_port"; then
+      NGINX_TCP443_CHANGED=1
+    else
+      rc=$?
+      (( rc == 1 )) || return "$rc"
+    fi
+  done <"$manifest"
+}
+
+nginx_tcp443_restore_backup() {
+  nginx_quic_restore_backup "$1"
 }
 
 nginx_process_running() {
@@ -772,7 +865,8 @@ cmd_init() {
   local cert="" key="" snippet="" xray_config="/etc/etxr/live/xray.json"
   local sing_config="/etc/etxr/live/sing-box.json"
   local tls_port=443 https_listen_port=8443 stream_path=""
-  local shared_tcp443=false control_path
+  local stream_loader_path="" shared_tcp443=false auto_rebind_https=false
+  local control_path
 
   if [[ "${1:-}" == "--help" ]]; then
     cat <<'EOF'
@@ -809,7 +903,9 @@ EOF
       --tls-port) tls_port="$2"; shift 2 ;;
       --nginx-https-listen-port) https_listen_port="$2"; shift 2 ;;
       --nginx-stream-path) stream_path="$2"; shift 2 ;;
+      --nginx-stream-loader-path) stream_loader_path="$2"; shift 2 ;;
       --nginx-shared-tcp443) shared_tcp443="$2"; shift 2 ;;
+      --nginx-auto-rebind-https) auto_rebind_https="$2"; shift 2 ;;
       --xray-config) xray_config="$2"; shift 2 ;;
       --sing-box-config) sing_config="$2"; shift 2 ;;
       *) die "Unknown init option: $1" ;;
@@ -832,19 +928,33 @@ EOF
   valid_port "$HY2_BRIDGE_PORT" || die "Invalid Hysteria2 bridge port"
   [[ "$shared_tcp443" == "true" || "$shared_tcp443" == "false" ]] ||
     die "Invalid nginx shared TCP 443 flag"
+  [[ "$auto_rebind_https" == "true" || "$auto_rebind_https" == "false" ]] ||
+    die "Invalid nginx auto rebind HTTPS flag"
   if [[ "$shared_tcp443" == "true" ]]; then
-    [[ "$nginx_mode" == "snippet" ]] ||
-      die "Shared TCP 443 currently requires Baota snippet mode"
+    [[ "$nginx_mode" == "snippet" || "$nginx_mode" == "standalone" ]] ||
+      die "Shared TCP 443 requires nginx snippet or standalone mode"
     [[ "$tls_port" == "443" ]] ||
       die "Shared TCP 443 requires public TLS port 443"
     [[ "$https_listen_port" != "443" ]] ||
       die "nginx internal HTTPS port must differ from 443"
-    [[ -n "$stream_path" ]] || stream_path="/www/server/panel/vhost/nginx/tcp/etxr.conf"
+    if [[ "$nginx_mode" == "snippet" ]]; then
+      [[ -n "$stream_path" ]] ||
+        stream_path="/www/server/panel/vhost/nginx/tcp/etxr.conf"
+    else
+      [[ -n "$stream_path" ]] || stream_path="/etc/nginx/stream-conf.d/etxr.conf"
+      [[ -n "$stream_loader_path" ]] ||
+        stream_loader_path="/etc/nginx/modules-enabled/99-etxr-stream.conf"
+      auto_rebind_https=false
+    fi
+  else
+    auto_rebind_https=false
   fi
   [[ -z "$cert" ]] || valid_absolute_path "$cert" || die "Invalid certificate path"
   [[ -z "$key" ]] || valid_absolute_path "$key" || die "Invalid certificate key path"
   [[ -z "$stream_path" ]] || valid_absolute_path "$stream_path" ||
     die "Invalid nginx stream path"
+  [[ -z "$stream_loader_path" ]] || valid_absolute_path "$stream_loader_path" ||
+    die "Invalid nginx stream loader path"
   valid_absolute_path "$xray_config" || die "Invalid Xray config path"
   valid_absolute_path "$sing_config" || die "Invalid sing-box config path"
   [[ "$nginx_mode" != "snippet" || -n "$snippet" ]] ||
@@ -870,7 +980,9 @@ EOF
     --arg sing_config "$sing_config" \
     --arg control_path "$control_path" \
     --arg stream_path "$stream_path" \
+    --arg stream_loader_path "$stream_loader_path" \
     --argjson shared_tcp443 "$shared_tcp443" \
+    --argjson auto_rebind_https "$auto_rebind_https" \
     --argjson https_listen_port "$https_listen_port" \
     --argjson tls_port "$tls_port" \
     --argjson limiter_port "$LIMITER_PORT" \
@@ -888,8 +1000,10 @@ EOF
         mode: $mode,
         tls_port: $tls_port,
         shared_tcp443: $shared_tcp443,
+        auto_rebind_https: $auto_rebind_https,
         https_listen_port: $https_listen_port,
         stream_path: $stream_path,
+        stream_loader_path: $stream_loader_path,
         certificate: $cert,
         certificate_key: $key,
         snippet_path: $snippet,
@@ -2254,7 +2368,8 @@ EOF
 }
 
 render_nginx_standalone() {
-  local out="$1" domain port cert key root include_file redirect_port="" tmp_output
+  local out="$1" domain port cert key root include_file redirect_port=""
+  local shared_tcp443 https_port listen_address tmp_output
   ensure_parent "$out"
   tmp_output="$(mktemp "$(dirname "$out")/.nginx-standalone.XXXXXX")"
   domain="$(jq -r '.node.domain' "$STATE_FILE")"
@@ -2263,6 +2378,13 @@ render_nginx_standalone() {
   key="$(jq -r '.nginx.certificate_key' "$STATE_FILE")"
   root="$(jq -r '.nginx.web_root' "$STATE_FILE")"
   include_file="$(jq -r '.nginx.paths_path // "/etc/etxr/live/nginx-paths.conf"' "$STATE_FILE")"
+  shared_tcp443="$(jq -r '.nginx.shared_tcp443 // false' "$STATE_FILE")"
+  https_port="$(jq -r '.nginx.https_listen_port // 8443' "$STATE_FILE")"
+  if [[ "$shared_tcp443" == "true" ]]; then
+    listen_address="127.0.0.1:${https_port}"
+  else
+    listen_address="$port"
+  fi
   [[ "$port" == "443" ]] || redirect_port=":${port}"
   cat <<EOF >"$tmp_output"
 # Generated by etxr ${VERSION}. Do not edit.
@@ -2279,7 +2401,8 @@ server {
 }
 
 server {
-    listen ${port} ssl http2;
+    listen ${listen_address} ssl;
+    http2 on;
     server_name ${domain};
 
     ssl_certificate ${cert};
@@ -2303,6 +2426,22 @@ EOF
     rm -f "$tmp_output"
     die "nginx 独立站点配置为空；未覆盖现有配置"
   }
+  chmod 600 "$tmp_output"
+  mv -f "$tmp_output" "$out"
+}
+
+render_nginx_stream_loader() {
+  local out="$1" stream_dir tmp_output
+  ensure_parent "$out"
+  stream_dir="$(dirname "$(jq -r '.nginx.stream_path' "$STATE_FILE")")"
+  valid_absolute_path "$stream_dir" || die "Invalid nginx stream directory"
+  tmp_output="$(mktemp "$(dirname "$out")/.nginx-stream-loader.XXXXXX")"
+  cat <<EOF >"$tmp_output"
+# Generated by etxr ${VERSION}. Do not edit.
+stream {
+    include ${stream_dir}/*.conf;
+}
+EOF
   chmod 600 "$tmp_output"
   mv -f "$tmp_output" "$out"
 }
@@ -2594,8 +2733,15 @@ cmd_render() {
   if [[ "$(jq -r '.nginx.shared_tcp443 // false' "$STATE_FILE")" == "true" ]]; then
     render_nginx_stream "$out/nginx-stream.conf"
     [[ -s "$out/nginx-stream.conf" ]] || die "生成的 nginx stream 配置为空"
+    if [[ "$(jq -r '.nginx.mode' "$STATE_FILE")" == "standalone" ]]; then
+      render_nginx_stream_loader "$out/nginx-stream-loader.conf"
+      [[ -s "$out/nginx-stream-loader.conf" ]] ||
+        die "生成的 nginx stream 加载配置为空"
+    else
+      rm -f "$out/nginx-stream-loader.conf"
+    fi
   else
-    rm -f "$out/nginx-stream.conf"
+    rm -f "$out/nginx-stream.conf" "$out/nginx-stream-loader.conf"
   fi
   if [[ "$(jq -r '.hysteria2.enabled' "$STATE_FILE")" == "true" ]]; then
     render_sing_box "$out/sing-box.json"
@@ -2652,10 +2798,30 @@ nginx_supports_stream_preread() {
 }
 
 check_baota_shared_nginx_layout() {
-  local nb="$1" stream_path hits main_conf
+  local nb="$1" mode stream_path hits main_conf auto_rebind
   nginx_supports_stream_preread ||
     die "当前 nginx 未编译 stream_ssl_preread_module，无法进行 Reality/XHTTP TCP 443 分流"
+  mode="$(jq -r '.nginx.mode' "$STATE_FILE")"
   stream_path="$(jq -r '.nginx.stream_path // empty' "$STATE_FILE")"
+  if [[ "$mode" == "standalone" ]]; then
+    main_conf="/etc/nginx/nginx.conf"
+    [[ -f "$main_conf" ]] || die "未找到 /etc/nginx/nginx.conf"
+    grep -Eq 'include[[:space:]]+/etc/nginx/modules-enabled/\*\.conf' "$main_conf" ||
+      die "标准 nginx 未加载 modules-enabled/*.conf，无法添加 stream 分流"
+    hits="$(
+      while IFS= read -r -d '' candidate; do
+        [[ "$candidate" != "$stream_path" ]] || continue
+        nginx_tcp443_file_has_active "$candidate" && printf '%s\n' "$candidate"
+      done < <(nginx_config_candidates)
+    )"
+    [[ -z "$hits" ]] || {
+      printf '%s\n' "$hits" >&2
+      die "标准 nginx 中已有其他 TCP 443 监听，无法自动共用"
+    }
+    [[ -n "$nb" ]]
+    return
+  fi
+
   main_conf="/www/server/nginx/conf/nginx.conf"
   if [[ -f "$main_conf" ]] &&
      ! grep -Eq 'include[[:space:]]+/www/server/panel/vhost/nginx/tcp/\*\.conf' \
@@ -2675,7 +2841,8 @@ check_baota_shared_nginx_layout() {
         '^[[:space:]]*listen[[:space:]]+443([[:space:];]|[[:space:]]+ssl|[[:space:]]+reuseport)' \
         /www/server/panel/vhost/nginx --exclude-dir=tcp 2>/dev/null || true)
     )"
-    if [[ -n "$hits" ]]; then
+    auto_rebind="$(jq -r '.nginx.auto_rebind_https // false' "$STATE_FILE")"
+    if [[ -n "$hits" && "$auto_rebind" != "true" ]]; then
       printf '%s\n' "$hits" >&2
       die "宝塔 HTTPS vhost 仍直接监听 TCP 443；请先改为 127.0.0.1:8443（不会自动修改其他网站）"
     fi
@@ -2785,9 +2952,11 @@ validate_state_semantics() {
   fi
   if [[ "$(jq -r '.nginx.shared_tcp443 // false' "$STATE_FILE")" == "true" ]]; then
     if ! jq -e '
-      (.nginx.mode == "snippet") and
+      ((.nginx.mode == "snippet") or (.nginx.mode == "standalone")) and
       (.nginx.tls_port == 443) and
       (.nginx.https_listen_port | type == "number" and . != 443) and
+      ((.nginx.auto_rebind_https // false) | type == "boolean") and
+      ((.nginx.auto_rebind_https // false) == false or .nginx.mode == "snippet") and
       ([.xray.reality_inbounds[]?] | length > 0) and
       (all(.xray.reality_inbounds[]?; .port == 443 and
         (.listen // "127.0.0.1") == "127.0.0.1")) and
@@ -2888,6 +3057,7 @@ cmd_backup() {
   backup_file "$(jq -r '.nginx.standalone_path' "$STATE_FILE")" "$dest"
   backup_file "$(jq -r '.nginx.paths_path // empty' "$STATE_FILE")" "$dest"
   backup_file "$(jq -r '.nginx.stream_path // empty' "$STATE_FILE")" "$dest"
+  backup_file "$(jq -r '.nginx.stream_loader_path // empty' "$STATE_FILE")" "$dest"
   backup_file "$EASYTIER_CONFIG" "$dest"
   backup_file "$LIMITER_CONFIG" "$dest"
   backup_file "$USAGE_FILE" "$dest"
@@ -3737,24 +3907,17 @@ configure_ufw_from_state() {
 
 check_standalone_nginx_takeover() {
   [[ "$(jq -r '.nginx.mode' "$STATE_FILE")" == "standalone" ]] || return 0
-  local target
+  local target stream_target candidate hits=""
   target="$(jq -r '.nginx.standalone_path' "$STATE_FILE")"
-  if command -v grep >/dev/null 2>&1; then
-    local hits
-    local -a nginx_scan_dirs=()
-    [[ -d /etc/nginx ]] && nginx_scan_dirs+=(/etc/nginx)
-    [[ -d /www/server/panel/vhost/nginx ]] &&
-      nginx_scan_dirs+=(/www/server/panel/vhost/nginx)
-    if ((${#nginx_scan_dirs[@]})); then
-      hits="$(grep -RIlE '^[[:space:]]*listen[[:space:]].*(80|443)([[:space:];]|$)' \
-        "${nginx_scan_dirs[@]}" 2>/dev/null | grep -vFx "$target" || true)"
-    else
-      hits=""
-    fi
-    if [[ -n "$hits" && "$FORCE" -ne 1 ]]; then
-      printf '%s\n' "$hits" >&2
-      die "Existing nginx 443 vhosts found. Use snippet mode, or inspect and rerun with --force."
-    fi
+  stream_target="$(jq -r '.nginx.stream_path // empty' "$STATE_FILE")"
+  while IFS= read -r -d '' candidate; do
+    [[ "$candidate" != "$target" && "$candidate" != "$stream_target" ]] || continue
+    nginx_tcp443_file_has_active "$candidate" &&
+      hits+="${candidate}"$'\n'
+  done < <(nginx_config_candidates)
+  if [[ -n "$hits" && "$FORCE" -ne 1 ]]; then
+    printf '%s' "$hits" >&2
+    die "标准 nginx 中已有其他 TCP 443 站点；请改用宝塔复用模式或先处理冲突"
   fi
 }
 
@@ -3771,16 +3934,21 @@ cmd_apply() {
 
   local xray_config sing_config mode nginx_target nginx_paths_target="" nb=""
   local nginx_stream_target="" nginx_previous="" nginx_paths_previous=""
-  local rollback_dir="" rollback_service quic_manifest=""
+  local nginx_stream_loader_target=""
+  local rollback_dir="" rollback_service quic_manifest="" tcp443_manifest=""
   local hy2_enabled hy2_port hy2_shared_udp443 nginx_was_running=0
-  local nginx_should_reload=0 nginx_quic_backup=""
+  local nginx_should_reload=0 nginx_quic_backup="" nginx_tcp443_backup=""
+  local auto_rebind_https https_listen_port
   xray_config="$(jq -r '.xray.config_path' "$STATE_FILE")"
   sing_config="$(jq -r '.hysteria2.config_path' "$STATE_FILE")"
   mode="$(jq -r '.nginx.mode' "$STATE_FILE")"
   hy2_enabled="$(jq -r '.hysteria2.enabled // false' "$STATE_FILE")"
   hy2_port="$(jq -r '.hysteria2.port // 8443' "$STATE_FILE")"
   hy2_shared_udp443="$(jq -r '.hysteria2.shared_udp443 // false' "$STATE_FILE")"
+  auto_rebind_https="$(jq -r '.nginx.auto_rebind_https // false' "$STATE_FILE")"
+  https_listen_port="$(jq -r '.nginx.https_listen_port // 8443' "$STATE_FILE")"
   quic_manifest="$(mktemp)"
+  tcp443_manifest="$(mktemp)"
   if [[ "$hy2_shared_udp443" == "true" ]]; then
     nginx_quic_active_manifest "$quic_manifest"
     if port_is_listening udp "$hy2_port" &&
@@ -3796,6 +3964,21 @@ cmd_apply() {
   else
     : >"$quic_manifest"
   fi
+  if [[ "$auto_rebind_https" == "true" ]]; then
+    nginx_tcp443_active_manifest "$tcp443_manifest"
+    if [[ ! -s "$tcp443_manifest" ]]; then
+      rm -f "$quic_manifest" "$tcp443_manifest"
+      die "没有找到需要迁移到内部 HTTPS 端口的宝塔 TCP 443 vhost"
+    fi
+  else
+    : >"$tcp443_manifest"
+  fi
+  if [[ "$(jq -r '.nginx.shared_tcp443 // false' "$STATE_FILE")" == "true" ]]; then
+    nginx_stream_target="$(jq -r '.nginx.stream_path' "$STATE_FILE")"
+    if [[ "$mode" == "standalone" ]]; then
+      nginx_stream_loader_target="$(jq -r '.nginx.stream_loader_path' "$STATE_FILE")"
+    fi
+  fi
   nginx_process_running && nginx_was_running=1
 
   if (( ! DRY_RUN )); then
@@ -3806,10 +3989,13 @@ cmd_apply() {
       cp -a "$LIMITER_CONFIG" "$rollback_dir/limits.json"
     [[ ! -e "$EASYTIER_CONFIG" ]] ||
       cp -a "$EASYTIER_CONFIG" "$rollback_dir/easytier.toml"
-    if [[ "$(jq -r '.nginx.shared_tcp443 // false' "$STATE_FILE")" == "true" ]]; then
-      nginx_stream_target="$(jq -r '.nginx.stream_path' "$STATE_FILE")"
+    if [[ -n "$nginx_stream_target" ]]; then
       [[ ! -e "$nginx_stream_target" ]] ||
         cp -a "$nginx_stream_target" "$rollback_dir/nginx-stream"
+    fi
+    if [[ -n "$nginx_stream_loader_target" ]]; then
+      [[ ! -e "$nginx_stream_loader_target" ]] ||
+        cp -a "$nginx_stream_loader_target" "$rollback_dir/nginx-stream-loader"
     fi
     if [[ -d "$SUBSCRIPTION_DIR" ]]; then
       : >"$rollback_dir/subscriptions.existed"
@@ -3881,8 +4067,18 @@ cmd_apply() {
         rm -f "$nginx_stream_target"
       fi
     fi
+    if [[ -n "$nginx_stream_loader_target" ]]; then
+      if [[ -e "$rollback_dir/nginx-stream-loader" ]]; then
+        cp -a "$rollback_dir/nginx-stream-loader" "$nginx_stream_loader_target"
+      else
+        rm -f "$nginx_stream_loader_target"
+      fi
+    fi
     if [[ -n "$nginx_quic_backup" ]]; then
       nginx_quic_restore_backup "$nginx_quic_backup" || true
+    fi
+    if [[ -n "$nginx_tcp443_backup" ]]; then
+      nginx_tcp443_restore_backup "$nginx_tcp443_backup" || true
     fi
     systemctl daemon-reload 2>/dev/null || true
     for rollback_service in etxr-easytier etxr-limiter etxr-xray etxr-sing-box etxr-meter etxr-control etxr-agent; do
@@ -3974,9 +4170,13 @@ cmd_apply() {
     ensure_parent "$nginx_paths_target"
   fi
   if [[ "$(jq -r '.nginx.shared_tcp443 // false' "$STATE_FILE")" == "true" ]]; then
-    nginx_stream_target="$(jq -r '.nginx.stream_path' "$STATE_FILE")"
     [[ -n "$nginx_stream_target" ]] || die "nginx.stream_path is empty"
     ensure_parent "$nginx_stream_target"
+    if [[ "$mode" == "standalone" ]]; then
+      [[ -n "$nginx_stream_loader_target" ]] ||
+        die "nginx.stream_loader_path is empty"
+      ensure_parent "$nginx_stream_loader_target"
+    fi
   fi
 
   if [[ -n "$nginx_target" && -e "$nginx_target" ]]; then
@@ -4000,7 +4200,37 @@ cmd_apply() {
   fi
   if [[ -n "$nginx_stream_target" ]]; then
     run install -m 600 "$GENERATED_DIR/nginx-stream.conf" "$nginx_stream_target" ||
-      { rollback_apply; die "写入宝塔 nginx stream 配置失败"; }
+      { rollback_apply; die "写入 nginx stream 配置失败"; }
+  fi
+  if [[ -n "$nginx_stream_loader_target" ]]; then
+    run install -m 600 "$GENERATED_DIR/nginx-stream-loader.conf" \
+      "$nginx_stream_loader_target" ||
+      { rollback_apply; die "写入 nginx stream 加载配置失败"; }
+  fi
+
+  if [[ "$auto_rebind_https" == "true" && -s "$tcp443_manifest" ]]; then
+    if (( DRY_RUN )); then
+      while IFS= read -r -d '' rollback_service; do
+        log "Would move Baota TCP 443 listener to 127.0.0.1:${https_listen_port} in $rollback_service"
+      done <"$tcp443_manifest"
+    else
+      nginx_tcp443_backup="$rollback_dir/nginx-tcp443"
+      if ! nginx_tcp443_rebind_manifest "$tcp443_manifest" \
+        "$nginx_tcp443_backup" "$https_listen_port"; then
+        rollback_apply
+        die "迁移宝塔 HTTPS 到内部端口失败，已恢复原配置"
+      fi
+      if [[ -n "$LAST_BACKUP_DIR" ]]; then
+        cp -a "$nginx_tcp443_backup" "$LAST_BACKUP_DIR/nginx-tcp443" || {
+          rollback_apply
+          die "保存宝塔 TCP 443 持久备份失败，已恢复原配置"
+        }
+      fi
+      if (( NGINX_TCP443_CHANGED )); then
+        nginx_should_reload=1
+        log "已把宝塔 HTTPS 移到 127.0.0.1:${https_listen_port}，TCP 443 交给 SNI 分流"
+      fi
+    fi
   fi
 
   if [[ "$hy2_shared_udp443" == "true" && -s "$quic_manifest" ]]; then
@@ -4150,7 +4380,7 @@ cmd_apply() {
     fi
 
   fi
-  rm -f "$quic_manifest"
+  rm -f "$quic_manifest" "$tcp443_manifest"
   [[ -z "$nginx_previous" ]] || rm -f "$nginx_previous"
   [[ -z "$nginx_paths_previous" ]] || rm -f "$nginx_paths_previous"
   [[ -z "$rollback_dir" ]] || rm -rf "$rollback_dir"
@@ -4393,7 +4623,8 @@ cmd_install() {
   done
   if (( DRY_RUN )); then
     log "Would install base packages: ca-certificates curl jq openssl unzip tar uuid-runtime python3 python3-aiohttp"
-    [[ ",$components," != *,nginx,* ]] || log "Would install Debian nginx"
+    [[ ",$components," != *,nginx,* ]] ||
+      log "Would install Debian nginx with stream preread module"
     [[ ",$components," != *,xray,* ]] || log "Would download and verify official latest Xray"
     [[ ",$components," != *,sing-box,* ]] || log "Would download and verify official latest sing-box"
     [[ ",$components," != *,easytier,* ]] || log "Would download and verify official latest EasyTier"
@@ -4406,7 +4637,8 @@ cmd_install() {
   apt-get update
   apt-get install -y ca-certificates curl jq openssl unzip tar uuid-runtime \
     python3 python3-aiohttp
-  [[ ",$components," != *,nginx,* ]] || apt-get install -y nginx
+  [[ ",$components," != *,nginx,* ]] ||
+    apt-get install -y nginx libnginx-mod-stream
   [[ ",$components," != *,xray,* ]] || install_xray
   [[ ",$components," != *,sing-box,* ]] || install_sing_box
   [[ ",$components," != *,easytier,* ]] || install_easytier
@@ -5028,14 +5260,18 @@ EOF
   valid_uuid "$relay_uuid" || die "Invalid relay UUID"
   valid_uuid "$user_uuid" || die "Invalid direct user UUID"
   generate_vlessenc_x25519_pair
-  reality_keys="$("$XRAY_BIN" x25519)"
-  reality_private="$(awk -F': ' '/^PrivateKey:/ {print $2}' <<<"$reality_keys")"
-  reality_public="$(awk -F': ' '/^Password/ {print $2; exit}' <<<"$reality_keys")"
-  if [[ -z "$reality_public" ]]; then
-    reality_public="$(awk -F': ' '/^PublicKey:/ {print $2; exit}' <<<"$reality_keys")"
+  reality_private=""
+  reality_public=""
+  if [[ "$reality_enabled" == "true" ]]; then
+    reality_keys="$("$XRAY_BIN" x25519)"
+    reality_private="$(awk -F': ' '/^PrivateKey:/ {print $2}' <<<"$reality_keys")"
+    reality_public="$(awk -F': ' '/^Password/ {print $2; exit}' <<<"$reality_keys")"
+    if [[ -z "$reality_public" ]]; then
+      reality_public="$(awk -F': ' '/^PublicKey:/ {print $2; exit}' <<<"$reality_keys")"
+    fi
+    [[ -n "$reality_private" && -n "$reality_public" ]] ||
+      die "无法解析 xray x25519 输出"
   fi
-  [[ -n "$reality_private" && -n "$reality_public" ]] ||
-    die "无法解析 xray x25519 输出"
   route_port="$(next_route_port)"
   route_path="/${name}-$(random_hex 10)"
   control_token="$(random_hex 32)"
@@ -5231,6 +5467,32 @@ generate_self_signed_cert() {
   printf '%s\n%s\n' "$cert_dir/fullchain.pem" "$cert_dir/privkey.pem"
 }
 
+tls_certificate_is_usable() {
+  local cert="$1" key="$2" cert_pub key_pub
+  [[ -f "$cert" && -r "$cert" && -f "$key" && -r "$key" ]] || return 1
+  openssl x509 -in "$cert" -noout -checkend 0 >/dev/null 2>&1 || return 1
+  openssl pkey -in "$key" -noout >/dev/null 2>&1 || return 1
+  cert_pub="$(
+    openssl x509 -in "$cert" -pubkey -noout 2>/dev/null |
+      openssl pkey -pubin -outform DER 2>/dev/null |
+      sha256sum | awk '{print $1}'
+  )"
+  key_pub="$(
+    openssl pkey -in "$key" -pubout -outform DER 2>/dev/null |
+      sha256sum | awk '{print $1}'
+  )"
+  [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]]
+}
+
+tls_certificate_matches_name() {
+  local cert="$1" name="$2"
+  if valid_ipv4 "$name"; then
+    openssl x509 -in "$cert" -noout -checkip "$name" >/dev/null 2>&1
+  else
+    openssl x509 -in "$cert" -noout -checkhost "$name" >/dev/null 2>&1
+  fi
+}
+
 detect_public_ipv4() {
   local ip=""
   ip="$(curl -4 --proto '=https' --tlsv1.2 -fsS --max-time 8 \
@@ -5241,14 +5503,304 @@ detect_public_ipv4() {
   printf '%s' "$ip"
 }
 
+bundle_worker_direct_config() {
+  local bundle="$1" name domain address
+  name="$(jq -r '.worker.name' <<<"$bundle")"
+  address="$(jq -r '.worker.public_host // ""' <<<"$bundle")"
+  address="${address:-$(detect_public_ipv4)}"
+  domain="${address:-${name}.local}"
+  jq -n \
+    --arg domain "$domain" --arg address "$address" \
+    --argjson direct "$(jq '.direct' <<<"$bundle")" '
+    {
+      domain: $domain,
+      address: $address,
+      nginx: {
+        mode: "disabled",
+        tls_port: 443,
+        https_listen_port: 8443,
+        shared_tcp443: false,
+        auto_rebind_https: false,
+        certificate: "",
+        certificate_key: "",
+        snippet_path: ""
+      },
+      xhttp: ($direct.xhttp + {behind_nginx: false}),
+      reality: ($direct.reality + {listen_port: $direct.reality.port}),
+      hysteria2: $direct.hysteria2
+    }
+  '
+}
+
+validate_worker_direct_config() {
+  jq -e '
+    (.domain | type == "string" and
+      test("^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$")) and
+    (.address | type == "string" and test("^[A-Za-z0-9.-]+$")) and
+    (.nginx.mode == "disabled" or .nginx.mode == "snippet" or
+      .nginx.mode == "standalone") and
+    (.nginx.tls_port | type == "number" and . >= 1 and . <= 65535) and
+    (.nginx.https_listen_port | type == "number" and . >= 1 and . <= 65535) and
+    (.nginx.shared_tcp443 | type == "boolean") and
+    (.nginx.auto_rebind_https | type == "boolean") and
+    (.nginx.shared_tcp443 == false or
+      (.nginx.mode != "disabled" and .nginx.tls_port == 443 and
+       .nginx.https_listen_port != 443)) and
+    (.nginx.auto_rebind_https == false or
+      (.nginx.mode == "snippet" and .nginx.shared_tcp443 == true)) and
+    (.nginx.certificate | type == "string" and
+      (length == 0 or test("^/[A-Za-z0-9._/-]+$"))) and
+    (.nginx.certificate_key | type == "string" and
+      (length == 0 or test("^/[A-Za-z0-9._/-]+$"))) and
+    (.nginx.snippet_path | type == "string" and
+      (length == 0 or test("^/[A-Za-z0-9._/-]+$"))) and
+    (.xhttp.enabled | type == "boolean") and
+    (.xhttp.public_port | type == "number" and . >= 1 and . <= 65535) and
+    (.xhttp.listen_port | type == "number" and . >= 1 and . <= 65535) and
+    (.xhttp.behind_nginx | type == "boolean") and
+    (.xhttp.behind_nginx == false or .nginx.mode != "disabled") and
+    (.xhttp.behind_nginx == false or .xhttp.public_port == .nginx.tls_port) and
+    (.xhttp.path | type == "string" and test("^/[A-Za-z0-9._~/-]+$") and
+      (contains("//") | not) and (contains("..") | not)) and
+    (.reality.enabled | type == "boolean") and
+    (.reality.port | type == "number" and . >= 1 and . <= 65535) and
+    (.reality.listen_port | type == "number" and . >= 1 and . <= 65535) and
+    (.reality.path | type == "string" and test("^/[A-Za-z0-9._~/-]+$") and
+      (contains("//") | not) and (contains("..") | not)) and
+    (.reality.target | type == "string" and test("^[A-Za-z0-9.-]+:[0-9]{1,5}$")) and
+    (.reality.server_name | type == "string" and test("^[A-Za-z0-9.-]+$")) and
+    (.reality.short_id | type == "string" and test("^[0-9a-fA-F]{2,32}$")) and
+    (.nginx.shared_tcp443 == false or
+      (.reality.enabled == true and .reality.port == 443 and
+       .reality.listen_port != 443)) and
+    (.hysteria2.enabled | type == "boolean") and
+    (.hysteria2.port | type == "number" and . >= 1 and . <= 65535) and
+    (.hysteria2.shared_udp443 | type == "boolean") and
+    (.hysteria2.shared_udp443 == false or
+      (.hysteria2.enabled == true and .hysteria2.port == 443)) and
+    (.hysteria2.obfs_password | type == "string" and length >= 1 and length <= 512) and
+    (.hysteria2.masquerade | type == "string" and
+      test("^https?://[^[:space:]]+$")) and
+    (.hysteria2.up_mbps | type == "number" and . >= 0 and . <= 100000) and
+    (.hysteria2.down_mbps | type == "number" and . >= 0 and . <= 100000)
+  ' <<<"$1" >/dev/null
+}
+
+prompt_worker_direct_config() {
+  local bundle="$1" name default_address domain address is_baota=0
+  local xhttp_enabled reality_enabled hy2_enabled shared_choice="n"
+  local nginx_mode="disabled" tls_port=443 https_port=8443
+  local auto_rebind=false cert="" key="" snippet=""
+  local xhttp_public=8443 xhttp_listen=18000 xhttp_path xhttp_behind=false
+  local reality_port=443 reality_listen=18443 reality_path reality_target
+  local reality_sni reality_short
+  local hy2_port=443 hy2_shared=true hy2_obfs hy2_masquerade hy2_up hy2_down
+
+  name="$(jq -r '.worker.name' <<<"$bundle")"
+  default_address="$(jq -r '.worker.public_host // ""' <<<"$bundle")"
+  [[ -n "$default_address" ]] || default_address="$(detect_public_ipv4)"
+  if [[ -z "$default_address" || "$default_address" =~ ^[0-9.]+$ ]]; then
+    domain="${name}.example.com"
+  else
+    domain="$default_address"
+  fi
+
+  printf '\n%s%s【从服务器独立入口】%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET" >&2
+  printf '下面只影响客户端直接连接这台从服务器；主从中继不受影响。\n' >&2
+  domain="$(prompt_hostname_value '已解析到这台从服务器的域名' "$domain")"
+  address="$(prompt_hostname_value '客户端连接地址（域名或公网映射地址）' \
+    "${default_address:-$domain}")"
+
+  if [[ -x /www/server/nginx/sbin/nginx ]]; then
+    is_baota=1
+    printf '%s✓ 检测到宝塔，将复用宝塔 nginx，不安装第二套。%s\n' \
+      "$C_GREEN" "$C_RESET" >&2
+  fi
+
+  xhttp_enabled="$(prompt_bool '启用从服务器 XHTTP + TLS' n)"
+  reality_enabled="$(prompt_bool '启用从服务器 Reality + XHTTP' y)"
+  hy2_enabled="$(prompt_bool '启用从服务器 Hysteria2' y)"
+
+  if [[ "$xhttp_enabled" == "y" || "$reality_enabled" == "y" ]]; then
+    shared_choice="$(prompt_bool '让 XHTTP、Reality 和网站共用 TCP 443' y)"
+  fi
+  if [[ "$shared_choice" == "y" ]]; then
+    if port_is_listening tcp 443 && ! port_is_nginx_owned tcp 443; then
+      die "TCP 443 已被非 nginx 程序占用，无法配置共用"
+    fi
+    if (( is_baota )); then
+      nginx_mode="snippet"
+      snippet="/www/server/panel/vhost/nginx/extension/${domain}/etxr.conf"
+      cert="/www/server/panel/vhost/cert/${domain}/fullchain.pem"
+      key="/www/server/panel/vhost/cert/${domain}/privkey.pem"
+      if [[ "$reality_enabled" == "y" ]]; then
+        https_port="$(prompt_port_checked '宝塔 HTTPS 内部监听 TCP 端口' '8443' tcp)"
+        printf '%s将备份所有宝塔 HTTPS vhost，并把 TCP 443 自动迁移到 127.0.0.1:%s。%s\n' \
+          "$C_YELLOW" "$https_port" "$C_RESET" >&2
+        menu_confirm "确认由 ETXR 自动调整宝塔 HTTPS 监听" ||
+          die "已取消 TCP 443 共用"
+        auto_rebind=true
+      fi
+    else
+      nginx_mode="standalone"
+      cert="/etc/letsencrypt/live/${domain}/fullchain.pem"
+      key="/etc/letsencrypt/live/${domain}/privkey.pem"
+      if [[ "$reality_enabled" == "y" ]]; then
+        https_port="$(prompt_port_checked 'nginx HTTPS 内部监听 TCP 端口' '8443' tcp)"
+      fi
+      printf '%s未检测到宝塔，将安装标准 nginx 和 stream 模块。%s\n' \
+        "$C_YELLOW" "$C_RESET" >&2
+    fi
+  elif [[ "$xhttp_enabled" == "y" ]]; then
+    xhttp_public="$(prompt_port_checked 'XHTTP 独立 TLS TCP 端口' '8443' tcp)"
+    xhttp_listen="$xhttp_public"
+  fi
+
+  xhttp_path="/${name}-xhttp-$(random_hex 10)"
+  if [[ "$xhttp_enabled" == "y" ]]; then
+    if [[ "$shared_choice" == "y" ]]; then
+      xhttp_public=443
+      xhttp_listen="$(prompt_port_checked 'Xray XHTTP 本地 TCP 端口' '18000' tcp)"
+      xhttp_behind=true
+    fi
+    xhttp_path="$(prompt_path_value 'XHTTP Path' "$xhttp_path")"
+  fi
+
+  reality_path="/${name}-reality-$(random_hex 10)"
+  reality_target="aod.itunes.apple.com:443"
+  reality_sni="aod.itunes.apple.com"
+  reality_short="$(random_hex 8)"
+  if [[ "$reality_enabled" == "y" ]]; then
+    if [[ "$shared_choice" == "y" ]]; then
+      reality_port=443
+      reality_listen="$(prompt_port_checked 'Reality 本地 TCP 端口' '18443' tcp)"
+    else
+      reality_port="$(prompt_port_checked 'Reality TCP 端口' \
+        "$([[ "$xhttp_enabled" == "y" ]] && printf '18443' || printf '443')")"
+      reality_listen="$reality_port"
+    fi
+    reality_path="$(prompt_path_value 'Reality XHTTP Path' "$reality_path")"
+    reality_target="$(prompt_target_value 'Reality 伪装网站（目标）' "$reality_target")"
+    reality_sni="$(prompt_hostname_value 'Reality 伪装域名（SNI）' \
+      "${reality_target%%:*}")"
+    reality_short="$(prompt_value 'Reality Short ID' "$reality_short")"
+    [[ "$reality_short" =~ ^[0-9a-fA-F]{2,32}$ ]] ||
+      die "Reality Short ID 必须是 2 到 32 位十六进制字符"
+  fi
+
+  hy2_obfs="$(random_password)"
+  hy2_masquerade="https://${domain}"
+  hy2_up=0
+  hy2_down=0
+  if [[ "$hy2_enabled" == "y" ]]; then
+    if [[ "$(prompt_bool '让 Hysteria2 使用 UDP 443' y)" == "y" ]] &&
+       confirm_hy2_udp443_share; then
+      hy2_port=443
+      hy2_shared=true
+    else
+      hy2_port="$(prompt_port_checked 'Hysteria2 UDP 端口' '28443' udp)"
+      hy2_shared=false
+    fi
+    hy2_obfs="$(prompt_secret_default 'Hysteria2 混淆密码' "$hy2_obfs")"
+    hy2_masquerade="$(prompt_url_value 'Hysteria2 伪装网站' "$hy2_masquerade")"
+    hy2_up="$(prompt_mbps 'Hysteria2 服务器总上传 Mbps，0 表示不限' '0')"
+    hy2_down="$(prompt_mbps 'Hysteria2 服务器总下载 Mbps，0 表示不限' '0')"
+  else
+    hy2_port=28443
+    hy2_shared=false
+  fi
+
+  if [[ "$nginx_mode" != "disabled" || "$hy2_enabled" == "y" ||
+        "$xhttp_enabled" == "y" ]]; then
+    if [[ -z "$cert" ]]; then
+      cert="${RUNTIME_DIR}/certs/${name}/fullchain.pem"
+      key="${RUNTIME_DIR}/certs/${name}/privkey.pem"
+    fi
+    cert="$(prompt_value 'TLS 证书文件路径（不存在时生成自签证书）' "$cert")"
+    key="$(prompt_value 'TLS 证书私钥路径（不存在时生成自签证书）' "$key")"
+  fi
+
+  WORKER_DIRECT_CONFIG="$(jq -n \
+    --arg domain "$domain" --arg address "$address" \
+    --arg mode "$nginx_mode" --arg cert "$cert" --arg key "$key" \
+    --arg snippet "$snippet" --argjson tls_port "$tls_port" \
+    --argjson https_port "$https_port" \
+    --argjson shared "$([[ "$shared_choice" == "y" && "$reality_enabled" == "y" ]] && printf true || printf false)" \
+    --argjson auto_rebind "$auto_rebind" \
+    --argjson xhttp_enabled "$([[ "$xhttp_enabled" == "y" ]] && printf true || printf false)" \
+    --argjson xhttp_public "$xhttp_public" --argjson xhttp_listen "$xhttp_listen" \
+    --arg xhttp_path "$xhttp_path" --argjson xhttp_behind "$xhttp_behind" \
+    --argjson reality_enabled "$([[ "$reality_enabled" == "y" ]] && printf true || printf false)" \
+    --argjson reality_port "$reality_port" --argjson reality_listen "$reality_listen" \
+    --arg reality_path "$reality_path" --arg reality_target "$reality_target" \
+    --arg reality_sni "$reality_sni" --arg reality_short "$reality_short" \
+    --argjson hy2_enabled "$([[ "$hy2_enabled" == "y" ]] && printf true || printf false)" \
+    --argjson hy2_port "$hy2_port" --argjson hy2_shared "$hy2_shared" \
+    --arg hy2_obfs "$hy2_obfs" --arg hy2_masquerade "$hy2_masquerade" \
+    --argjson hy2_up "$hy2_up" --argjson hy2_down "$hy2_down" '
+    {
+      domain: $domain,
+      address: $address,
+      nginx: {
+        mode: $mode,
+        tls_port: $tls_port,
+        https_listen_port: $https_port,
+        shared_tcp443: $shared,
+        auto_rebind_https: $auto_rebind,
+        certificate: $cert,
+        certificate_key: $key,
+        snippet_path: $snippet
+      },
+      xhttp: {
+        enabled: $xhttp_enabled,
+        public_port: $xhttp_public,
+        listen_port: $xhttp_listen,
+        path: $xhttp_path,
+        behind_nginx: $xhttp_behind
+      },
+      reality: {
+        enabled: $reality_enabled,
+        port: $reality_port,
+        listen_port: $reality_listen,
+        path: $reality_path,
+        target: $reality_target,
+        server_name: $reality_sni,
+        short_id: $reality_short
+      },
+      hysteria2: {
+        enabled: $hy2_enabled,
+        port: $hy2_port,
+        shared_udp443: $hy2_shared,
+        obfs_password: $hy2_obfs,
+        masquerade: $hy2_masquerade,
+        up_mbps: $hy2_up,
+        down_mbps: $hy2_down
+      }
+    }
+  ')"
+  validate_worker_direct_config "$WORKER_DIRECT_CONFIG" ||
+    die "从服务器独立入口配置校验失败"
+}
+
 cmd_pair_join() {
   local pairing_id="" trusted_fingerprint="" prepare_only=0
+  local configure_direct=0 direct_config_file="" direct_config=""
   while (($#)); do
     case "$1" in
       --prepare-only) prepare_only=1; shift ;;
+      --configure-direct) configure_direct=1; shift ;;
+      --direct-config-file) direct_config_file="${2:-}"; shift 2 ;;
       --fingerprint) trusted_fingerprint="${2:-}"; shift 2 ;;
       --help)
-        echo "Usage: etxr pair join [--prepare-only] --fingerprint SHA256_PREFIX PAIRING_ID"
+        cat <<'EOF'
+Usage:
+  etxr pair join [--prepare-only] --fingerprint SHA256_PREFIX PAIRING_ID
+  etxr pair join --configure-direct --fingerprint SHA256_PREFIX PAIRING_ID
+  etxr pair join --direct-config-file FILE --fingerprint SHA256_PREFIX PAIRING_ID
+
+--configure-direct makes the worker ask for its own XHTTP, Reality, Hysteria2,
+certificate, Path, and TCP/UDP 443 settings after the Pair ID is verified.
+EOF
         return ;;
       *)
         [[ -z "$pairing_id" ]] || die "Only one pairing ID is allowed"
@@ -5257,6 +5809,8 @@ cmd_pair_join() {
     esac
   done
   [[ -n "$pairing_id" ]] || die "Usage: etxr pair join PAIRING_ID"
+  (( ! configure_direct || ${#direct_config_file} == 0 )) ||
+    die "--configure-direct and --direct-config-file cannot be used together"
   [[ "$trusted_fingerprint" =~ ^[0-9a-fA-F]{32}$ ]] ||
     die "必须提供主服务器显示的 32 位 Pair 签名指纹"
   need_jq
@@ -5264,30 +5818,105 @@ cmd_pair_join() {
   need_cmd gzip
   need_cmd base64
   need_cmd sha256sum
-  local bundle now name public_host domain cert key cert_info
+  local bundle now name domain address cert="" key="" cert_info
+  local nginx_mode components="xray,easytier" local_direct=0
+  local certificate_insecure=false needs_certificate=false
+  local reality_keys="" reality_private="" reality_public=""
   bundle="$(pair_decode "$pairing_id" "$trusted_fingerprint")"
   validate_pair_bundle "$bundle" ||
     die "Pair ID 字段校验失败，未安装软件、未覆盖现有状态"
   now="$(date +%s)"
   (( now <= $(jq -r '.expires_at' <<<"$bundle") )) || die "配对 ID 已过期，请在主服务器重新生成"
   name="$(jq -r '.worker.name' <<<"$bundle")"
-  public_host="$(jq -r '.worker.public_host' <<<"$bundle")"
-  public_host="${public_host:-$(detect_public_ipv4)}"
-  domain="$public_host"
-  [[ -n "$domain" ]] || domain="${name}.local"
-  valid_hostname "$domain" || die "Pair ID 中的从服务器域名无效"
+
+  if [[ -n "$direct_config_file" ]]; then
+    [[ -f "$direct_config_file" && -r "$direct_config_file" ]] ||
+      die "从服务器协议配置文件不存在或不可读"
+    (( $(wc -c <"$direct_config_file") <= 65536 )) ||
+      die "从服务器协议配置文件超过 64 KiB"
+    direct_config="$(jq -ce . "$direct_config_file")" ||
+      die "从服务器协议配置文件不是有效 JSON"
+    local_direct=1
+  elif (( configure_direct )); then
+    prompt_worker_direct_config "$bundle"
+    direct_config="$WORKER_DIRECT_CONFIG"
+    local_direct=1
+  else
+    direct_config="$(bundle_worker_direct_config "$bundle")"
+  fi
+  validate_worker_direct_config "$direct_config" ||
+    die "从服务器协议配置字段校验失败，未安装软件、未覆盖现有状态"
+
+  domain="$(jq -r '.domain' <<<"$direct_config")"
+  address="$(jq -r '.address' <<<"$direct_config")"
+  nginx_mode="$(jq -r '.nginx.mode' <<<"$direct_config")"
+  valid_hostname "$domain" || die "从服务器域名无效"
+  valid_hostname "$address" || die "从服务器客户端连接地址无效"
+
+  jq -e --argjson c "$direct_config" '
+    [
+      .relay.private_port,
+      (if .relay.public_enabled then .relay.listen_port else empty end),
+      (if $c.xhttp.enabled then $c.xhttp.listen_port else empty end),
+      (if $c.reality.enabled then $c.reality.listen_port else empty end)
+    ] | length == (unique | length)
+  ' <<<"$bundle" >/dev/null ||
+    die "主从中继、XHTTP 或 Reality 的本地 TCP 监听端口重复"
+
   if (( ! prepare_only )); then
     need_root
     # Validate the complete signed bundle before installing any dependency.
-    cmd_install --components xray,sing-box,easytier
+    [[ "$(jq -r '.hysteria2.enabled' <<<"$direct_config")" != "true" ]] ||
+      components+=",sing-box"
+    [[ "$nginx_mode" != "standalone" ]] || components+=",nginx"
+    cmd_install --components "$components"
   fi
-  cert_info="$(generate_self_signed_cert "$name" "$domain")"
-  cert="$(sed -n '1p' <<<"$cert_info")"
-  key="$(sed -n '2p' <<<"$cert_info")"
+
+  if [[ "$nginx_mode" != "disabled" ||
+        "$(jq -r '.xhttp.enabled' <<<"$direct_config")" == "true" ||
+        "$(jq -r '.hysteria2.enabled' <<<"$direct_config")" == "true" ]]; then
+    needs_certificate=true
+  fi
+  cert="$(jq -r '.nginx.certificate' <<<"$direct_config")"
+  key="$(jq -r '.nginx.certificate_key' <<<"$direct_config")"
+  if [[ "$needs_certificate" == "true" ]]; then
+    if ! tls_certificate_is_usable "$cert" "$key"; then
+      [[ -z "$cert" && -z "$key" ]] ||
+        warn "指定证书不可用、已过期或与私钥不匹配，将改用自动生成的自签证书"
+      cert_info="$(generate_self_signed_cert "$name" "$domain")"
+      cert="$(sed -n '1p' <<<"$cert_info")"
+      key="$(sed -n '2p' <<<"$cert_info")"
+      certificate_insecure=true
+    elif ! tls_certificate_matches_name "$cert" "$domain"; then
+      warn "证书不包含域名 $domain，订阅将自动启用跳过证书名称校验"
+      certificate_insecure=true
+    fi
+    direct_config="$(jq -c --arg cert "$cert" --arg key "$key" \
+      '.nginx.certificate = $cert | .nginx.certificate_key = $key' \
+      <<<"$direct_config")"
+  fi
+  if [[ "$(jq -r '.reality.enabled' <<<"$direct_config")" == "true" ]]; then
+    if (( local_direct )); then
+      reality_keys="$("$XRAY_BIN" x25519)"
+      reality_private="$(awk -F': ' '/^PrivateKey:/ {print $2; exit}' <<<"$reality_keys")"
+      reality_public="$(awk -F': ' '/^(Password|PublicKey)/ {print $2; exit}' <<<"$reality_keys")"
+    else
+      reality_private="$(jq -r '.direct.reality.private_key // ""' <<<"$bundle")"
+      reality_public="$(jq -r '.direct.reality.public_key // ""' <<<"$bundle")"
+    fi
+    [[ -n "$reality_private" && -n "$reality_public" ]] ||
+      die "无法解析从服务器本机生成的 Reality x25519 密钥"
+  fi
 
   FORCE=1
-  cmd_init --name "$name" --role exit --domain "$domain" --address "$public_host" \
-    --nginx-mode disabled --cert "$cert" --key "$key"
+  cmd_init --name "$name" --role exit --domain "$domain" --address "$address" \
+    --nginx-mode "$nginx_mode" \
+    --tls-port "$(jq -r '.nginx.tls_port' <<<"$direct_config")" \
+    --nginx-https-listen-port "$(jq -r '.nginx.https_listen_port' <<<"$direct_config")" \
+    --nginx-shared-tcp443 "$(jq -r '.nginx.shared_tcp443' <<<"$direct_config")" \
+    --nginx-auto-rebind-https "$(jq -r '.nginx.auto_rebind_https' <<<"$direct_config")" \
+    --snippet "$(jq -r '.nginx.snippet_path' <<<"$direct_config")" \
+    --cert "$cert" --key "$key"
   FORCE=0
   local private_relay public_relay='[]' xhttp_routes='[]' reality_inbounds='[]'
   local worker_users
@@ -5313,13 +5942,18 @@ cmd_pair_join() {
       flow: .relay.flow
     }]' <<<"$bundle")"
   fi
-  if [[ "$(jq -r '.direct.xhttp.enabled // false' <<<"$bundle")" == "true" ]]; then
-    xhttp_routes="$(jq -c --arg cert "$cert" --arg key "$key" '[{
-      name: (.worker.name + "-xhttp"),
-      listen: "0.0.0.0",
-      port: .direct.xhttp.listen_port,
-      public_port: .direct.xhttp.public_port,
-      path: .direct.xhttp.path,
+  if [[ "$(jq -r '.xhttp.enabled' <<<"$direct_config")" == "true" ]]; then
+    xhttp_routes="$(jq -nc \
+      --arg name "$name" --arg cert "$cert" --arg key "$key" \
+      --argjson config "$direct_config" \
+      --argjson insecure "$certificate_insecure" '
+      $config.xhttp as $x |
+      [{
+      name: ($name + "-xhttp"),
+      listen: (if $x.behind_nginx then "127.0.0.1" else "0.0.0.0" end),
+      port: $x.listen_port,
+      public_port: $x.public_port,
+      path: $x.path,
       target: "direct",
       profile: "plain",
       host: "",
@@ -5327,24 +5961,29 @@ cmd_pair_join() {
       client_encryption: "none",
       flow: "",
       direct: true,
-       security: "tls",
-       certificate: $cert,
-       certificate_key: $key,
-       allow_insecure: true
-    }]' <<<"$bundle")"
+      security: (if $x.behind_nginx then "none" else "tls" end),
+      certificate: (if $x.behind_nginx then "" else $cert end),
+      certificate_key: (if $x.behind_nginx then "" else $key end),
+      allow_insecure: $insecure
+    }]')"
   fi
-  if [[ "$(jq -r '.direct.reality.enabled // true' <<<"$bundle")" == "true" ]]; then
-    reality_inbounds="$(jq -c '[{
-      name: "direct",
-      listen: "0.0.0.0",
-      port: .direct.reality.port,
-      path: .direct.reality.path,
-      target: .direct.reality.target,
-      server_names: [.direct.reality.server_name],
-      private_key: .direct.reality.private_key,
-      public_key: .direct.reality.public_key,
-      short_ids: [.direct.reality.short_id]
-    }]' <<<"$bundle")"
+  if [[ "$(jq -r '.reality.enabled' <<<"$direct_config")" == "true" ]]; then
+    reality_inbounds="$(jq -nc \
+      --arg private "$reality_private" --arg public "$reality_public" \
+      --argjson config "$direct_config" '
+      $config.reality as $r |
+      [{
+        name: "direct",
+        listen: (if $config.nginx.shared_tcp443 then "127.0.0.1" else "0.0.0.0" end),
+        port: $r.port,
+        listen_port: $r.listen_port,
+        path: $r.path,
+        target: $r.target,
+        server_names: [$r.server_name],
+        private_key: $private,
+        public_key: $public,
+        short_ids: [$r.short_id]
+      }]')"
   fi
   worker_users="$(jq -c --arg prefix "$(sha1_prefix admin)" \
     --arg token "$(random_hex 20)" '
@@ -5386,7 +6025,7 @@ cmd_pair_join() {
     .hysteria2.masquerade = $hy2_masquerade |
     .hysteria2.certificate = $cert |
     .hysteria2.certificate_key = $key |
-     .hysteria2.insecure = true |
+    .hysteria2.insecure = $certificate_insecure |
     .control = {
       enabled: false,
       base_path: "",
@@ -5408,17 +6047,18 @@ cmd_pair_join() {
     --argjson private "$private_relay" --argjson public "$public_relay" \
     --argjson xhttp_routes "$xhttp_routes" \
     --argjson reality_inbounds "$reality_inbounds" \
-    --argjson hy2_enabled "$(jq -r '.direct.hysteria2.enabled // true' <<<"$bundle")" \
-    --argjson hy2_port "$(jq -r '.direct.hysteria2.port' <<<"$bundle")" \
-    --argjson hy2_shared_udp443 "$(jq -r '.direct.hysteria2.shared_udp443 // false' <<<"$bundle")" \
-    --argjson hy2_up "$(jq -r '.direct.hysteria2.up_mbps // 0' <<<"$bundle")" \
-    --argjson hy2_down "$(jq -r '.direct.hysteria2.down_mbps // 0' <<<"$bundle")" \
-    --arg hy2_obfs "$(jq -r '.direct.hysteria2.obfs_password' <<<"$bundle")" \
-    --arg hy2_masquerade "$(jq -r '.direct.hysteria2.masquerade // "https://www.cloudflare.com"' <<<"$bundle")" \
+    --argjson hy2_enabled "$(jq -r '.hysteria2.enabled' <<<"$direct_config")" \
+    --argjson hy2_port "$(jq -r '.hysteria2.port' <<<"$direct_config")" \
+    --argjson hy2_shared_udp443 "$(jq -r '.hysteria2.shared_udp443' <<<"$direct_config")" \
+    --argjson hy2_up "$(jq -r '.hysteria2.up_mbps' <<<"$direct_config")" \
+    --argjson hy2_down "$(jq -r '.hysteria2.down_mbps' <<<"$direct_config")" \
+    --arg hy2_obfs "$(jq -r '.hysteria2.obfs_password' <<<"$direct_config")" \
+    --arg hy2_masquerade "$(jq -r '.hysteria2.masquerade' <<<"$direct_config")" \
     --arg control_url "$(jq -r '.control.base_url' <<<"$bundle")" \
     --arg control_node "$(jq -r '.control.node_id' <<<"$bundle")" \
     --arg control_token "$(jq -r '.control.token' <<<"$bundle")" \
     --arg cert "$cert" --arg key "$key" \
+    --argjson certificate_insecure "$certificate_insecure" \
     --argjson users "$worker_users"
 
   if (( prepare_only )); then
@@ -6509,7 +7149,8 @@ menu_worker_join() {
   clear_screen
   printf '%s%s【从服务器加入向导】%s\n\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
   printf '把主服务器生成的配对 ID 和签名指纹粘贴到下面，然后回车。\n'
-  printf 'Xray、EasyTier、Hysteria2 和所有密钥都会自动安装。\n'
+  printf '配对验证通过后，再在这台从服务器选择 XHTTP、Reality、Hysteria2 和 443 共用。\n'
+  printf '协议密钥在本机生成；有宝塔就复用宝塔 nginx，没有才安装标准 nginx。\n'
   printf '%s粘贴时屏幕不会显示字符，这是正常的。%s\n\n' "$C_YELLOW" "$C_RESET"
   local pairing_id fingerprint
   pairing_id="$(prompt_secret '请粘贴配对 ID')"
@@ -6532,8 +7173,9 @@ menu_worker_join() {
       return
     }
   fi
-  printf '\n正在自动安装并连接主服务器，通常需要 1～3 分钟……\n'
-  if menu_exec cmd_pair_join --fingerprint "$fingerprint" "$pairing_id"; then
+  printf '\n配对已准备完成，接下来配置这台从服务器自己的客户端入口。\n'
+  if menu_exec cmd_pair_join --configure-direct \
+    --fingerprint "$fingerprint" "$pairing_id"; then
     printf '\n%s✓ 从服务器已加入成功。现在可以回到主服务器复制订阅测试。%s\n' \
       "$C_GREEN" "$C_RESET"
   fi
@@ -6553,14 +7195,11 @@ menu_pair_create() {
   fi
   local name public_host="" backup_port=29000 backup_listen_port=29000
   local relay_private_port=19000 mode_choice
-  local xhttp_enabled reality_enabled hy2_enabled xhttp_port xhttp_listen_port xhttp_path
-  local reality_port reality_path reality_target reality_sni reality_short
-  local hy2_port hy2_password hy2_obfs hy2_masquerade hy2_up hy2_down
-  local hy2_shared_udp443=false hy2_share_choice
-  local relay_uuid user_uuid pair_expires_minutes
+  local relay_uuid pair_expires_minutes
   clear_screen
   printf '%s%s【给主服务器添加从服务器】%s\n\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
-  printf '有公网中继端口时默认公网直连；没有可用端口时自动使用 EasyTier。\n\n'
+  printf '这里只配置主从中继。XHTTP、Reality、Hysteria2 和 443 共用会在从服务器本机设置。\n'
+  printf '有公网中继端口时默认公网直连；没有可用端口时使用 EasyTier。\n\n'
   name="$(prompt_name_value '给从服务器起个短名字' 'tw1')"
   pair_expires_minutes="$(prompt_value '配对 ID 有效期（分钟）' '30')"
   if [[ ! "$pair_expires_minutes" =~ ^[0-9]+$ ]] ||
@@ -6576,9 +7215,9 @@ menu_pair_create() {
   read -r -p '请选择 [1]: ' mode_choice
   mode_choice="${mode_choice:-1}"
   if [[ "$mode_choice" == "2" ]]; then
-    public_host="$(prompt_hostname_value '从服务器的公网 IP 或域名' "${name}.example.com")"
+    public_host="$(prompt_hostname_value '从服务器公网 IP 或域名' "${name}.example.com")"
   elif [[ "$mode_choice" == "3" ]]; then
-    public_host="$(prompt_hostname_value '公网映射地址（IP 或域名）' "${name}.example.com")"
+    public_host="$(prompt_hostname_value '从服务器公网映射地址（IP 或域名）' "${name}.example.com")"
   elif [[ "$mode_choice" != "1" ]]; then
     warn "选项无效"
     menu_pause
@@ -6589,124 +7228,34 @@ menu_pair_create() {
   relay_private_port="$(prompt_port_value 'EasyTier 私网中继 TCP 端口' '19000')"
   relay_uuid="$(prompt_uuid_value '主从中继 UUID' "$(random_uuid)")"
   if [[ "$mode_choice" == "2" || "$mode_choice" == "3" ]]; then
-    backup_port="$(prompt_port_value '公网主线路 TCP 端口' '29000')"
-    backup_listen_port="$(prompt_port_value '从服务器公网中继监听 TCP 端口' '29000')"
+    backup_port="$(prompt_port_value '客户端看到的公网中继 TCP 端口' '29000')"
+    backup_listen_port="$(prompt_port_value '从服务器实际监听的中继 TCP 端口' '29000')"
   fi
 
-  printf '\n%s【从服务器独立入口】%s\n' "$C_BOLD" "$C_RESET"
-  printf '这里只设置客户端直接连接从服务器的入口；主服务器转发不受影响。\n'
-  xhttp_enabled="$(prompt_bool '启用从服务器 XHTTP + TLS 入口' n)"
-  reality_enabled="$(prompt_bool '启用从服务器 Reality + XHTTP 入口' y)"
-  hy2_enabled="$(prompt_bool '启用从服务器 Hysteria2 入口' y)"
-  user_uuid="$(prompt_uuid_value '从服务器直接入口 UUID' "$(random_uuid)")"
-
-  xhttp_port=18000
-  xhttp_listen_port=18000
-  xhttp_path="/${name}-xhttp-$(random_hex 8)"
-  if [[ "$xhttp_enabled" == "y" ]]; then
-    xhttp_port="$(prompt_port_value 'XHTTP 公网 TCP 端口' '18000')"
-    xhttp_listen_port="$(prompt_port_value 'XHTTP 内部监听 TCP 端口' "$xhttp_port")"
-    xhttp_path="$(prompt_path_value 'XHTTP Path' "$xhttp_path")"
-  fi
-
-  reality_port=18443
-  reality_path="/${name}-reality-$(random_hex 8)"
-  reality_target="aod.itunes.apple.com:443"
-  reality_sni="aod.itunes.apple.com"
-  reality_short="$(random_hex 8)"
-  if [[ "$reality_enabled" == "y" ]]; then
-    reality_port="$(prompt_port_value 'Reality TCP 端口' '18443')"
-    reality_path="$(prompt_path_value 'Reality XHTTP Path' "$reality_path")"
-    reality_target="$(prompt_target_value 'Reality 伪装网站（目标）' 'aod.itunes.apple.com:443')"
-    reality_sni="$(prompt_hostname_value 'Reality 伪装域名（SNI）' "${reality_target%%:*}")"
-    reality_short="$(prompt_value 'Reality Short ID' "$reality_short")"
-    [[ "$reality_short" =~ ^[0-9a-fA-F]{2,32}$ ]] || {
-      warn "Reality Short ID 必须是 2 到 32 位十六进制字符"
-      menu_pause
-      return
-    }
-  fi
-
-  hy2_port=28443
-  hy2_password="$(random_password)"
-  hy2_obfs="$(random_password)"
-  hy2_masquerade="https://www.cloudflare.com"
-  hy2_up=0
-  hy2_down=0
-  if [[ "$hy2_enabled" == "y" ]]; then
-    hy2_share_choice="$(prompt_bool '让从服务器 Hysteria2 使用 UDP 443（与 TCP 443 共用）' y)"
-    if [[ "$hy2_share_choice" == "y" ]]; then
-      printf '\n%s从服务器加入时将自动检测 nginx H3/QUIC。%s\n' \
-        "$C_YELLOW" "$C_RESET"
-      printf '如 UDP 443 被 nginx 占用，将备份配置、关闭 H3/QUIC、保留 TCP HTTPS，并在失败时回滚。\n'
-      if menu_confirm "确认让从服务器自动配置 UDP 443"; then
-        hy2_port=443
-        hy2_shared_udp443=true
-      else
-        hy2_port="$(prompt_port_value 'Hysteria2 UDP 端口' '28443')"
-      fi
-    else
-      hy2_port="$(prompt_port_value 'Hysteria2 UDP 端口' '28443')"
-    fi
-    hy2_password="$(prompt_secret_default 'Hysteria2 用户密码' "$hy2_password")"
-    hy2_obfs="$(prompt_secret_default 'Hysteria2 混淆密码' "$hy2_obfs")"
-    hy2_masquerade="$(prompt_url_value 'Hysteria2 伪装网站' "$hy2_masquerade")"
-    hy2_up="$(prompt_mbps 'Hysteria2 服务器总上传 Mbps，0 表示不限' '0')"
-    hy2_down="$(prompt_mbps 'Hysteria2 服务器总下载 Mbps，0 表示不限' '0')"
-  fi
-
-  printf '\n%s从服务器端口只检查格式，不检查占用；配对加入时会由从服务器实际验证。%s\n' \
+  printf '\n%s从服务器粘贴 Pair ID 后会现场检查协议端口占用，并生成 Reality 密钥。%s\n' \
     "$C_YELLOW" "$C_RESET"
   if [[ "$mode_choice" == "3" ]]; then
-    printf 'NAT 主线路映射：%s:%s -> 从服务器:%s TCP\n' \
+    printf '请先准备这条 NAT 映射：%s:%s -> 从服务器:%s TCP\n' \
       "$public_host" "$backup_port" "$backup_listen_port"
-    [[ "$xhttp_enabled" != "y" ]] ||
-      printf 'NAT XHTTP 映射：%s:%s -> 从服务器:%s TCP\n' \
-        "$public_host" "$xhttp_port" "$xhttp_listen_port"
-    [[ "$reality_enabled" != "y" ]] ||
-      printf 'NAT Reality 映射：%s:%s -> 从服务器:%s TCP\n' \
-        "$public_host" "$reality_port" "$reality_port"
-    [[ "$hy2_enabled" != "y" ]] ||
-      printf 'NAT Hysteria2 映射：%s:%s -> 从服务器:%s UDP\n' \
-        "$public_host" "$hy2_port" "$hy2_port"
   fi
 
   local -a args=(
     --name "$name"
     --private-relay-port "$relay_private_port"
     --relay-uuid "$relay_uuid"
-    --user-uuid "$user_uuid"
     --public-relay-port "$backup_port"
     --public-listen-port "$backup_listen_port"
-    --xhttp-port "$xhttp_port"
-    --xhttp-listen-port "$xhttp_listen_port"
-    --xhttp-path "$xhttp_path"
-    --reality-port "$reality_port"
-    --reality-path "$reality_path"
-    --reality-target "$reality_target"
-    --reality-sni "$reality_sni"
-    --reality-short-id "$reality_short"
-    --hy2-port "$hy2_port"
-    --hy2-password "$hy2_password"
-    --hy2-obfs-password "$hy2_obfs"
-    --hy2-masquerade "$hy2_masquerade"
-    --hy2-up-mbps "$hy2_up"
-    --hy2-down-mbps "$hy2_down"
+    --no-xhttp
+    --no-reality
+    --no-hy2
     --expires-minutes "$pair_expires_minutes"
   )
-  [[ "$xhttp_enabled" == "y" ]] && args+=(--xhttp-enabled) || args+=(--no-xhttp)
-  [[ "$reality_enabled" == "y" ]] && args+=(--reality-enabled) || args+=(--no-reality)
-  [[ "$hy2_enabled" == "y" ]] && args+=(--hy2-enabled) || args+=(--no-hy2)
-  if [[ "$hy2_shared_udp443" == "true" ]]; then
-    args+=(--hy2-share-udp443)
-  else
-    args+=(--hy2-no-share-udp443)
-  fi
   [[ -z "$public_host" ]] || args+=(--public-host "$public_host")
   if menu_exec cmd_pair_create "${args[@]}"; then
     printf '\n%s下一步只有一件事：%s\n' "$C_BOLD" "$C_RESET"
-     printf '%s把上面的 ER2 开头配对 ID 和签名指纹完整复制到从服务器，并选择主菜单第 2 项。%s\n' \
+    printf '%s把上面的 ER2 开头配对 ID 和签名指纹完整复制到从服务器，并选择主菜单第 2 项。%s\n' \
       "$C_GREEN" "$C_RESET"
+    printf '协议、域名、证书、Path 和 443 共用全部在从服务器上选择。\n'
     menu_apply_prompt || true
   fi
   menu_pause
