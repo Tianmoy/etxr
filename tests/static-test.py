@@ -15,7 +15,7 @@ def main() -> int:
     text = SCRIPT.read_text(encoding="utf-8")
     assert text.startswith("#!/usr/bin/env bash\n")
     assert "set -Eeuo pipefail" in text
-    assert 'VERSION="0.13.0"' in text
+    assert 'VERSION="0.13.1"' in text
     assert "local expires_minutes=30 expires_at" in text
     assert "--expires-minutes" in text
 
@@ -163,6 +163,16 @@ def main() -> int:
     assert 'location = /sub/' not in text
     assert 'install -m 600 "$GENERATED_DIR/nginx-paths.conf"' in text
     assert 'install -m 600 "$GENERATED_DIR/nginx-stream.conf"' in text
+
+    # Public relay prompts must describe who connects to each port. A worker
+    # with a dedicated public IP uses one public/listen port; only NAT mode
+    # asks for separate external and internal ports.
+    assert "客户端看到的公网中继 TCP 端口" not in text
+    assert "从服务器公网中继 TCP 端口（需在防火墙放行）" in text
+    assert 'backup_listen_port="$backup_port"' in text
+    assert "服务商提供的公网映射 TCP 端口（外部端口）" in text
+    assert "从服务器本机中继 TCP 端口（映射目标端口）" in text
+    assert '--nginx-auto-rebind-https "$auto_rebind_https"' in text
 
     # Fresh-install-only code must not carry historical import or remote-shell
     # synchronization implementations.
