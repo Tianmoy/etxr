@@ -27,4 +27,16 @@ test "$(parse_xray_sha256_dgst "$TMP/dashed.dgst")" = "$expected"
 printf 'SHA2-512=%0128d\n' 0 >"$TMP/missing.dgst"
 test -z "$(parse_xray_sha256_dgst "$TMP/missing.dgst")"
 
+api_fixture="$(
+  jq -n --arg digest "sha256:$expected" '{
+    assets: [{
+      name: "sing-box-1.13.14-linux-amd64.tar.gz",
+      digest: $digest
+    }]
+  }'
+)"
+test "$(github_asset_sha256 "$api_fixture" \
+  "sing-box-1.13.14-linux-amd64.tar.gz")" = "$expected"
+test -z "$(github_asset_sha256 "$api_fixture" "missing.tar.gz")"
+
 echo "xray-checksum-test: PASS"

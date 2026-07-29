@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.12.1"
+VERSION="0.12.2"
 
 STATE_FILE="${ETXR_STATE:-/etc/etxr/state.json}"
 RUNTIME_DIR="${ETXR_RUNTIME:-/etc/etxr}"
@@ -4231,9 +4231,18 @@ parse_xray_sha256_dgst() {
   ' "$digest_file"
 }
 
+github_asset_sha256() {
+  local api_json="$1" asset_name="$2" digest
+  digest="$(jq -r --arg n "$asset_name" \
+    '[.assets[] | select(.name == $n) | .digest][0] // empty' <<<"$api_json")"
+  if [[ "$digest" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; then
+    printf '%s\n' "${digest#sha256:}"
+  fi
+}
+
 download_xray_release() {
   local destination="$1"
-  local arch api version asset_name url dgst_url api_digest
+  local arch api version asset_name url dgst_url
   local expected="" sidecar_expected="" actual
   arch="$(detect_arch_xray)"
   api="$(curl --proto '=https' --tlsv1.2 -fsSL \
@@ -4241,14 +4250,11 @@ download_xray_release() {
   version="$(jq -r '.tag_name' <<<"$api")"
   asset_name="Xray-linux-${arch}.zip"
   url="$(jq -r --arg n "$asset_name" '.assets[] | select(.name == $n) | .browser_download_url' <<<"$api")"
-  api_digest="$(jq -r --arg n "$asset_name" '.assets[] | select(.name == $n) | .digest // ""' <<<"$api")"
   dgst_url="$(jq -r --arg n "${asset_name}.dgst" '.assets[] | select(.name == $n) | .browser_download_url' <<<"$api")"
   [[ -n "$url" && "$url" != "null" ]] || die "Xray release asset not found"
   mkdir -p "$destination"
   curl --proto '=https' --tlsv1.2 -fL "$url" -o "$destination/xray.zip"
-  if [[ "$api_digest" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; then
-    expected="${api_digest#sha256:}"
-  fi
+  expected="$(github_asset_sha256 "$api" "$asset_name")"
   if [[ -n "$dgst_url" && "$dgst_url" != "null" ]]; then
     curl --proto '=https' --tlsv1.2 -fL "$dgst_url" -o "$destination/xray.zip.dgst"
     sidecar_expected="$(parse_xray_sha256_dgst "$destination/xray.zip.dgst")"
@@ -4290,7 +4296,8 @@ install_xray() {
 }
 
 install_sing_box() {
-  local arch api version bare asset url checksums_url tmp expected actual
+  local arch api version bare asset url checksums_url tmp
+  local expected="" sidecar_expected="" actual
   arch="$(detect_arch_singbox)"
   api="$(curl --proto '=https' --tlsv1.2 -fsSL \
     https://api.github.com/repos/SagerNet/sing-box/releases/latest)"
@@ -4298,19 +4305,41 @@ install_sing_box() {
   bare="${version#v}"
   asset="sing-box-${bare}-linux-${arch}.tar.gz"
   url="$(jq -r --arg n "$asset" '.assets[] | select(.name == $n) | .browser_download_url' <<<"$api")"
-  checksums_url="$(jq -r '.assets[] | select(.name | test("checksums.*txt$")) | .browser_download_url' <<<"$api" | head -n1)"
+  checksums_url="$(jq -r \
+    '[.assets[] | select(.name | test("checksums.*txt$")) | .browser_download_url][0] // empty' \
+    <<<"$api")"
   [[ -n "$url" && "$url" != "null" ]] || die "sing-box release asset not found"
   tmp="$(mktemp -d)"
   curl --proto '=https' --tlsv1.2 -fL "$url" -o "$tmp/$asset"
+  expected="$(github_asset_sha256 "$api" "$asset")"
   if [[ -n "$checksums_url" && "$checksums_url" != "null" ]]; then
     curl --proto '=https' --tlsv1.2 -fL "$checksums_url" -o "$tmp/checksums.txt"
-    expected="$(awk -v n="$asset" '$2 == n {print $1}' "$tmp/checksums.txt")"
-    actual="$(sha256sum "$tmp/$asset" | awk '{print $1}')"
-    [[ "$expected" =~ ^[0-9a-fA-F]{64}$ && "${expected,,}" == "${actual,,}" ]] ||
-      die "sing-box SHA256 校验失败"
-  else
-    die "sing-box release 没有 SHA256 校验文件"
+    sidecar_expected="$(awk -v n="$asset" '
+      {
+        file = $2
+        sub(/^\*/, "", file)
+        if (file == n) {
+          print $1
+          exit
+        }
+      }
+    ' "$tmp/checksums.txt")"
+    if [[ "$sidecar_expected" =~ ^[0-9a-fA-F]{64}$ ]]; then
+      if [[ -n "$expected" && "${expected,,}" != "${sidecar_expected,,}" ]]; then
+        die "sing-box release API 与校验文件的 SHA256 不一致"
+      fi
+      expected="$sidecar_expected"
+    elif [[ -z "$expected" ]]; then
+      die "sing-box 校验文件中没有当前安装包的 SHA256"
+    else
+      warn "sing-box 校验文件格式无法识别，改用 GitHub release API 的 SHA256"
+    fi
   fi
+  [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] ||
+    die "sing-box release 没有可用的 SHA256 摘要"
+  actual="$(sha256sum "$tmp/$asset" | awk '{print $1}')"
+  [[ "${expected,,}" == "${actual,,}" ]] ||
+    die "sing-box SHA256 校验失败"
   verify_tar_entries "$tmp/$asset"
   tar -xzf "$tmp/$asset" -C "$tmp"
   find "$tmp/sing-box-${bare}-linux-${arch}" -type l -print -quit |
