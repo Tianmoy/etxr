@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.13.0"
+VERSION="0.13.1"
 
 STATE_FILE="${ETXR_STATE:-/etc/etxr/state.json}"
 RUNTIME_DIR="${ETXR_RUNTIME:-/etc/etxr}"
@@ -453,7 +453,7 @@ nginx_process_running() {
 
 confirm_hy2_udp443_share() {
   local manifest file occupied_by_other=0
-  printf '\n%sHysteria2 共用 443 的方式：%s\n' "$C_BOLD" "$C_RESET"
+  printf '\n%s网站 TCP 443 与 Hysteria2 UDP 443 同时使用：%s\n' "$C_BOLD" "$C_RESET"
   printf '  • 网站、XHTTP、Reality 继续使用 TCP 443\n'
   printf '  • Hysteria2 单独使用 UDP 443，两者不会争用同一个协议端口\n'
 
@@ -5437,13 +5437,23 @@ EOF
   printf '\n%s配对 ID（请完整复制到从服务器）：%s\n\n%s\n\n' \
     "$C_GREEN" "$C_RESET" "$pairing_id"
   printf 'Pair 签名指纹（从服务器加入时必须核对）： %s\n' "$pair_fingerprint"
-  printf '主服务器客户端 Path：%s\n从服务器 EasyTier IP：%s\n' "$route_path" "$worker_ip"
+  printf '客户端通过主服务器访问该从服务器时使用的 XHTTP Path：%s\n' "$route_path"
+  printf '从服务器加入 EasyTier 后使用的私网 IP：%s\n' "$worker_ip"
   if [[ -n "$public_host" ]]; then
-    printf '公网主线路：%s:%s -> 从服务器 TCP %s（仅允许主服务器）\n' \
-      "$public_host" "$backup_port" "$backup_listen_port"
-    printf '故障回退：EasyTier %s:%s\n' "$worker_ip" "$relay_private_port"
+    if [[ "$backup_port" == "$backup_listen_port" ]]; then
+      printf '优先线路（公网直连）：主服务器 -> %s:%s（从服务器监听 TCP %s）\n' \
+        "$public_host" "$backup_port" "$backup_listen_port"
+    else
+      printf '优先线路（公网端口映射）：主服务器 -> %s:%s -> 从服务器 TCP %s\n' \
+        "$public_host" "$backup_port" "$backup_listen_port"
+    fi
+    printf '备用线路（公网失败后使用）：主服务器 -> EasyTier %s:%s\n' \
+      "$worker_ip" "$relay_private_port"
+    printf '防火墙要求：从服务器 TCP %s 只允许主服务器公网 IP 访问。\n' \
+      "$backup_listen_port"
   else
-    printf '连接方式：仅 EasyTier %s:%s\n' "$worker_ip" "$relay_private_port"
+    printf '唯一线路：主服务器 -> EasyTier %s:%s（无需开放公网端口）\n' \
+      "$worker_ip" "$relay_private_port"
   fi
   printf '%s该 ID 包含组网密钥，有效期 %s 分钟，请勿公开；指纹用于防止 Pair ID 被篡改。%s\n' \
     "$C_YELLOW" "$expires_minutes" "$C_RESET"
@@ -5605,10 +5615,12 @@ prompt_worker_direct_config() {
     domain="$default_address"
   fi
 
-  printf '\n%s%s【从服务器独立入口】%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET" >&2
-  printf '下面只影响客户端直接连接这台从服务器；主从中继不受影响。\n' >&2
-  domain="$(prompt_hostname_value '已解析到这台从服务器的域名' "$domain")"
-  address="$(prompt_hostname_value '客户端连接地址（域名或公网映射地址）' \
+  printf '\n%s%s【从服务器设置：手机或电脑直接连接这台机器】%s\n' \
+    "$C_BOLD" "$C_CYAN" "$C_RESET" >&2
+  printf '这部分是从服务器自己的代理入口，不影响“主服务器 -> 从服务器”的中继线路。\n' >&2
+  printf '没有域名时可先填写准备使用的域名；证书无效时脚本会生成自签证书。\n\n' >&2
+  domain="$(prompt_hostname_value '从服务器入口域名（用于 TLS 证书和 SNI）' "$domain")"
+  address="$(prompt_hostname_value '客户端实际连接的地址（通常填上面的域名，也可填公网 IP）' \
     "${default_address:-$domain}")"
 
   if [[ -x /www/server/nginx/sbin/nginx ]]; then
@@ -5617,12 +5629,16 @@ prompt_worker_direct_config() {
       "$C_GREEN" "$C_RESET" >&2
   fi
 
-  xhttp_enabled="$(prompt_bool '启用从服务器 XHTTP + TLS' n)"
-  reality_enabled="$(prompt_bool '启用从服务器 Reality + XHTTP' y)"
-  hy2_enabled="$(prompt_bool '启用从服务器 Hysteria2' y)"
+  printf '\n%s【选择客户端可用的协议】%s\n' "$C_BOLD" "$C_RESET" >&2
+  printf '可以同时启用多个协议；不确定时直接使用括号中的默认选择。\n' >&2
+  xhttp_enabled="$(prompt_bool '启用 XHTTP + nginx TLS（TCP/HTTPS）' n)"
+  reality_enabled="$(prompt_bool '启用 Reality + XHTTP（TCP）' y)"
+  hy2_enabled="$(prompt_bool '启用 Hysteria2（UDP）' y)"
 
   if [[ "$xhttp_enabled" == "y" || "$reality_enabled" == "y" ]]; then
-    shared_choice="$(prompt_bool '让 XHTTP、Reality 和网站共用 TCP 443' y)"
+    printf '\n%s【TCP 443 使用方式】%s\n' "$C_BOLD" "$C_RESET" >&2
+    printf '选择共用后，客户端仍连接公网 TCP 443，脚本按域名和 Path 自动分流。\n' >&2
+    shared_choice="$(prompt_bool '让网站、XHTTP 和 Reality 共用公网 TCP 443' y)"
   fi
   if [[ "$shared_choice" == "y" ]]; then
     if port_is_listening tcp 443 && ! port_is_nginx_owned tcp 443; then
@@ -5634,10 +5650,11 @@ prompt_worker_direct_config() {
       cert="/www/server/panel/vhost/cert/${domain}/fullchain.pem"
       key="/www/server/panel/vhost/cert/${domain}/privkey.pem"
       if [[ "$reality_enabled" == "y" ]]; then
-        https_port="$(prompt_port_checked '宝塔 HTTPS 内部监听 TCP 端口' '8443' tcp)"
-        printf '%s将备份所有宝塔 HTTPS vhost，并把 TCP 443 自动迁移到 127.0.0.1:%s。%s\n' \
+        printf '下面是 nginx 在本机内部使用的端口，客户端不连接，也无需开放防火墙。\n' >&2
+        https_port="$(prompt_port_checked '宝塔网站迁移后的本机 HTTPS TCP 端口' '8443' tcp)"
+        printf '%s将先备份宝塔 HTTPS 配置，再把网站从公网 TCP 443 迁移到 127.0.0.1:%s；客户端访问网站仍使用 443。%s\n' \
           "$C_YELLOW" "$https_port" "$C_RESET" >&2
-        menu_confirm "确认由 ETXR 自动调整宝塔 HTTPS 监听" ||
+        menu_confirm "确认让 ETXR 自动备份并调整宝塔 HTTPS 监听" ||
           die "已取消 TCP 443 共用"
         auto_rebind=true
       fi
@@ -5646,13 +5663,14 @@ prompt_worker_direct_config() {
       cert="/etc/letsencrypt/live/${domain}/fullchain.pem"
       key="/etc/letsencrypt/live/${domain}/privkey.pem"
       if [[ "$reality_enabled" == "y" ]]; then
-        https_port="$(prompt_port_checked 'nginx HTTPS 内部监听 TCP 端口' '8443' tcp)"
+        printf '下面是 nginx 在本机内部使用的端口，客户端不连接，也无需开放防火墙。\n' >&2
+        https_port="$(prompt_port_checked '网站迁移后的 nginx 本机 HTTPS TCP 端口' '8443' tcp)"
       fi
       printf '%s未检测到宝塔，将安装标准 nginx 和 stream 模块。%s\n' \
         "$C_YELLOW" "$C_RESET" >&2
     fi
   elif [[ "$xhttp_enabled" == "y" ]]; then
-    xhttp_public="$(prompt_port_checked 'XHTTP 独立 TLS TCP 端口' '8443' tcp)"
+    xhttp_public="$(prompt_port_checked 'XHTTP 公网 TLS TCP 端口（需在防火墙放行）' '8443' tcp)"
     xhttp_listen="$xhttp_public"
   fi
 
@@ -5660,10 +5678,11 @@ prompt_worker_direct_config() {
   if [[ "$xhttp_enabled" == "y" ]]; then
     if [[ "$shared_choice" == "y" ]]; then
       xhttp_public=443
-      xhttp_listen="$(prompt_port_checked 'Xray XHTTP 本地 TCP 端口' '18000' tcp)"
+      printf '下面是 nginx 转发到 Xray 的本机端口，客户端不连接，也无需开放防火墙。\n' >&2
+      xhttp_listen="$(prompt_port_checked 'Xray XHTTP 本机接收 TCP 端口' '18000' tcp)"
       xhttp_behind=true
     fi
-    xhttp_path="$(prompt_path_value 'XHTTP Path' "$xhttp_path")"
+    xhttp_path="$(prompt_path_value 'XHTTP 连接 Path（直接回车使用随机值）' "$xhttp_path")"
   fi
 
   reality_path="/${name}-reality-$(random_hex 10)"
@@ -5673,17 +5692,18 @@ prompt_worker_direct_config() {
   if [[ "$reality_enabled" == "y" ]]; then
     if [[ "$shared_choice" == "y" ]]; then
       reality_port=443
-      reality_listen="$(prompt_port_checked 'Reality 本地 TCP 端口' '18443' tcp)"
+      printf '下面是 TCP 443 分流后转给 Xray 的本机端口，客户端不连接，也无需开放防火墙。\n' >&2
+      reality_listen="$(prompt_port_checked 'Xray Reality 本机接收 TCP 端口' '18443' tcp)"
     else
-      reality_port="$(prompt_port_checked 'Reality TCP 端口' \
+      reality_port="$(prompt_port_checked 'Reality 公网 TCP 端口（需在防火墙放行）' \
         "$([[ "$xhttp_enabled" == "y" ]] && printf '18443' || printf '443')")"
       reality_listen="$reality_port"
     fi
-    reality_path="$(prompt_path_value 'Reality XHTTP Path' "$reality_path")"
-    reality_target="$(prompt_target_value 'Reality 伪装网站（目标）' "$reality_target")"
-    reality_sni="$(prompt_hostname_value 'Reality 伪装域名（SNI）' \
+    reality_path="$(prompt_path_value 'Reality 的 XHTTP 连接 Path（直接回车使用随机值）' "$reality_path")"
+    reality_target="$(prompt_target_value 'Reality 握手转发目标（域名:443）' "$reality_target")"
+    reality_sni="$(prompt_hostname_value 'Reality 客户端填写的伪装域名（SNI）' \
       "${reality_target%%:*}")"
-    reality_short="$(prompt_value 'Reality Short ID' "$reality_short")"
+    reality_short="$(prompt_value 'Reality Short ID（直接回车使用随机值）' "$reality_short")"
     [[ "$reality_short" =~ ^[0-9a-fA-F]{2,32}$ ]] ||
       die "Reality Short ID 必须是 2 到 32 位十六进制字符"
   fi
@@ -5693,18 +5713,21 @@ prompt_worker_direct_config() {
   hy2_up=0
   hy2_down=0
   if [[ "$hy2_enabled" == "y" ]]; then
-    if [[ "$(prompt_bool '让 Hysteria2 使用 UDP 443' y)" == "y" ]] &&
+    printf '\n%s【Hysteria2 公网 UDP 端口】%s\n' "$C_BOLD" "$C_RESET" >&2
+    printf '网站 HTTPS 使用 TCP，Hysteria2 使用 UDP；两者都可使用数字 443。\n' >&2
+    if [[ "$(prompt_bool '让 Hysteria2 使用公网 UDP 443' y)" == "y" ]] &&
        confirm_hy2_udp443_share; then
       hy2_port=443
       hy2_shared=true
     else
-      hy2_port="$(prompt_port_checked 'Hysteria2 UDP 端口' '28443' udp)"
+      hy2_port="$(prompt_port_checked 'Hysteria2 公网 UDP 端口（需在防火墙放行 UDP）' '28443' udp)"
       hy2_shared=false
     fi
-    hy2_obfs="$(prompt_secret_default 'Hysteria2 混淆密码' "$hy2_obfs")"
-    hy2_masquerade="$(prompt_url_value 'Hysteria2 伪装网站' "$hy2_masquerade")"
-    hy2_up="$(prompt_mbps 'Hysteria2 服务器总上传 Mbps，0 表示不限' '0')"
-    hy2_down="$(prompt_mbps 'Hysteria2 服务器总下载 Mbps，0 表示不限' '0')"
+    hy2_obfs="$(prompt_secret_default 'Hysteria2 混淆密码（客户端必须填写相同密码）' "$hy2_obfs")"
+    hy2_masquerade="$(prompt_url_value 'Hysteria2 伪装网站 URL（需要包含 https://）' "$hy2_masquerade")"
+    printf '下面是整条 Hysteria2 入站的带宽参数，不是单用户限速；0 表示不设置。\n' >&2
+    hy2_up="$(prompt_mbps 'Hysteria2 总上传带宽 Mbps' '0')"
+    hy2_down="$(prompt_mbps 'Hysteria2 总下载带宽 Mbps' '0')"
   else
     hy2_port=28443
     hy2_shared=false
@@ -5716,9 +5739,32 @@ prompt_worker_direct_config() {
       cert="${RUNTIME_DIR}/certs/${name}/fullchain.pem"
       key="${RUNTIME_DIR}/certs/${name}/privkey.pem"
     fi
-    cert="$(prompt_value 'TLS 证书文件路径（不存在时生成自签证书）' "$cert")"
-    key="$(prompt_value 'TLS 证书私钥路径（不存在时生成自签证书）' "$key")"
+    printf '\n%s【TLS 证书文件】%s\n' "$C_BOLD" "$C_RESET" >&2
+    printf "已有宝塔或 Let's Encrypt 证书可直接回车；文件无效时会自动生成自签证书。\n" >&2
+    cert="$(prompt_value '证书完整链文件路径（fullchain.pem）' "$cert")"
+    key="$(prompt_value '证书私钥文件路径（privkey.pem）' "$key")"
   fi
+
+  printf '\n%s【从服务器客户端入口摘要】%s\n' "$C_BOLD" "$C_RESET" >&2
+  printf '客户端连接地址：%s\n' "$address" >&2
+  if [[ "$xhttp_enabled" == "y" ]]; then
+    printf 'XHTTP + TLS：已启用，公网 TCP %s，Path %s\n' \
+      "$xhttp_public" "$xhttp_path" >&2
+  else
+    printf 'XHTTP + TLS：未启用\n' >&2
+  fi
+  if [[ "$reality_enabled" == "y" ]]; then
+    printf 'Reality + XHTTP：已启用，公网 TCP %s，SNI %s\n' \
+      "$reality_port" "$reality_sni" >&2
+  else
+    printf 'Reality + XHTTP：未启用\n' >&2
+  fi
+  if [[ "$hy2_enabled" == "y" ]]; then
+    printf 'Hysteria2：已启用，公网 UDP %s\n' "$hy2_port" >&2
+  else
+    printf 'Hysteria2：未启用\n' >&2
+  fi
+  printf '提示：TCP 和 UDP 是不同协议；TCP 443 与 UDP 443 可以同时使用。\n' >&2
 
   WORKER_DIRECT_CONFIG="$(jq -n \
     --arg domain "$domain" --arg address "$address" \
@@ -6466,7 +6512,8 @@ menu_quick_init() {
 
   local role="gateway" name domain address mode cert key snippet=""
   local xhttp_enabled reality_enabled hy2_enabled tls_port route_port route_path
-  local shared_tcp443=false https_listen_port=8443 reality_listen_port
+  local shared_tcp443=false auto_rebind_https=false
+  local https_listen_port=8443 reality_listen_port
   local reality_port reality_path reality_target reality_sni
   local hy2_port hy2_obfs_password hy2_masquerade hy2_up hy2_down
   local hy2_shared_udp443=false hy2_share_choice
@@ -6474,8 +6521,8 @@ menu_quick_init() {
   local username user_uuid user_password user_up user_down
   local value default_uuid default_password
   printf '\n'
-  name="$(prompt_name_value '给这台机器起个短名字' 'hk')"
-  domain="$(prompt_hostname_value '填写已解析到本机的域名' 'hk.example.com')"
+  name="$(prompt_name_value '主服务器名称（仅用于菜单和订阅显示，例如 hk）' 'hk')"
+  domain="$(prompt_hostname_value '主服务器入口域名（必须已解析到这台机器）' 'hk.example.com')"
   address="$domain"
 
   if (( is_baota )); then
@@ -6493,15 +6540,17 @@ menu_quick_init() {
     printf '%s✓ 已找到域名证书，不需要手动填写路径。%s\n' "$C_GREEN" "$C_RESET"
   else
     printf '%s没有在默认位置找到证书。%s\n' "$C_YELLOW" "$C_RESET"
-    cert="$(prompt_value '证书文件路径' "$cert")"
-    key="$(prompt_value '证书私钥路径' "$key")"
+    printf '文件不存在或不匹配时，后续检查会提示具体原因。\n'
+    cert="$(prompt_value 'TLS 完整证书链路径（fullchain.pem）' "$cert")"
+    key="$(prompt_value 'TLS 证书私钥路径（privkey.pem）' "$key")"
   fi
 
-  printf '\n%s【入口协议】%s\n' "$C_BOLD" "$C_RESET"
-  xhttp_enabled="$(prompt_bool '启用 HTTPS/XHTTP 主入口' y)"
+  printf '\n%s【客户端连接主服务器：XHTTP + HTTPS】%s\n' "$C_BOLD" "$C_RESET"
+  printf '公网端口供手机/电脑连接；Xray 本机端口只供 nginx 转发。\n'
+  xhttp_enabled="$(prompt_bool '启用 XHTTP + nginx TLS（TCP/HTTPS）' y)"
   if [[ "$xhttp_enabled" == "y" ]]; then
     while true; do
-      tls_port="$(prompt_port_value 'HTTPS/XHTTP TCP 端口' '443')"
+      tls_port="$(prompt_port_value '网站和 XHTTP 的公网 HTTPS TCP 端口' '443')"
       if port_is_listening tcp "$tls_port"; then
         if (( is_baota )) && port_is_nginx_owned tcp "$tls_port"; then
           printf '%s✓ TCP %s 已由宝塔 nginx 监听，将安全共用。%s\n' \
@@ -6513,33 +6562,41 @@ menu_quick_init() {
       fi
       break
     done
-    route_port="$(prompt_port_checked 'Xray XHTTP 本地端口' '18001' tcp)"
-    route_path="$(prompt_path_value 'XHTTP Path' "/$(random_hex 12)")"
+    route_port="$(prompt_port_checked 'Xray XHTTP 本机接收 TCP 端口（无需开放防火墙）' '18001' tcp)"
+    route_path="$(prompt_path_value 'XHTTP 连接 Path（直接回车使用随机值）' "/$(random_hex 12)")"
   else
     tls_port=443
     route_port=18001
     route_path="/$(random_hex 12)"
   fi
 
-  reality_enabled="$(prompt_bool '启用 Reality + XHTTP 入口' n)"
+  printf '\n%s【客户端连接主服务器：Reality + XHTTP】%s\n' "$C_BOLD" "$C_RESET"
+  reality_enabled="$(prompt_bool '启用 Reality + XHTTP（TCP）' n)"
   if [[ "$reality_enabled" == "y" ]]; then
     if (( is_baota )) && [[ "$xhttp_enabled" == "y" ]]; then
-      shared_tcp443="$(prompt_bool 'Reality 与宝塔网站共用 TCP 443' y)"
+      printf '选择共用后，网站、XHTTP 和 Reality 都使用公网 TCP 443，由 SNI 自动分流。\n'
+      shared_tcp443="$(prompt_bool '让 Reality、XHTTP 和宝塔网站共用公网 TCP 443' y)"
     fi
     if [[ "$shared_tcp443" == "y" ]]; then
       tls_port=443
-      https_listen_port="$(prompt_port_checked '宝塔 HTTPS 内部监听 TCP 端口' '8443' tcp)"
+      printf '下面两个端口只在本机内部使用，客户端不连接，也无需开放防火墙。\n'
+      https_listen_port="$(prompt_port_checked '宝塔网站迁移后的本机 HTTPS TCP 端口' '8443' tcp)"
       reality_port=443
-      reality_listen_port="$(prompt_port_checked 'Reality 本地监听 TCP 端口' '18443' tcp)"
-      printf '%s共享 TCP 443 需要把宝塔所有 HTTPS vhost 改为 127.0.0.1:%s；脚本不会自动修改其他网站。%s\n' \
+      reality_listen_port="$(prompt_port_checked 'Xray Reality 本机接收 TCP 端口' '18443' tcp)"
+      printf '%s脚本会先备份所有宝塔 HTTPS vhost，再把网站从公网 TCP 443 迁移到 127.0.0.1:%s；网站域名和客户端端口保持不变。%s\n' \
         "$C_YELLOW" "$https_listen_port" "$C_RESET"
+      menu_confirm "确认让 ETXR 自动备份并调整宝塔 HTTPS 监听" || {
+        FORCE=0
+        return
+      }
+      auto_rebind_https=true
     else
-      reality_port="$(prompt_port_checked 'Reality TCP 端口' '18443' tcp)"
+      reality_port="$(prompt_port_checked 'Reality 公网 TCP 端口（需在防火墙放行）' '18443' tcp)"
       reality_listen_port="$reality_port"
     fi
-    reality_path="$(prompt_path_value 'Reality XHTTP Path' "/$(random_hex 12)")"
-    reality_target="$(prompt_target_value 'Reality 伪装网站（目标）' 'aod.itunes.apple.com:443')"
-    reality_sni="$(prompt_hostname_value 'Reality 伪装域名（SNI）' "${reality_target%%:*}")"
+    reality_path="$(prompt_path_value 'Reality 的 XHTTP 连接 Path（直接回车使用随机值）' "/$(random_hex 12)")"
+    reality_target="$(prompt_target_value 'Reality 握手转发目标（域名:443）' 'aod.itunes.apple.com:443')"
+    reality_sni="$(prompt_hostname_value 'Reality 客户端填写的伪装域名（SNI）' "${reality_target%%:*}")"
   else
     reality_port=18443
     reality_listen_port=18443
@@ -6548,9 +6605,11 @@ menu_quick_init() {
     reality_sni="aod.itunes.apple.com"
   fi
 
-  hy2_enabled="$(prompt_bool '启用 Hysteria2' y)"
+  printf '\n%s【客户端连接主服务器：Hysteria2】%s\n' "$C_BOLD" "$C_RESET"
+  printf 'Hysteria2 使用 UDP；网站 HTTPS 使用 TCP，两者可以同时使用数字 443。\n'
+  hy2_enabled="$(prompt_bool '启用 Hysteria2（UDP）' y)"
   if [[ "$hy2_enabled" == "y" ]]; then
-    hy2_share_choice="$(prompt_bool '让 Hysteria2 与网站共用 443（HY2 用 UDP 443）' y)"
+    hy2_share_choice="$(prompt_bool '让 Hysteria2 使用公网 UDP 443' y)"
     if [[ "$hy2_share_choice" == "y" ]] && confirm_hy2_udp443_share; then
       hy2_port=443
       hy2_shared_udp443=true
@@ -6559,13 +6618,14 @@ menu_quick_init() {
         printf '%s已取消 UDP 443 共用，请选择其他 Hysteria2 端口。%s\n' \
           "$C_YELLOW" "$C_RESET"
       fi
-      hy2_port="$(prompt_port_checked 'Hysteria2 UDP 端口' '8443' udp)"
+      hy2_port="$(prompt_port_checked 'Hysteria2 公网 UDP 端口（需在防火墙放行 UDP）' '8443' udp)"
       hy2_shared_udp443=false
     fi
-    hy2_up="$(prompt_mbps 'Hysteria2 服务器总上传 Mbps，0 表示不限' '0')"
-    hy2_down="$(prompt_mbps 'Hysteria2 服务器总下载 Mbps，0 表示不限' '0')"
-    hy2_obfs_password="$(prompt_secret_default 'Hysteria2 混淆密码' "$(random_password)")"
-    hy2_masquerade="$(prompt_url_value 'Hysteria2 伪装网站' "https://${domain}")"
+    printf '下面是整条 Hysteria2 入站的带宽参数，不是单用户限速；0 表示不设置。\n'
+    hy2_up="$(prompt_mbps 'Hysteria2 总上传带宽 Mbps' '0')"
+    hy2_down="$(prompt_mbps 'Hysteria2 总下载带宽 Mbps' '0')"
+    hy2_obfs_password="$(prompt_secret_default 'Hysteria2 混淆密码（客户端必须填写相同密码）' "$(random_password)")"
+    hy2_masquerade="$(prompt_url_value 'Hysteria2 伪装网站 URL（需要包含 https://）' "https://${domain}")"
   else
     hy2_port=8443
     hy2_shared_udp443=false
@@ -6576,27 +6636,29 @@ menu_quick_init() {
   fi
 
   printf '\n%s【管理员账号】%s\n' "$C_BOLD" "$C_RESET"
-  username="$(prompt_name_value '管理员用户名' 'admin')"
+  printf '安装后会为这个用户生成 UUID、Hysteria2 密码和订阅链接。\n'
+  username="$(prompt_name_value '管理员用户名（仅用于 ETXR 用户管理）' 'admin')"
   default_uuid="$(random_uuid)"
   default_password="$(random_password)"
-  user_uuid="$(prompt_uuid_value '管理员 UUID' "$default_uuid")"
-  user_password="$(prompt_secret_default '管理员 Hysteria2 密码' "$default_password")"
-  user_up="$(prompt_mbps '管理员上传限速 Mbps（0 表示不限速）' '0')"
-  user_down="$(prompt_mbps '管理员下载限速 Mbps（0 表示不限速）' '0')"
+  user_uuid="$(prompt_uuid_value '管理员 VLESS UUID（直接回车使用随机值）' "$default_uuid")"
+  user_password="$(prompt_secret_default '管理员 Hysteria2 登录密码（直接回车使用随机值）' "$default_password")"
+  user_up="$(prompt_mbps '该用户上传限速 Mbps（0 表示不限速）' '0')"
+  user_down="$(prompt_mbps '该用户下载限速 Mbps（0 表示不限速）' '0')"
   [[ -n "$user_password" ]] || {
     warn "密码不能为空"
     FORCE=0
     return
   }
 
-  printf '\n%s【主从组网】%s\n' "$C_BOLD" "$C_RESET"
-  et_ip="$(prompt_ipv4_value '主服务器 EasyTier 私网 IP' '10.100.0.1')"
+  printf '\n%s【EasyTier 主从私网】%s\n' "$C_BOLD" "$C_RESET"
+  printf '以后添加从服务器时，它们会主动连接下面的主服务器公网 TCP 端口。\n'
+  et_ip="$(prompt_ipv4_value '主服务器在 EasyTier 私网中的 IP' '10.100.0.1')"
   et_endpoint="$(detect_public_ipv4)"
   et_endpoint="${et_endpoint:-$address}"
-  et_endpoint="$(prompt_hostname_value '主服务器公网 IP 或域名' "$et_endpoint")"
-  et_port="$(prompt_port_checked '主从组网 TCP 端口' '11010' tcp)"
-  et_name="$(prompt_name_value 'EasyTier 网络名称' "er-$(random_hex 8)")"
-  et_secret="$(prompt_secret_default 'EasyTier 网络密钥' "$(random_hex 24)")"
+  et_endpoint="$(prompt_hostname_value '从服务器连接的主服务器公网 IP 或域名' "$et_endpoint")"
+  et_port="$(prompt_port_checked 'EasyTier 公网 TCP 接入端口（需在主服务器防火墙放行）' '11010' tcp)"
+  et_name="$(prompt_name_value 'EasyTier 私网名称（直接回车使用随机值）' "er-$(random_hex 8)")"
+  et_secret="$(prompt_secret_default 'EasyTier 私网密钥（直接回车使用随机值）' "$(random_hex 24)")"
 
   if [[ "$shared_tcp443" == "y" ]]; then
     shared_tcp443=true
@@ -6605,16 +6667,16 @@ menu_quick_init() {
   fi
   printf '\n%s【配置确认】%s\n' "$C_BOLD" "$C_RESET"
   printf '  • HTTPS/XHTTP：%s' "$([[ "$xhttp_enabled" == "y" ]] && printf '开启' || printf '关闭')"
-  [[ "$xhttp_enabled" != "y" ]] || printf '，TCP %s，本地 %s，Path %s' "$tls_port" "$route_port" "$route_path"
+  [[ "$xhttp_enabled" != "y" ]] || printf '，公网 TCP %s，本机转发 TCP %s，Path %s' "$tls_port" "$route_port" "$route_path"
   printf '\n  • Reality：%s' "$([[ "$reality_enabled" == "y" ]] && printf '开启' || printf '关闭')"
-  [[ "$reality_enabled" != "y" ]] || printf '，公网 TCP %s，本地 %s，SNI %s' \
+  [[ "$reality_enabled" != "y" ]] || printf '，公网 TCP %s，本机接收 TCP %s，SNI %s' \
     "$reality_port" "$reality_listen_port" "$reality_sni"
   printf '\n  • Hysteria2：%s' "$([[ "$hy2_enabled" == "y" ]] && printf '开启' || printf '关闭')"
   [[ "$hy2_enabled" != "y" ]] || printf '，UDP %s%s，伪装 %s' \
     "$hy2_port" \
-    "$([[ "$hy2_shared_udp443" == "true" ]] && printf '（与 TCP 443 共用，自动关闭 nginx H3）')" \
+    "$([[ "$hy2_shared_udp443" == "true" ]] && printf '（与网站 TCP 443 同时使用；自动关闭 nginx H3）')" \
     "$hy2_masquerade"
-  printf '\n  • 主从组网：TCP %s，私网 IP %s\n' "$et_port" "$et_ip"
+  printf '\n  • EasyTier 主从私网：主服务器公网 TCP %s，私网 IP %s\n' "$et_port" "$et_ip"
   printf '  • 管理员：%s，上传 %s，下载 %s\n\n' \
     "$username" \
     "$([[ "$user_up" == "0" ]] && printf '不限速' || printf '%s Mbps' "$user_up")" \
@@ -6637,6 +6699,7 @@ menu_quick_init() {
     --name "$name" --role "$role" --domain "$domain" --address "$address"
     --nginx-mode "$mode" --cert "$cert" --key "$key" --tls-port "$tls_port"
     --nginx-shared-tcp443 "$shared_tcp443"
+    --nginx-auto-rebind-https "$auto_rebind_https"
     --nginx-https-listen-port "$https_listen_port"
   )
   [[ "$mode" != "snippet" ]] || args+=(--snippet "$snippet")
@@ -6745,11 +6808,11 @@ menu_users() {
     case "$choice" in
       1)
         default_name="user$(( $(jq '.users | length' "$STATE_FILE") + 1 ))"
-        name="$(prompt_name_value '用户名' "$default_name")"
-        uuid="$(prompt_uuid_value '用户 UUID' "$(random_uuid)")"
-        password="$(prompt_secret_default 'Hysteria2 用户密码' "$(random_password)")"
-        up_mbps="$(prompt_mbps '上传限速 Mbps（0 表示不限速）' '0')"
-        down_mbps="$(prompt_mbps '下载限速 Mbps（0 表示不限速）' '0')"
+        name="$(prompt_name_value '用户名（仅用于 ETXR 用户管理和订阅名称）' "$default_name")"
+        uuid="$(prompt_uuid_value 'VLESS UUID（直接回车使用随机值）' "$(random_uuid)")"
+        password="$(prompt_secret_default 'Hysteria2 登录密码（直接回车使用随机值）' "$(random_password)")"
+        up_mbps="$(prompt_mbps '该用户上传限速 Mbps（0 表示不限速）' '0')"
+        down_mbps="$(prompt_mbps '该用户下载限速 Mbps（0 表示不限速）' '0')"
         if menu_exec cmd_user_add --name "$name" --uuid "$uuid" \
           --password "$password" --up-mbps "$up_mbps" \
           --down-mbps "$down_mbps"; then
@@ -6800,8 +6863,8 @@ menu_users() {
         down_mbps="$(jq -r --arg name "$name" \
           '.users[] | select(.name == $name) | (.speed_limit.down_mbps // 0)' \
           "$STATE_FILE" 2>/dev/null || printf '0')"
-        up_mbps="$(prompt_mbps '上传限速 Mbps（0 表示不限速）' "${up_mbps:-0}")"
-        down_mbps="$(prompt_mbps '下载限速 Mbps（0 表示不限速）' "${down_mbps:-0}")"
+        up_mbps="$(prompt_mbps '该用户上传限速 Mbps（0 表示不限速）' "${up_mbps:-0}")"
+        down_mbps="$(prompt_mbps '该用户下载限速 Mbps（0 表示不限速）' "${down_mbps:-0}")"
         if menu_exec cmd_user_limit "$name" --up-mbps "$up_mbps" \
           --down-mbps "$down_mbps"; then
           menu_apply_prompt || true
@@ -6872,11 +6935,12 @@ menu_routes() {
     case "$choice" in
       1) menu_exec cmd_route_list || true; menu_pause ;;
       2|3)
-        name="$(prompt_value '线路名称')"
-        path="$(prompt_value '入口 Path' "/$(random_hex 12)")"
-        port="$(prompt_value 'Xray 本地端口' "$(next_route_port)")"
+        printf '此处是高级功能：客户端用 Path 进入主服务器，nginx 再转到 Xray 本机端口。\n'
+        name="$(prompt_value '线路名称（仅用于菜单和订阅显示）')"
+        path="$(prompt_value '客户端连接主服务器时使用的 Path' "/$(random_hex 12)")"
+        port="$(prompt_value 'Xray 本机接收 TCP 端口（无需开放防火墙）' "$(next_route_port)")"
         cmd_exit_list || true
-        target="$(prompt_value '出口名称，direct 表示本机' 'direct')"
+        target="$(prompt_value '流量从哪里出去（direct=主服务器本机，或填写从服务器名称）' 'direct')"
         if [[ "$choice" == "3" ]]; then
           if generate_vlessenc_pair; then
             menu_exec cmd_route_add --name "$name" --path "$path" --port "$port" \
@@ -6926,13 +6990,14 @@ menu_exits() {
     case "$choice" in
       1) menu_exec cmd_exit_list || true; menu_pause ;;
       2)
-        name="$(prompt_value '出口名称，例如 tw/us')"
-        address="$(prompt_value '出口域名或地址')"
-        server_name="$(prompt_value 'TLS SNI' "$address")"
-        host="$(prompt_value 'XHTTP Host' "$server_name")"
-        port="$(prompt_value '公网端口' '443')"
-        path="$(prompt_value '出口机中继 Path' "/$(random_hex 12)")"
-        uuid="$(prompt_value '出口机中继 UUID，留空自动生成')"
+        printf '主服务器将通过 TLS/XHTTP 连接远程出口服务器。两端的域名、端口、Path 和 UUID 必须一致。\n'
+        name="$(prompt_value '出口名称（仅用于菜单显示，例如 tw 或 us）')"
+        address="$(prompt_value '主服务器连接的出口服务器公网 IP 或域名')"
+        server_name="$(prompt_value 'TLS 证书域名（SNI）' "$address")"
+        host="$(prompt_value 'XHTTP Host（通常与 TLS SNI 相同）' "$server_name")"
+        port="$(prompt_value '出口服务器公网 TCP 端口' '443')"
+        path="$(prompt_value '出口服务器中继 Path' "/$(random_hex 12)")"
+        uuid="$(prompt_value '主从中继 UUID（留空自动生成）')"
         uuid="${uuid:-$(random_uuid)}"
         menu_exec cmd_exit_add --name "$name" --address "$address" --port "$port" \
           --transport tls --server-name "$server_name" --host "$host" \
@@ -6941,12 +7006,13 @@ menu_exits() {
         menu_pause
         ;;
       3)
-        name="$(prompt_value '出口名称')"
-        address="$(prompt_value '出口 IP 或域名')"
-        port="$(prompt_value 'Reality 端口' '443')"
-        server_name="$(prompt_value 'Reality SNI')"
-        path="$(prompt_value 'Reality XHTTP Path' "/$(random_hex 12)")"
-        uuid="$(prompt_value '中继 UUID，留空自动生成')"
+        printf '主服务器将通过 Reality/XHTTP 连接远程出口服务器。以下参数必须与出口服务器一致。\n'
+        name="$(prompt_value '出口名称（仅用于菜单显示）')"
+        address="$(prompt_value '主服务器连接的出口服务器公网 IP 或域名')"
+        port="$(prompt_value '出口服务器 Reality 公网 TCP 端口' '443')"
+        server_name="$(prompt_value 'Reality 客户端 SNI')"
+        path="$(prompt_value 'Reality 的 XHTTP 连接 Path' "/$(random_hex 12)")"
+        uuid="$(prompt_value '主从中继 UUID（留空自动生成）')"
         uuid="${uuid:-$(random_uuid)}"
         public_key="$(prompt_value 'Reality 公钥')"
         short_id="$(prompt_value 'Reality Short ID')"
@@ -6956,11 +7022,12 @@ menu_exits() {
         menu_pause
         ;;
       4)
-        name="$(prompt_value '出口名称')"
-        address="$(prompt_value 'EasyTier/WireGuard 私网地址')"
-        port="$(prompt_value '私网端口' '18000')"
-        path="$(prompt_value 'XHTTP Path' "/$(random_hex 12)")"
-        uuid="$(prompt_value '中继 UUID，留空自动生成')"
+        printf '主服务器将通过 EasyTier/WireGuard 私网连接出口服务器，不需要开放公网中继端口。\n'
+        name="$(prompt_value '出口名称（仅用于菜单显示）')"
+        address="$(prompt_value '出口服务器的 EasyTier/WireGuard 私网 IP')"
+        port="$(prompt_value '出口服务器私网中继 TCP 端口' '18000')"
+        path="$(prompt_value '私网中继的 XHTTP Path' "/$(random_hex 12)")"
+        uuid="$(prompt_value '主从中继 UUID（留空自动生成）')"
         uuid="${uuid:-$(random_uuid)}"
         if generate_vlessenc_pair; then
           menu_exec cmd_exit_add --name "$name" --address "$address" --port "$port" \
@@ -6996,17 +7063,17 @@ menu_add_reality() {
   private_key="$(awk -F': ' '/^PrivateKey:/ {print $2}' <<<"$output")"
   public_key="$(awk -F': ' '/^Password/ {print $2}' <<<"$output")"
   short_id="$(random_hex 8)"
-  name="$(prompt_value 'Reality 名称' 'reality')"
+  name="$(prompt_value 'Reality 入站名称（仅用于菜单显示）' 'reality')"
   if [[ "$(jq -r '.nginx.shared_tcp443 // false' "$STATE_FILE")" == "true" ]]; then
     port=443
-    listen_port="$(prompt_port_value 'Reality 本地监听 TCP 端口' '18443')"
+    listen_port="$(prompt_port_value 'Xray Reality 本机接收 TCP 端口（无需开放防火墙）' '18443')"
   else
-    port="$(prompt_value 'Reality TCP 端口' '8444')"
+    port="$(prompt_value 'Reality 公网 TCP 端口（需在防火墙放行）' '8444')"
     listen_port="$port"
   fi
-  path="$(prompt_value 'Reality XHTTP Path' "/$(random_hex 12)")"
-  target="$(prompt_value 'Reality 目标' 'aod.itunes.apple.com:443')"
-  sni="$(prompt_value 'Reality SNI' "${target%%:*}")"
+  path="$(prompt_value 'Reality 的 XHTTP 连接 Path' "/$(random_hex 12)")"
+  target="$(prompt_value 'Reality 握手转发目标（域名:443）' 'aod.itunes.apple.com:443')"
+  sni="$(prompt_value 'Reality 客户端填写的伪装域名（SNI）' "${target%%:*}")"
   menu_exec cmd_reality_add --name "$name" --port "$port" \
     --listen-port "$listen_port" --path "$path" \
     --target "$target" --server-names "$sni" \
@@ -7045,7 +7112,8 @@ menu_protocols() {
         ;;
       4)
         shared_udp443=false
-        share_choice="$(prompt_bool '让 Hysteria2 与网站共用 443（HY2 用 UDP 443）' y)"
+        printf '网站使用 TCP，Hysteria2 使用 UDP；两者可以同时使用数字 443。\n'
+        share_choice="$(prompt_bool '让 Hysteria2 使用公网 UDP 443' y)"
         if [[ "$share_choice" == "y" ]] && confirm_hy2_udp443_share; then
           port=443
           shared_udp443=true
@@ -7054,12 +7122,13 @@ menu_protocols() {
             printf '%s已取消 UDP 443 共用，请选择其他 Hysteria2 端口。%s\n' \
               "$C_YELLOW" "$C_RESET"
           fi
-          port="$(prompt_port_checked 'Hysteria2 UDP 端口' '8443' udp)"
+          port="$(prompt_port_checked 'Hysteria2 公网 UDP 端口（需在防火墙放行 UDP）' '8443' udp)"
         fi
-        up="$(prompt_mbps '服务器上传 Mbps，0 表示不限' '0')"
-        down="$(prompt_mbps '服务器下载 Mbps，0 表示不限' '0')"
-        obfs_password="$(prompt_secret_default 'Hysteria2 混淆密码' "$(random_password)")"
-        masquerade="$(prompt_url_value '伪装网址' 'https://www.cloudflare.com')"
+        printf '下面是整条 Hysteria2 入站的带宽参数，不是单用户限速；0 表示不设置。\n'
+        up="$(prompt_mbps 'Hysteria2 总上传带宽 Mbps' '0')"
+        down="$(prompt_mbps 'Hysteria2 总下载带宽 Mbps' '0')"
+        obfs_password="$(prompt_secret_default 'Hysteria2 混淆密码（客户端必须填写相同密码）' "$(random_password)")"
+        masquerade="$(prompt_url_value 'Hysteria2 伪装网站 URL（需要包含 https://）' 'https://www.cloudflare.com')"
         local -a hy2_args=(
           --port "$port" --up-mbps "$up" --down-mbps "$down"
           --obfs salamander --obfs-password "$obfs_password"
@@ -7197,47 +7266,85 @@ menu_pair_create() {
   local relay_private_port=19000 mode_choice
   local relay_uuid pair_expires_minutes
   clear_screen
-  printf '%s%s【给主服务器添加从服务器】%s\n\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
-  printf '这里只配置主从中继。XHTTP、Reality、Hysteria2 和 443 共用会在从服务器本机设置。\n'
-  printf '有公网中继端口时默认公网直连；没有可用端口时使用 EasyTier。\n\n'
-  name="$(prompt_name_value '给从服务器起个短名字' 'tw1')"
-  pair_expires_minutes="$(prompt_value '配对 ID 有效期（分钟）' '30')"
+  printf '%s%s【添加从服务器：第一步，在主服务器生成 Pair ID】%s\n\n' \
+    "$C_BOLD" "$C_CYAN" "$C_RESET"
+  printf '本向导只设置“主服务器怎样把流量送到从服务器”。\n'
+  printf 'XHTTP、Reality、Hysteria2、域名、证书和 443 共用稍后在从服务器设置。\n'
+  printf '公网可达时优先走公网；公网连接失败时自动改走 EasyTier 私网。\n\n'
+  name="$(prompt_name_value '从服务器名称（仅用于菜单显示，例如 tw1）' 'tw1')"
+  pair_expires_minutes="$(prompt_value 'Pair ID 可使用多少分钟（过期后需重新生成）' '30')"
   if [[ ! "$pair_expires_minutes" =~ ^[0-9]+$ ]] ||
      (( 10#$pair_expires_minutes < 1 || 10#$pair_expires_minutes > 525600 )); then
     warn "有效期必须是 1 到 525600 分钟之间的整数"
     menu_pause
     return
   fi
-  printf '\n从服务器属于哪种情况？\n'
-  printf '1. 普通/NAT/被墙机器   （没有可用端口，使用 EasyTier）\n'
-  printf '2. 有独立公网入口      （公网直连，EasyTier 自动备用）\n'
-  printf '3. 普通/NAT/被墙机器   （有端口映射，公网直连并自动备用）\n'
+  printf '\n%s从服务器的公网端口属于哪种情况？%s\n' "$C_BOLD" "$C_RESET"
+  printf '1. 没有可用公网 TCP 端口\n'
+  printf '   主服务器只能通过 EasyTier 私网连接，最省事。\n'
+  printf '2. 有独立公网 IP，可以直接开放 TCP 端口\n'
+  printf '   主服务器优先直连从服务器公网端口，EasyTier 自动备用。\n'
+  printf '3. NAT 机器，服务商提供了公网 TCP 端口映射\n'
+  printf '   主服务器连接外部映射端口，再转到从服务器本机监听端口。\n'
   read -r -p '请选择 [1]: ' mode_choice
   mode_choice="${mode_choice:-1}"
   if [[ "$mode_choice" == "2" ]]; then
-    public_host="$(prompt_hostname_value '从服务器公网 IP 或域名' "${name}.example.com")"
+    public_host="$(prompt_hostname_value '从服务器公网 IP 或域名（主服务器连接这个地址）' "${name}.example.com")"
   elif [[ "$mode_choice" == "3" ]]; then
-    public_host="$(prompt_hostname_value '从服务器公网映射地址（IP 或域名）' "${name}.example.com")"
+    public_host="$(prompt_hostname_value '服务商提供的公网映射地址（IP 或域名）' "${name}.example.com")"
   elif [[ "$mode_choice" != "1" ]]; then
     warn "选项无效"
     menu_pause
     return
   fi
 
-  printf '\n%s【主从中继参数】%s\n' "$C_BOLD" "$C_RESET"
-  relay_private_port="$(prompt_port_value 'EasyTier 私网中继 TCP 端口' '19000')"
-  relay_uuid="$(prompt_uuid_value '主从中继 UUID' "$(random_uuid)")"
-  if [[ "$mode_choice" == "2" || "$mode_choice" == "3" ]]; then
-    backup_port="$(prompt_port_value '客户端看到的公网中继 TCP 端口' '29000')"
-    backup_listen_port="$(prompt_port_value '从服务器实际监听的中继 TCP 端口' '29000')"
+  printf '\n%s【EasyTier 备用线路】%s\n' "$C_BOLD" "$C_RESET"
+  printf '下面的端口监听在从服务器的 EasyTier 私网 IP 上，无需在公网防火墙放行。\n'
+  relay_private_port="$(prompt_port_value '从服务器 EasyTier 私网中继 TCP 端口' '19000')"
+  relay_uuid="$(prompt_uuid_value '主从中继身份 UUID（直接回车使用随机值）' "$(random_uuid)")"
+  if [[ "$mode_choice" == "2" ]]; then
+    printf '\n%s【公网优先线路：独立公网 IP】%s\n' "$C_BOLD" "$C_RESET"
+    printf '该端口监听在从服务器公网 IP 上，主服务器会优先连接它。\n'
+    backup_port="$(prompt_port_value '从服务器公网中继 TCP 端口（需在防火墙放行）' '29000')"
+    backup_listen_port="$backup_port"
+  elif [[ "$mode_choice" == "3" ]]; then
+    printf '\n%s【公网优先线路：NAT 端口映射】%s\n' "$C_BOLD" "$C_RESET"
+    printf '外部端口由主服务器连接；内部端口由从服务器 Xray 监听。\n'
+    backup_port="$(prompt_port_value '服务商提供的公网映射 TCP 端口（外部端口）' '29000')"
+    backup_listen_port="$(prompt_port_value '从服务器本机中继 TCP 端口（映射目标端口）' '29000')"
+  fi
+  if [[ "$mode_choice" != "1" && "$backup_listen_port" == "$relay_private_port" ]]; then
+    warn "公网中继的从服务器监听端口不能与 EasyTier 私网中继端口相同"
+    warn "请重新添加，并为两条线路使用不同端口，例如私网 19000、公网 29000"
+    menu_pause
+    return
   fi
 
-  printf '\n%s从服务器粘贴 Pair ID 后会现场检查协议端口占用，并生成 Reality 密钥。%s\n' \
+  printf '\n%s【将要使用的连接方式】%s\n' "$C_BOLD" "$C_RESET"
+  case "$mode_choice" in
+    1)
+      printf '主服务器 -> EasyTier 私网 -> 从服务器 TCP %s\n' "$relay_private_port"
+      printf '公网防火墙：无需为主从中继开放端口。\n'
+      ;;
+    2)
+      printf '优先：主服务器 -> %s:%s -> 从服务器 Xray\n' \
+        "$public_host" "$backup_port"
+      printf '备用：主服务器 -> EasyTier 私网 -> 从服务器 TCP %s\n' \
+        "$relay_private_port"
+      printf '防火墙：从服务器放行 TCP %s，建议只允许主服务器公网 IP。\n' \
+        "$backup_port"
+      ;;
+    3)
+      printf '优先：主服务器 -> %s:%s -> 端口映射 -> 从服务器 TCP %s\n' \
+        "$public_host" "$backup_port" "$backup_listen_port"
+      printf '备用：主服务器 -> EasyTier 私网 -> 从服务器 TCP %s\n' \
+        "$relay_private_port"
+      printf '服务商面板需添加：公网 TCP %s -> 从服务器 TCP %s。\n' \
+        "$backup_port" "$backup_listen_port"
+      ;;
+  esac
+  printf '%s从服务器粘贴 Pair ID 后，脚本会检查本机端口占用并生成 Reality 密钥。%s\n' \
     "$C_YELLOW" "$C_RESET"
-  if [[ "$mode_choice" == "3" ]]; then
-    printf '请先准备这条 NAT 映射：%s:%s -> 从服务器:%s TCP\n' \
-      "$public_host" "$backup_port" "$backup_listen_port"
-  fi
 
   local -a args=(
     --name "$name"
@@ -7283,7 +7390,7 @@ menu_pair_manage() {
       1) menu_exec cmd_pair_list || true; menu_pause ;;
       2) menu_pair_create ;;
       3)
-        name="$(prompt_value '从服务器 ID')"
+        name="$(prompt_value '从服务器名称（添加时填写的短名字）')"
         if [[ -f "$RUNTIME_DIR/pairs/${name}.id" ]]; then
           cat "$RUNTIME_DIR/pairs/${name}.id"
           printf '\n'
@@ -7293,7 +7400,7 @@ menu_pair_manage() {
         menu_pause
         ;;
       4)
-        name="$(prompt_value '要删除的从服务器 ID')"
+        name="$(prompt_value '要删除的从服务器名称（添加时填写的短名字）')"
         if menu_confirm "确认删除 ${name} 的线路与出口"; then
           menu_exec cmd_pair_remove "$name" || true
           menu_apply_prompt || true

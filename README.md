@@ -1,4 +1,4 @@
-# ETXR v0.13.0
+# ETXR v0.13.1
 
 ETXR 是面向 Debian 12 空白系统的一站式中文菜单脚本，用一份脚本安装主服务器或任意数量的从服务器。它管理 Xray、sing-box、EasyTier、订阅和用户配置，并可复用宝塔 nginx 的 TCP 443。
 
@@ -75,40 +75,43 @@ chmod +x etxr.sh
 选择主菜单 `1`，向导依次询问：
 
 ```text
-节点名称
-域名
-证书和私钥路径
+主服务器名称（仅用于菜单和订阅显示）
+主服务器入口域名（必须已解析到本机）
+TLS 完整证书链和私钥路径
 
-是否启用 HTTPS/XHTTP [Y/n]
-HTTPS TCP 端口 [443]
-Xray XHTTP 本地端口 [18001]
-XHTTP Path [随机]
+是否启用 XHTTP + nginx TLS（TCP/HTTPS）[Y/n]
+网站和 XHTTP 的公网 HTTPS TCP 端口 [443]
+Xray XHTTP 本机接收 TCP 端口 [18001]
+XHTTP 连接 Path [随机]
 
 是否启用 Reality + XHTTP [y/N]
-Reality 与宝塔网站共用 TCP 443 [Y/n]（宝塔模式且启用 XHTTP 时询问）
-Reality 本地监听 TCP 端口 [18443]
-Reality Path [随机]
-Reality 伪装目标 [aod.itunes.apple.com:443]
-Reality SNI [aod.itunes.apple.com]
+Reality、XHTTP 和宝塔网站是否共用公网 TCP 443 [Y/n]
+宝塔网站迁移后的本机 HTTPS TCP 端口 [8443]
+Xray Reality 本机接收 TCP 端口 [18443]
+Reality 的 XHTTP 连接 Path [随机]
+Reality 握手转发目标 [aod.itunes.apple.com:443]
+Reality 客户端 SNI [aod.itunes.apple.com]
 
 是否启用 Hysteria2 [Y/n]
-Hysteria2 与网站共用 443 [Y/n]
+Hysteria2 是否使用公网 UDP 443 [Y/n]
 检测到 nginx H3/QUIC 时，确认自动关闭并回滚保护 [y/N]
-不共用时：Hysteria2 UDP 端口 [8443]
-总上传/下载 Mbps [0]
-混淆密码 [随机]
-伪装网站 [当前域名]
+不使用 UDP 443 时：Hysteria2 公网 UDP 端口 [8443]
+整条 Hysteria2 入站总上传/下载 Mbps [0]
+客户端使用的混淆密码 [随机]
+伪装网站 URL [当前域名]
 
 管理员用户名 [admin]
-管理员 UUID [随机]
-管理员 Hysteria2 密码 [随机]
-管理员上传/下载限速 Mbps [0]
+管理员 VLESS UUID [随机]
+管理员 Hysteria2 登录密码 [随机]
+该用户上传/下载限速 Mbps [0]
 
-EasyTier 私网 IP [10.100.0.1]
-主服务器公网地址 [自动检测]
-EasyTier TCP 端口 [11010]
-网络名称和网络密码 [随机]
+主服务器的 EasyTier 私网 IP [10.100.0.1]
+从服务器连接的主服务器公网地址 [自动检测]
+EasyTier 公网 TCP 接入端口 [11010]
+EasyTier 私网名称和私网密钥 [随机]
 ```
+
+向导中的“公网端口”供客户端或从服务器连接，需要在对应机器的防火墙/安全组放行；“本机端口”只供 nginx 和 Xray 在服务器内部转发，不需要对公网开放。
 
 宝塔模式只写入当前域名的扩展配置：
 
@@ -116,7 +119,7 @@ EasyTier TCP 端口 [11010]
 /www/server/panel/vhost/nginx/extension/DOMAIN/etxr.conf
 ```
 
-通常不会改写其他网站 vhost 和 nginx 主配置。随机控制 Path、XHTTP Path、订阅地址都写在这个扩展文件中，并继续使用网站原有证书和 TCP 443。只有用户明确选择“HY2 共用 UDP 443”并确认关闭 H3/QUIC 时，脚本才会处理命中的 nginx QUIC/HTTP3 指令。
+通常不会改写其他网站 vhost 和 nginx 主配置。随机控制 Path、XHTTP Path、订阅地址都写在这个扩展文件中，并继续使用网站原有证书和 TCP 443。只有用户明确选择 Hysteria2 使用 UDP 443 并确认关闭 H3/QUIC 时，脚本才会处理命中的 nginx QUIC/HTTP3 指令。
 
 启用 Reality 与 XHTTP 共用 TCP 443 时，会额外写入：
 
@@ -124,8 +127,7 @@ EasyTier TCP 端口 [11010]
 /www/server/panel/vhost/nginx/tcp/etxr.conf
 ```
 
-此模式要求宝塔所有 HTTPS vhost 将 TCP 监听从 `443` 调整为内部端口（默认
-`127.0.0.1:8443`）。脚本只生成并检查分流文件，不会自动修改其他网站。
+此模式要求宝塔所有 HTTPS vhost 将 TCP 监听从 `443` 调整为内部端口（默认 `127.0.0.1:8443`）。确认后脚本会先备份命中的 vhost，再自动迁移监听并执行 nginx 检查；写入、检查、reload 或服务启动失败时恢复原文件和服务状态。网站域名和客户端使用的公网 TCP 443 不变。
 
 Hysteria2 与网站共用 `443` 实际是分开使用两个传输层端口：
 
@@ -159,30 +161,49 @@ nginx 的 QUIC/HTTP3 也使用 UDP 443，因此二者不能同时监听。选择
 主服务器向导只询问：
 
 ```text
-从服务器名称
-Pair ID 有效期 [30 分钟]
-线路类型
-EasyTier 私网中继端口
-主从中继 UUID
-公网线路外部端口和从服务器实际监听端口（仅线路 2/3）
+从服务器名称（仅用于菜单显示）
+Pair ID 可使用多少分钟 [30]
+从服务器有没有可用的公网 TCP 端口
+从服务器 EasyTier 私网中继 TCP 端口 [19000]
+主从中继身份 UUID [随机]
 ```
 
-NAT 模式会显示需要在服务商面板建立的主从中继 TCP 映射。协议入口不在主服务器填写，避免主服务器误判从服务器端口、宝塔和证书状态。
+三种线路的端口填写方法：
+
+```text
+线路 1（没有公网端口）：
+  主服务器 -> EasyTier 私网 -> 从服务器 TCP 19000
+  无需在公网防火墙放行中继端口。
+
+线路 2（独立公网 IP）：
+  主服务器 -> 从服务器公网 IP:29000
+  只询问一个公网端口，从服务器也监听同一个端口。
+  从服务器防火墙应放行 TCP 29000，并建议只允许主服务器公网 IP。
+
+线路 3（NAT 端口映射）：
+  主服务器 -> 公网地址:外部端口 -> 从服务器:内部端口
+  例如服务商分配 39000，映射到从服务器 29000：填写 39000 和 29000。
+```
+
+`19000` 和 `29000` 是两条不同线路在从服务器上的监听端口，必须不同：`19000` 只监听 EasyTier 私网，`29000` 用于公网优先线路。手机或电脑上的代理客户端不会连接这两个端口。协议入口不在主服务器填写，避免主服务器误判从服务器端口、宝塔和证书状态。
 
 最后会生成一个 `ER2...` 配对 ID 和 32 位签名指纹。到从服务器运行同一脚本，选择主菜单 `2`，粘贴 Pair ID 并核对指纹。验签和有效期检查通过后，从服务器现场询问：
 
 ```text
-已解析到从服务器的域名
-客户端连接地址
-XHTTP + TLS [y/N]
-Reality + XHTTP [Y/n]
-Hysteria2 [Y/n]
-XHTTP、Reality、网站是否共用 TCP 443 [Y/n]
-Hysteria2 是否使用 UDP 443 [Y/n]
-Path、本地端口、Reality 目标/SNI/Short ID
-Hysteria2 混淆密码、伪装网站和总带宽
-证书与私钥路径
+从服务器入口域名（用于 TLS 证书和 SNI）
+客户端实际连接地址（通常填写上面的域名）
+是否启用 XHTTP + nginx TLS（TCP/HTTPS）[y/N]
+是否启用 Reality + XHTTP（TCP）[Y/n]
+是否启用 Hysteria2（UDP）[Y/n]
+网站、XHTTP 和 Reality 是否共用公网 TCP 443 [Y/n]
+Hysteria2 是否使用公网 UDP 443 [Y/n]
+各协议的公网端口、仅本机使用的转发端口和随机 Path
+Reality 转发目标、客户端 SNI 和随机 Short ID
+Hysteria2 混淆密码、伪装网站 URL 和整条入站带宽
+TLS 完整证书链和私钥文件路径
 ```
+
+向导会明确标出端口用途：带有“公网”和“需在防火墙放行”的端口供客户端连接；带有“本机”的端口只供 nginx/Xray 内部转发，不需要在服务商安全组或系统防火墙开放。TCP 443 和 UDP 443 属于不同协议，可以同时使用。
 
 有宝塔时使用当前域名的宝塔证书和扩展目录。选择 Reality 共用 TCP 443 后，脚本会先列出操作，确认后备份所有宝塔 HTTPS vhost，把公开 TCP 443 改为统一的内部 HTTPS 端口，再通过 `stream_ssl_preread` 按 SNI 分流。nginx 检查、reload 或服务启动失败时会恢复 vhost、stream 文件和服务状态。
 
@@ -341,7 +362,7 @@ checksums.txt
 
 脚本先校验 SHA-256 和二进制内置版本，再通过同目录临时文件原子替换；旧二进制保存在 `/etc/etxr/backups/dataplane-binary/`，失败时自动恢复。镜像站可将 `ETXR_DOWNLOAD_BASE` 设置为包含上述三个文件的 HTTPS 目录。
 
-推送 `v0.13.0` 形式的 Git 标签后，GitHub Actions 会运行完整测试、交叉编译两个 Linux 架构并创建 Release。构建使用 `CGO_ENABLED=0`，目标机不需要额外运行库。
+推送 `v0.13.1` 形式的 Git 标签后，GitHub Actions 会运行完整测试、交叉编译两个 Linux 架构并创建 Release。构建使用 `CGO_ENABLED=0`，目标机不需要额外运行库。
 
 ## 许可证
 
