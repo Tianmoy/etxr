@@ -1,10 +1,10 @@
-# ETXR v0.11.0
+# ETXR v0.12.0
 
 ETXR 是面向 Debian 12 空白系统的一站式中文菜单脚本，用一份脚本安装主服务器或任意数量的从服务器。它管理 Xray、sing-box、EasyTier、订阅和用户配置，并可复用宝塔 nginx 的 TCP 443。
 
 ## 主要能力
 
-- 主服务器：VLESS + XHTTP + nginx TLS，可选 Reality + XHTTP、Hysteria2。
+- 主服务器：VLESS + XHTTP + nginx TLS，可选 Reality + XHTTP、Hysteria2；HY2 可用 UDP 443 与网站的 TCP 443 共存。
 - 从服务器：可选 XHTTP + TLS、Reality + XHTTP、Hysteria2。
 - 主从中继：VLESS Encryption + Vision + RAW。
 - 公网中继可用时优先直连，探测失败后回退 EasyTier。
@@ -44,6 +44,7 @@ flowchart LR
 - 脚本只读取 `/etc/etxr` 和 `/var/lib/etxr`，不导入历史项目目录或旧状态。
 - 检测到宝塔时复用 `/www/server/nginx/sbin/nginx`，不会安装第二套 nginx。
 - 宝塔模式可选用 `stream_ssl_preread` 按 SNI 共享 TCP 443：Reality 进入本机 Xray，其他域名进入宝塔 HTTPS。
+- Hysteria2 可选择 UDP 443。确认后会自动备份并关闭 nginx QUIC/HTTP3，但保留 HTTPS、HTTP/2 和 TCP 443。
 
 ## 启动菜单
 
@@ -89,7 +90,9 @@ Reality 伪装目标 [aod.itunes.apple.com:443]
 Reality SNI [aod.itunes.apple.com]
 
 是否启用 Hysteria2 [Y/n]
-Hysteria2 UDP 端口 [8443]
+Hysteria2 与网站共用 443 [Y/n]
+检测到 nginx H3/QUIC 时，确认自动关闭并回滚保护 [y/N]
+不共用时：Hysteria2 UDP 端口 [8443]
 总上传/下载 Mbps [0]
 混淆密码 [随机]
 伪装网站 [当前域名]
@@ -111,7 +114,7 @@ EasyTier TCP 端口 [11010]
 /www/server/panel/vhost/nginx/extension/DOMAIN/etxr.conf
 ```
 
-其他网站 vhost 和 nginx 主配置不会被改写。随机控制 Path、XHTTP Path、订阅地址都写在这个扩展文件中，并继续使用网站原有证书和 TCP 443。
+通常不会改写其他网站 vhost 和 nginx 主配置。随机控制 Path、XHTTP Path、订阅地址都写在这个扩展文件中，并继续使用网站原有证书和 TCP 443。只有用户明确选择“HY2 共用 UDP 443”并确认关闭 H3/QUIC 时，脚本才会处理命中的 nginx QUIC/HTTP3 指令。
 
 启用 Reality 与 XHTTP 共用 TCP 443 时，会额外写入：
 
@@ -121,7 +124,25 @@ EasyTier TCP 端口 [11010]
 
 此模式要求宝塔所有 HTTPS vhost 将 TCP 监听从 `443` 调整为内部端口（默认
 `127.0.0.1:8443`）。脚本只生成并检查分流文件，不会自动修改其他网站。
-UDP 443 的 QUIC/HTTP3 可以继续保留；Hysteria2 需要使用其他 UDP 端口。
+
+Hysteria2 与网站共用 `443` 实际是分开使用两个传输层端口：
+
+```text
+nginx / XHTTP / Reality：TCP 443
+Hysteria2：              UDP 443
+```
+
+nginx 的 QUIC/HTTP3 也使用 UDP 443，因此二者不能同时监听。选择共用后，ETXR 会列出命中的配置文件并再次确认，然后执行：
+
+1. 备份所有命中的 nginx 文件到本次 ETXR 备份目录。
+2. 注释 `listen 443 quic`（包括 IPv6 形式）。
+3. 将 `http3 on`、`quic_retry on`、`quic_gso on` 关闭。
+4. 注释发布 H3 的 `Alt-Svc` 响应头。
+5. 保留 `listen 443 ssl`、`http2 on` 和普通网站 HTTPS。
+6. 使用实际 nginx 二进制执行 `nginx -t`，先 reload 释放 UDP 443，再启动 sing-box。
+7. nginx 检查、reload、sing-box 启动或 UDP 监听验证任一步失败，恢复所有文件和服务状态。
+
+宝塔优先使用 `/www/server/nginx/sbin/nginx`。自动扫描宝塔 vhost、宝塔主配置以及标准 `/etc/nginx` 配置目录。
 
 ## 添加从服务器
 
@@ -139,6 +160,7 @@ UDP 443 的 QUIC/HTTP3 可以继续保留；Hysteria2 需要使用其他 UDP 端
 从服务器 XHTTP + TLS [y/N]
 从服务器 Reality + XHTTP [Y/n]
 从服务器 Hysteria2 [Y/n]
+Hysteria2 使用 UDP 443 [Y/n]
 直接入口 UUID [随机]
 各协议端口、Path、密码、Short ID、伪装目标和带宽
 ```
@@ -274,6 +296,7 @@ JQ=tools/jq tests/runtime-test.sh
 python3 tests/control-e2e-test.py
 python3 tests/data-plane-test.py
 python3 tests/menu-smoke-test.py
+tests/nginx-quic-test.sh
 
 tools/shellcheck-unpack/shellcheck-v0.11.0/shellcheck \
   -x -e SC2016 \
@@ -292,7 +315,7 @@ checksums.txt
 
 脚本先校验 SHA-256 和二进制内置版本，再通过同目录临时文件原子替换；旧二进制保存在 `/etc/etxr/backups/dataplane-binary/`，失败时自动恢复。镜像站可将 `ETXR_DOWNLOAD_BASE` 设置为包含上述三个文件的 HTTPS 目录。
 
-推送 `v0.11.0` 形式的 Git 标签后，GitHub Actions 会运行完整测试、交叉编译两个 Linux 架构并创建 Release。构建使用 `CGO_ENABLED=0`，目标机不需要额外运行库。
+推送 `v0.12.0` 形式的 Git 标签后，GitHub Actions 会运行完整测试、交叉编译两个 Linux 架构并创建 Release。构建使用 `CGO_ENABLED=0`，目标机不需要额外运行库。
 
 ## 许可证
 

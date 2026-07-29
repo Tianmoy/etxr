@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.11.0"
+VERSION="0.12.0"
 
 STATE_FILE="${ETXR_STATE:-/etc/etxr/state.json}"
 RUNTIME_DIR="${ETXR_RUNTIME:-/etc/etxr}"
@@ -35,6 +35,9 @@ DRY_RUN=0
 FORCE=0
 YES=0
 STATE_LOCK_HELD=0
+STATE_LOCK_DEPTH=0
+LAST_BACKUP_DIR=""
+NGINX_QUIC_CHANGED=0
 
 if [[ -t 1 && "${TERM:-dumb}" != "dumb" ]]; then
   C_RED=$'\033[31m'
@@ -154,7 +157,265 @@ port_is_listening() {
 port_is_nginx_owned() {
   local proto="$1" port="$2"
   command -v ss >/dev/null 2>&1 || return 1
-  ss -H -lntp "sport = :$port" 2>/dev/null | grep -q 'users:(("nginx"'
+  case "$proto" in
+    tcp) ss -H -lntp "sport = :$port" 2>/dev/null ;;
+    udp) ss -H -lnup "sport = :$port" 2>/dev/null ;;
+    *) return 1 ;;
+  esac | grep -q 'users:(("nginx"'
+}
+
+port_is_sing_box_owned() {
+  local proto="$1" port="$2"
+  command -v ss >/dev/null 2>&1 || return 1
+  case "$proto" in
+    tcp) ss -H -lntp "sport = :$port" 2>/dev/null ;;
+    udp) ss -H -lnup "sport = :$port" 2>/dev/null ;;
+    *) return 1 ;;
+  esac | grep -q 'users:(("sing-box"'
+}
+
+nginx_config_candidates() {
+  local root candidate resolved
+  local -a roots=()
+  local -A seen=()
+  if [[ -n "${ETXR_NGINX_SCAN_ROOTS:-}" ]]; then
+    IFS=':' read -r -a roots <<<"$ETXR_NGINX_SCAN_ROOTS"
+  else
+    roots=(
+      /www/server/nginx/conf/nginx.conf
+      /www/server/panel/vhost/nginx
+      /etc/nginx/nginx.conf
+      /etc/nginx/conf.d
+      /etc/nginx/sites-enabled
+    )
+  fi
+  for root in "${roots[@]}"; do
+    [[ -e "$root" ]] || continue
+    if [[ -f "$root" ]]; then
+      resolved="$(readlink -f -- "$root" 2>/dev/null || true)"
+      [[ -n "$resolved" && -f "$resolved" && -z "${seen[$resolved]:-}" ]] || continue
+      seen["$resolved"]=1
+      printf '%s\0' "$resolved"
+      continue
+    fi
+    [[ -d "$root" ]] || continue
+    while IFS= read -r -d '' candidate; do
+      resolved="$(readlink -f -- "$candidate" 2>/dev/null || true)"
+      [[ -n "$resolved" && -f "$resolved" && -z "${seen[$resolved]:-}" ]] || continue
+      seen["$resolved"]=1
+      printf '%s\0' "$resolved"
+    done < <(
+      if [[ "$root" == */sites-enabled ]]; then
+        find "$root" -maxdepth 1 \( -type f -o -type l \) -print0 2>/dev/null
+      else
+        find "$root" \( -type f -o -type l \) \
+          \( -name 'nginx.conf' -o -name '*.conf' \) -print0 2>/dev/null
+      fi
+    )
+  done
+}
+
+nginx_quic_file_has_active() {
+  local file="$1"
+  awk '
+    function is_active(line, lower) {
+      lower = tolower(line)
+      if (lower ~ /^[ \t]*#/ || lower ~ /^[ \t]*$/) return 0
+      if (lower ~ /^[ \t]*listen[ \t]+/ &&
+          lower ~ /(^|[^0-9])443([^0-9]|$)/ &&
+          lower ~ /(^|[ \t])quic([ \t;]|$)/) return 1
+      if (lower ~ /^[ \t]*(http3|quic_retry|quic_gso)[ \t]+on[ \t]*;/) return 1
+      if (lower ~ /^[ \t]*add_header[ \t]+alt-svc[ \t]+/ &&
+          lower ~ /(h3|quic)/) return 1
+      return 0
+    }
+    is_active($0) { found = 1; exit }
+    END { exit(found ? 0 : 1) }
+  ' "$file"
+}
+
+nginx_quic_active_manifest() {
+  local manifest="$1" candidate
+  : >"$manifest"
+  while IFS= read -r -d '' candidate; do
+    if nginx_quic_file_has_active "$candidate"; then
+      printf '%s\0' "$candidate" >>"$manifest"
+    fi
+  done < <(nginx_config_candidates)
+}
+
+nginx_quic_has_active() {
+  local manifest
+  manifest="$(mktemp)"
+  nginx_quic_active_manifest "$manifest"
+  if [[ -s "$manifest" ]]; then
+    rm -f "$manifest"
+    return 0
+  fi
+  rm -f "$manifest"
+  return 1
+}
+
+nginx_quic_rewrite_file() {
+  local file="$1" tmp output
+  tmp="$(mktemp "$(dirname "$file")/.etxr-nginx.XXXXXX")"
+  output="$(mktemp "$(dirname "$file")/.etxr-nginx-output.XXXXXX")"
+  if ! awk '
+    function indent_of(line) {
+      match(line, /^[ \t]*/)
+      return substr(line, RSTART, RLENGTH)
+    }
+    {
+      line = $0
+      lower = tolower(line)
+      if (lower ~ /^[ \t]*#/ || lower ~ /^[ \t]*$/) {
+        print line
+        next
+      }
+      if (lower ~ /^[ \t]*listen[ \t]+/ &&
+          lower ~ /(^|[^0-9])443([^0-9]|$)/ &&
+          lower ~ /(^|[ \t])quic([ \t;]|$)/) {
+        indent = indent_of(line)
+        print indent "# etxr-hy2-udp443: " substr(line, length(indent) + 1)
+        next
+      }
+      if (lower ~ /^[ \t]*(http3|quic_retry|quic_gso)[ \t]+on[ \t]*;/) {
+        sub(/[ \t]+on[ \t]*;/, " off;", line)
+        print line " # etxr-hy2-udp443: was on"
+        next
+      }
+      if (lower ~ /^[ \t]*add_header[ \t]+alt-svc[ \t]+/ &&
+          lower ~ /(h3|quic)/) {
+        indent = indent_of(line)
+        print indent "# etxr-hy2-udp443: " substr(line, length(indent) + 1)
+        next
+      }
+      print line
+    }
+  ' "$file" >"$output"; then
+    rm -f "$tmp" "$output"
+    return 2
+  fi
+  if cmp -s "$file" "$output"; then
+    rm -f "$tmp" "$output"
+    return 1
+  fi
+  rm -f "$tmp"
+  cp -a -- "$file" "$tmp" || {
+    rm -f "$tmp" "$output"
+    return 2
+  }
+  cat "$output" >"$tmp" || {
+    rm -f "$tmp" "$output"
+    return 2
+  }
+  rm -f "$output"
+  mv -f -- "$tmp" "$file"
+}
+
+nginx_quic_backup_file() {
+  local file="$1" backup="$2" key
+  key="$(printf '%s' "$file" | sha256sum | awk '{print $1}')"
+  mkdir -p "$backup/files"
+  cp -a -- "$file" "$backup/files/$key"
+  printf '%s\0' "$file" >>"$backup/manifest"
+}
+
+nginx_quic_disable_manifest() {
+  local manifest="$1" backup="$2" file rc
+  NGINX_QUIC_CHANGED=0
+  mkdir -p "$backup"
+  : >"$backup/manifest"
+  while IFS= read -r -d '' file; do
+    nginx_quic_backup_file "$file" "$backup"
+    if nginx_quic_rewrite_file "$file"; then
+      NGINX_QUIC_CHANGED=1
+    else
+      rc=$?
+      (( rc == 1 )) || return "$rc"
+    fi
+  done <"$manifest"
+}
+
+nginx_quic_restore_backup() {
+  local backup="$1" file key tmp
+  [[ -f "$backup/manifest" ]] || return 0
+  while IFS= read -r -d '' file; do
+    key="$(printf '%s' "$file" | sha256sum | awk '{print $1}')"
+    [[ -e "$backup/files/$key" ]] || return 1
+    ensure_parent "$file"
+    tmp="$(mktemp "$(dirname "$file")/.etxr-restore.XXXXXX")"
+    rm -f "$tmp"
+    cp -a -- "$backup/files/$key" "$tmp"
+    mv -f -- "$tmp" "$file"
+  done <"$backup/manifest"
+}
+
+nginx_process_running() {
+  if command -v pgrep >/dev/null 2>&1 && pgrep -x nginx >/dev/null 2>&1; then
+    return 0
+  fi
+  port_is_nginx_owned tcp 443 || port_is_nginx_owned udp 443
+}
+
+confirm_hy2_udp443_share() {
+  local manifest file occupied_by_other=0
+  printf '\n%sHysteria2 共用 443 的方式：%s\n' "$C_BOLD" "$C_RESET"
+  printf '  • 网站、XHTTP、Reality 继续使用 TCP 443\n'
+  printf '  • Hysteria2 单独使用 UDP 443，两者不会争用同一个协议端口\n'
+
+  if port_is_listening udp 443 &&
+     ! port_is_nginx_owned udp 443 &&
+     ! port_is_sing_box_owned udp 443; then
+    occupied_by_other=1
+  fi
+  if (( occupied_by_other )); then
+    warn "UDP 443 已被 nginx/sing-box 以外的程序占用，暂时不能共用"
+    return 1
+  fi
+
+  manifest="$(mktemp)"
+  nginx_quic_active_manifest "$manifest"
+  if [[ -s "$manifest" ]] || port_is_nginx_owned udp 443; then
+    printf '\n%s检测到 nginx 已启用 QUIC/HTTP3，占用了 UDP 443。%s\n' \
+      "$C_YELLOW" "$C_RESET"
+    printf '继续后脚本会自动：\n'
+    printf '  1. 备份命中的 nginx 配置\n'
+    printf '  2. 关闭 listen 443 quic、HTTP/3 和 Alt-Svc H3 公告\n'
+    printf '  3. 保留普通 HTTPS、HTTP/2 和 TCP 443\n'
+    printf '  4. 测试 nginx；失败时自动恢复全部文件\n'
+    while IFS= read -r -d '' file; do
+      printf '     - %s\n' "$file"
+    done <"$manifest"
+    if ! menu_confirm "确认自动关闭 nginx H3/QUIC 并让 Hysteria2 使用 UDP 443"; then
+      rm -f "$manifest"
+      return 1
+    fi
+  fi
+  rm -f "$manifest"
+  return 0
+}
+
+verify_hy2_udp_listener() {
+  local port="$1" shared="$2" attempt
+  command -v ss >/dev/null 2>&1 || {
+    warn "没有 ss 命令，跳过 Hysteria2 UDP 监听验证"
+    return 0
+  }
+  for ((attempt=1; attempt<=20; attempt++)); do
+    if port_is_listening udp "$port"; then
+      if [[ "$shared" == "true" ]] && port_is_nginx_owned udp "$port"; then
+        warn "UDP $port 仍由 nginx 占用"
+        return 1
+      fi
+      if port_is_sing_box_owned udp "$port"; then
+        return 0
+      fi
+    fi
+    sleep 0.25
+  done
+  warn "Hysteria2 未在 UDP $port 上成功监听"
+  return 1
 }
 
 prompt_port_checked() {
@@ -349,19 +610,28 @@ state_update() {
 }
 
 state_lock_acquire() {
-  (( STATE_LOCK_HELD )) && return 0
+  if (( STATE_LOCK_HELD )); then
+    STATE_LOCK_DEPTH="$((STATE_LOCK_DEPTH + 1))"
+    return 0
+  fi
   need_cmd flock
   ensure_parent "$STATE_FILE"
   exec 9>"${STATE_FILE}.lock"
   flock -x 9
   STATE_LOCK_HELD=1
+  STATE_LOCK_DEPTH=1
 }
 
 state_lock_release() {
   (( STATE_LOCK_HELD )) || return 0
+  if (( STATE_LOCK_DEPTH > 1 )); then
+    STATE_LOCK_DEPTH="$((STATE_LOCK_DEPTH - 1))"
+    return 0
+  fi
   flock -u 9 || true
   exec 9>&-
   STATE_LOCK_HELD=0
+  STATE_LOCK_DEPTH=0
 }
 
 random_hex() {
@@ -641,6 +911,7 @@ EOF
         config_path: $sing_config,
         listen: "0.0.0.0",
         port: 8443,
+        shared_udp443: false,
         up_mbps: 0,
         down_mbps: 0,
         obfs: "salamander",
@@ -1245,10 +1516,12 @@ cmd_reality() {
 
 cmd_hy2_enable() {
   local port=8443 up=0 down=0 obfs="salamander" obfs_password="" masquerade=""
-  local cert="" key=""
+  local cert="" key="" shared_udp443=false share_flag_seen=0
   while (($#)); do
     case "$1" in
       --port) port="$2"; shift 2 ;;
+      --share-udp443) shared_udp443=true; share_flag_seen=1; shift ;;
+      --no-share-udp443) shared_udp443=false; share_flag_seen=1; shift ;;
       --up-mbps) up="$2"; shift 2 ;;
       --down-mbps) down="$2"; shift 2 ;;
       --obfs) obfs="$2"; shift 2 ;;
@@ -1259,10 +1532,12 @@ cmd_hy2_enable() {
       --help)
         cat <<'EOF'
 Usage:
-  etxr hy2 enable --port 8443 --up-mbps 30 --down-mbps 200 \
+  etxr hy2 enable --port 443 --share-udp443 \
+    --up-mbps 30 --down-mbps 200 \
     --obfs salamander --masquerade https://www.example.com
 
-Use UDP 443 only when nginx QUIC/HTTP3 is disabled and no other process owns UDP 443.
+--share-udp443 means Hysteria2 uses UDP 443 while HTTPS keeps TCP 443.
+During apply, ETXR backs up and disables nginx QUIC/HTTP3 automatically.
 EOF
         return ;;
       *) die "Unknown hy2 option: $1" ;;
@@ -1270,6 +1545,18 @@ EOF
   done
   require_state
   valid_port "$port" || die "Invalid Hysteria2 port"
+  [[ "$shared_udp443" == "true" || "$shared_udp443" == "false" ]] ||
+    die "Invalid Hysteria2 UDP 443 sharing flag"
+  if [[ "$shared_udp443" == "true" && "$port" != "443" ]]; then
+    die "--share-udp443 requires --port 443"
+  fi
+  if [[ "$port" == "443" && "$share_flag_seen" -eq 0 ]]; then
+    shared_udp443=false
+  fi
+  if [[ "$port" == "443" && "$shared_udp443" == "false" ]] &&
+     { port_is_nginx_owned udp 443 || nginx_quic_has_active; }; then
+    die "nginx H3/QUIC 正在使用 UDP 443；请添加 --share-udp443 让 ETXR 自动备份并关闭它"
+  fi
   [[ "$obfs" == "salamander" || "$obfs" == "none" ]] ||
     die "--obfs must be salamander or none"
   valid_mbps "$up" || die "Invalid upload Mbps"
@@ -1285,6 +1572,7 @@ EOF
   state_update \
     '.hysteria2.enabled = true |
      .hysteria2.port = $port |
+     .hysteria2.shared_udp443 = $shared_udp443 |
      .hysteria2.up_mbps = $up |
      .hysteria2.down_mbps = $down |
      .hysteria2.obfs = $obfs |
@@ -1292,10 +1580,11 @@ EOF
      .hysteria2.masquerade = $masquerade |
      .hysteria2.certificate = $cert |
      .hysteria2.certificate_key = $key' \
-    --argjson port "$port" --argjson up "$up" --argjson down "$down" \
+    --argjson port "$port" --argjson shared_udp443 "$shared_udp443" \
+    --argjson up "$up" --argjson down "$down" \
     --arg obfs "$obfs" --arg password "$obfs_password" \
     --arg masquerade "$masquerade" --arg cert "$cert" --arg key "$key"
-  log "Enabled Hysteria2 on UDP $port"
+  log "Enabled Hysteria2 on UDP $port (shared UDP 443: $shared_udp443)"
   [[ -z "$obfs_password" ]] || printf 'Hysteria2 obfs password: %s\n' "$obfs_password"
 }
 
@@ -1303,7 +1592,12 @@ cmd_hy2() {
   local action="${1:-}"; shift || true
   case "$action" in
     enable) cmd_hy2_enable "$@" ;;
-    disable) state_update '.hysteria2.enabled = false' ;;
+    disable)
+      state_update '
+        .hysteria2.enabled = false |
+        .hysteria2.shared_udp443 = false
+      '
+      ;;
     show) require_state; jq '.hysteria2' "$STATE_FILE" ;;
     *) die "Usage: etxr hy2 enable|disable|show" ;;
   esac
@@ -2318,10 +2612,28 @@ cmd_render() {
 }
 
 nginx_bin() {
-  local configured
+  local configured pid running
   configured="$(jq -r '.nginx.binary // empty' "$STATE_FILE")"
   if [[ -n "$configured" && -x "$configured" ]]; then
     printf '%s' "$configured"
+  elif command -v pgrep >/dev/null 2>&1; then
+    while IFS= read -r pid; do
+      running="$(readlink -f "/proc/${pid}/exe" 2>/dev/null || true)"
+      if [[ -n "$running" && -x "$running" &&
+            "$(basename "$running")" == "nginx" ]]; then
+        printf '%s' "$running"
+        return
+      fi
+    done < <(pgrep -f 'nginx: master process' 2>/dev/null || true)
+    if [[ -x /www/server/nginx/sbin/nginx ]]; then
+      printf '%s' /www/server/nginx/sbin/nginx
+    elif [[ -x /usr/sbin/nginx ]]; then
+      printf '%s' /usr/sbin/nginx
+    elif command -v nginx >/dev/null 2>&1; then
+      command -v nginx
+    else
+      return 1
+    fi
   elif [[ -x /www/server/nginx/sbin/nginx ]]; then
     printf '%s' /www/server/nginx/sbin/nginx
   elif [[ -x /usr/sbin/nginx ]]; then
@@ -2439,6 +2751,14 @@ validate_state_semantics() {
     errors=1
   fi
   if ! jq -e '
+    ((.hysteria2.shared_udp443 // false) | type == "boolean") and
+    ((.hysteria2.shared_udp443 // false) == false or
+      ((.hysteria2.enabled // false) == true and .hysteria2.port == 443))
+  ' "$STATE_FILE" >/dev/null; then
+    warn "Hysteria2 共用 UDP 443 的状态无效：必须启用 HY2 并使用端口 443"
+    errors=1
+  fi
+  if ! jq -e '
     def valid_ipv4:
       type == "string" and
       (split(".") | length == 4 and
@@ -2552,9 +2872,14 @@ backup_file() {
 
 cmd_backup() {
   require_state
-  local stamp dest
+  local stamp dest suffix=0
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
   dest="${BACKUP_DIR}/${stamp}"
+  while [[ -e "$dest" ]]; do
+    suffix="$((suffix + 1))"
+    dest="${BACKUP_DIR}/${stamp}-${suffix}"
+  done
+  LAST_BACKUP_DIR="$dest"
   mkdir -p "$dest"
   cp -a "$STATE_FILE" "$dest/state.json"
   backup_file "$(jq -r '.xray.config_path' "$STATE_FILE")" "$dest"
@@ -3444,12 +3769,34 @@ cmd_apply() {
   check_standalone_nginx_takeover ||
     die "nginx 接管检查失败，已停止应用"
 
-  local xray_config sing_config mode nginx_target nginx_paths_target="" nb
+  local xray_config sing_config mode nginx_target nginx_paths_target="" nb=""
   local nginx_stream_target="" nginx_previous="" nginx_paths_previous=""
-  local rollback_dir="" rollback_service
+  local rollback_dir="" rollback_service quic_manifest=""
+  local hy2_enabled hy2_port hy2_shared_udp443 nginx_was_running=0
+  local nginx_should_reload=0 nginx_quic_backup=""
   xray_config="$(jq -r '.xray.config_path' "$STATE_FILE")"
   sing_config="$(jq -r '.hysteria2.config_path' "$STATE_FILE")"
   mode="$(jq -r '.nginx.mode' "$STATE_FILE")"
+  hy2_enabled="$(jq -r '.hysteria2.enabled // false' "$STATE_FILE")"
+  hy2_port="$(jq -r '.hysteria2.port // 8443' "$STATE_FILE")"
+  hy2_shared_udp443="$(jq -r '.hysteria2.shared_udp443 // false' "$STATE_FILE")"
+  quic_manifest="$(mktemp)"
+  if [[ "$hy2_shared_udp443" == "true" ]]; then
+    nginx_quic_active_manifest "$quic_manifest"
+    if port_is_listening udp "$hy2_port" &&
+       ! port_is_nginx_owned udp "$hy2_port" &&
+       ! port_is_sing_box_owned udp "$hy2_port"; then
+      rm -f "$quic_manifest"
+      die "UDP $hy2_port 已被其他程序占用，未修改 nginx"
+    fi
+    if port_is_nginx_owned udp "$hy2_port" && [[ ! -s "$quic_manifest" ]]; then
+      rm -f "$quic_manifest"
+      die "nginx 正在占用 UDP $hy2_port，但没有在受支持的配置目录中找到 H3/QUIC 配置"
+    fi
+  else
+    : >"$quic_manifest"
+  fi
+  nginx_process_running && nginx_was_running=1
 
   if (( ! DRY_RUN )); then
     rollback_dir="$(mktemp -d "$RUNTIME_DIR/.apply.XXXXXX")"
@@ -3534,6 +3881,9 @@ cmd_apply() {
         rm -f "$nginx_stream_target"
       fi
     fi
+    if [[ -n "$nginx_quic_backup" ]]; then
+      nginx_quic_restore_backup "$nginx_quic_backup" || true
+    fi
     systemctl daemon-reload 2>/dev/null || true
     for rollback_service in etxr-easytier etxr-limiter etxr-xray etxr-sing-box etxr-meter etxr-control etxr-agent; do
       if [[ -f "$rollback_dir/${rollback_service}.unit" ]]; then
@@ -3556,7 +3906,8 @@ cmd_apply() {
         systemctl stop "${rollback_service}.service" 2>/dev/null || true
       fi
     done
-    if [[ "$mode" != "disabled" && -n "${nb:-}" ]]; then
+    if [[ -n "${nb:-}" ]] &&
+       { (( nginx_was_running )) || [[ "$mode" != "disabled" ]]; }; then
       if "$nb" -t >/dev/null 2>&1; then
         "$nb" -s reload >/dev/null 2>&1 || true
       fi
@@ -3568,7 +3919,7 @@ cmd_apply() {
   [[ -x "$XRAY_BIN" ]] || die "Install Xray before apply"
   "$XRAY_BIN" run -test -config "$GENERATED_DIR/xray.json" ||
     die "Xray 配置检查失败，未写入 live 配置"
-  if [[ "$(jq -r '.hysteria2.enabled' "$STATE_FILE")" == "true" ]]; then
+  if [[ "$hy2_enabled" == "true" ]]; then
     [[ -x "$SING_BOX_BIN" ]] || die "Install sing-box before enabling Hysteria2"
     "$SING_BOX_BIN" check -c "$GENERATED_DIR/sing-box.json" ||
       die "sing-box 配置检查失败，未写入 live 配置"
@@ -3580,9 +3931,11 @@ cmd_apply() {
      (( ! DRY_RUN )); then
     ensure_control_runtime
   fi
-  if [[ "$mode" != "disabled" ]]; then
+  if [[ "$mode" != "disabled" || -s "$quic_manifest" ||
+        ( "$hy2_shared_udp443" == "true" && "$nginx_was_running" -eq 1 ) ]]; then
     nb="$(nginx_bin)" || die "nginx not found"
-    if [[ "$(jq -r '.nginx.shared_tcp443 // false' "$STATE_FILE")" == "true" ]]; then
+    if [[ "$mode" != "disabled" &&
+          "$(jq -r '.nginx.shared_tcp443 // false' "$STATE_FILE")" == "true" ]]; then
       check_baota_shared_nginx_layout "$nb"
     fi
     "$nb" -t || die "现有 nginx 配置检查失败，已停止应用"
@@ -3595,7 +3948,7 @@ cmd_apply() {
       { rollback_apply; die "写入 Xray live 配置失败"; }
   fi
 
-  if [[ "$(jq -r '.hysteria2.enabled' "$STATE_FILE")" == "true" ]]; then
+  if [[ "$hy2_enabled" == "true" ]]; then
     ensure_parent "$sing_config"
     if [[ "$GENERATED_DIR/sing-box.json" != "$sing_config" ]]; then
       run install -m 600 "$GENERATED_DIR/sing-box.json" "$sing_config" ||
@@ -3650,6 +4003,31 @@ cmd_apply() {
       { rollback_apply; die "写入宝塔 nginx stream 配置失败"; }
   fi
 
+  if [[ "$hy2_shared_udp443" == "true" && -s "$quic_manifest" ]]; then
+    if (( DRY_RUN )); then
+      while IFS= read -r -d '' rollback_service; do
+        log "Would disable nginx H3/QUIC in $rollback_service"
+      done <"$quic_manifest"
+    else
+      nginx_quic_backup="$rollback_dir/nginx-quic"
+      if ! nginx_quic_disable_manifest "$quic_manifest" "$nginx_quic_backup"; then
+        rollback_apply
+        die "关闭 nginx H3/QUIC 失败，已恢复原配置"
+      fi
+      if [[ -n "$LAST_BACKUP_DIR" ]]; then
+        cp -a "$nginx_quic_backup" "$LAST_BACKUP_DIR/nginx-quic" || {
+          rollback_apply
+          die "保存 nginx H3/QUIC 持久备份失败，已恢复原配置"
+        }
+      fi
+      if (( NGINX_QUIC_CHANGED )); then
+        nginx_should_reload=1
+        log "已关闭 nginx H3/QUIC；普通 HTTPS、HTTP/2 和 TCP 443 保持不变"
+      fi
+    fi
+  fi
+  [[ "$mode" == "disabled" ]] || nginx_should_reload=1
+
   mkdir -p "$SUBSCRIPTION_DIR"
   [[ -n "$SUBSCRIPTION_DIR" && "$SUBSCRIPTION_DIR" != "/" ]] ||
     { rollback_apply; die "Unsafe subscription directory"; }
@@ -3674,16 +4052,29 @@ cmd_apply() {
   write_systemd_units || { rollback_apply; die "写入 systemd 服务失败"; }
 
   if (( ! DRY_RUN )); then
-    if [[ "$mode" != "disabled" ]] && ! "$nb" -t; then
+    if [[ -n "$nb" ]] && ! "$nb" -t; then
       warn "New nginx configuration is invalid; rolling back"
       rollback_apply
       "$nb" -t || true
       die "nginx validation failed; previous configuration restored"
     fi
-    systemctl daemon-reload
-    configure_ufw_from_state
+    systemctl daemon-reload ||
+      { rollback_apply; die "systemd 配置重载失败"; }
+    configure_ufw_from_state ||
+      { rollback_apply; die "防火墙规则应用失败"; }
+    if (( nginx_should_reload )) &&
+       { (( nginx_was_running )) || [[ "$mode" != "disabled" ]]; }; then
+      "$nb" -s reload ||
+        { rollback_apply; die "nginx reload 失败，已恢复 H3/QUIC 和其他配置"; }
+      if [[ "$hy2_shared_udp443" == "true" ]] &&
+         port_is_nginx_owned udp "$hy2_port"; then
+        rollback_apply
+        die "nginx reload 后仍占用 UDP $hy2_port，已恢复原配置"
+      fi
+    fi
     if [[ "$(jq -r '.easytier.enabled // false' "$STATE_FILE")" == "true" ]]; then
-      [[ -x "$EASYTIER_CORE_BIN" ]] || die "Install EasyTier before apply"
+      [[ -x "$EASYTIER_CORE_BIN" ]] ||
+        { rollback_apply; die "Install EasyTier before apply"; }
     fi
     if [[ "$(jq -r '.easytier.enabled // false' "$STATE_FILE")" == "true" ]]; then
       systemctl enable --now etxr-easytier.service ||
@@ -3705,7 +4096,8 @@ cmd_apply() {
         (((.speed_limit.up_mbps // 0) > 0) or
          ((.speed_limit.down_mbps // 0) > 0))
       )
-    ] | length' "$STATE_FILE")"
+    ] | length' "$STATE_FILE")" ||
+      { rollback_apply; die "读取单用户限速状态失败"; }
     if (( limited_users_count > 0 )); then
       systemctl enable --now etxr-limiter.service ||
         { rollback_apply; die "单用户限速服务启动失败"; }
@@ -3719,16 +4111,19 @@ cmd_apply() {
     systemctl restart etxr-xray.service ||
       { rollback_apply; die "Xray 服务重启失败"; }
 
-    if [[ "$(jq -r '.hysteria2.enabled' "$STATE_FILE")" == "true" ]]; then
+    if [[ "$hy2_enabled" == "true" ]]; then
       systemctl enable --now etxr-sing-box.service ||
         { rollback_apply; die "sing-box 服务启动失败"; }
       systemctl restart etxr-sing-box.service ||
         { rollback_apply; die "sing-box 服务重启失败"; }
+      verify_hy2_udp_listener "$hy2_port" "$hy2_shared_udp443" ||
+        { rollback_apply; die "Hysteria2 UDP 监听验证失败"; }
     else
       systemctl disable --now etxr-sing-box.service 2>/dev/null || true
     fi
 
-    mkdir -p "$(dirname "$USAGE_FILE")"
+    mkdir -p "$(dirname "$USAGE_FILE")" ||
+      { rollback_apply; die "创建流量统计目录失败"; }
     systemctl enable --now etxr-meter.service ||
       { rollback_apply; die "单用户流量统计服务启动失败"; }
     systemctl restart etxr-meter.service ||
@@ -3754,9 +4149,8 @@ cmd_apply() {
       systemctl disable --now etxr-agent.service 2>/dev/null || true
     fi
 
-    [[ "$mode" == "disabled" ]] || "$nb" -s reload ||
-      { rollback_apply; die "nginx reload 失败"; }
   fi
+  rm -f "$quic_manifest"
   [[ -z "$nginx_previous" ]] || rm -f "$nginx_previous"
   [[ -z "$nginx_paths_previous" ]] || rm -f "$nginx_paths_previous"
   [[ -z "$rollback_dir" ]] || rm -rf "$rollback_dir"
@@ -4344,6 +4738,9 @@ validate_pair_bundle() {
     (.direct.reality.short_id | type == "string" and test("^[0-9a-fA-F]{2,32}$")) and
     (.direct.hysteria2.enabled | type == "boolean") and
     (.direct.hysteria2.port | type == "number" and floor == . and . >= 1 and . <= 65535) and
+    ((.direct.hysteria2.shared_udp443 // false) | type == "boolean") and
+    ((.direct.hysteria2.shared_udp443 // false) == false or
+      (.direct.hysteria2.enabled == true and .direct.hysteria2.port == 443)) and
     (.direct.hysteria2.password | type == "string" and length <= 512) and
     (.direct.hysteria2.obfs_password | type == "string" and length <= 512) and
     (.direct.hysteria2.masquerade | type == "string" and test("^https?://[^[:space:]]+$")) and
@@ -4448,6 +4845,7 @@ cmd_pair_create() {
   local reality_port=18443 hy2_port=28443
   local reality_sni="aod.itunes.apple.com" reality_target="aod.itunes.apple.com:443"
   local xhttp_enabled=false reality_enabled=true hy2_enabled=true
+  local hy2_shared_udp443=false
   local xhttp_port=18000 xhttp_listen_port=18000 xhttp_path=""
   local reality_path="" hy2_masquerade="https://www.cloudflare.com"
   local relay_uuid="" user_uuid="" hy2_password="" hy2_obfs="" reality_short=""
@@ -4473,6 +4871,8 @@ cmd_pair_create() {
       --hy2-enabled) hy2_enabled=true; shift ;;
       --no-hy2) hy2_enabled=false; shift ;;
       --hy2-port) hy2_port="$2"; shift 2 ;;
+      --hy2-share-udp443) hy2_shared_udp443=true; shift ;;
+      --hy2-no-share-udp443) hy2_shared_udp443=false; shift ;;
       --hy2-masquerade) hy2_masquerade="$2"; shift 2 ;;
       --hy2-up-mbps) hy2_up="$2"; shift 2 ;;
       --hy2-down-mbps) hy2_down="$2"; shift 2 ;;
@@ -4494,7 +4894,7 @@ cmd_pair_create() {
 Usage:
   etxr pair create --name worker1 [--public-host PUBLIC_HOST]
     [--public-relay-port EXTERNAL_PORT] [--public-listen-port INTERNAL_PORT]
-    [--reality-port 18443] [--hy2-port 28443]
+    [--reality-port 18443] [--hy2-port 443 --hy2-share-udp443]
     [--expires-minutes 30]
 
 When --public-host is set, the public relay is primary and EasyTier is the
@@ -4529,6 +4929,12 @@ EOF
     die "Invalid Reality enabled flag"
   [[ "$hy2_enabled" == "true" || "$hy2_enabled" == "false" ]] ||
     die "Invalid Hysteria2 enabled flag"
+  [[ "$hy2_shared_udp443" == "true" || "$hy2_shared_udp443" == "false" ]] ||
+    die "Invalid Hysteria2 UDP 443 sharing flag"
+  if [[ "$hy2_shared_udp443" == "true" &&
+        ( "$hy2_enabled" != "true" || "$hy2_port" != "443" ) ]]; then
+    die "Worker Hysteria2 UDP 443 sharing requires enabled HY2 on port 443"
+  fi
   xhttp_path="${xhttp_path:-/${name}-xhttp-$(random_hex 8)}"
   reality_path="${reality_path:-/${name}-reality-$(random_hex 8)}"
   xhttp_path="$(normalize_path "$xhttp_path")"
@@ -4599,6 +5005,7 @@ EOF
     --argjson reality_port "$reality_port" --argjson hy2_enabled "$hy2_enabled" \
     --arg user_uuid "$user_uuid" --arg hy2_password "$hy2_password" \
     --arg hy2_obfs "$hy2_obfs" --argjson hy2_port "$hy2_port" \
+    --argjson hy2_shared_udp443 "$hy2_shared_udp443" \
     --arg hy2_masquerade "$hy2_masquerade" \
     --argjson hy2_up "$hy2_up" --argjson hy2_down "$hy2_down" \
     --arg control_url "$control_url" --arg control_token "$control_token" \
@@ -4659,6 +5066,7 @@ EOF
         hysteria2: {
           enabled: $hy2_enabled,
           port: $hy2_port,
+          shared_udp443: $hy2_shared_udp443,
           password: $hy2_password,
           obfs_password: $hy2_obfs,
           masquerade: $hy2_masquerade,
@@ -4909,6 +5317,7 @@ cmd_pair_join() {
     .xray.reality_inbounds = $reality_inbounds |
     .hysteria2.enabled = $hy2_enabled |
     .hysteria2.port = $hy2_port |
+    .hysteria2.shared_udp443 = $hy2_shared_udp443 |
     .hysteria2.up_mbps = $hy2_up |
     .hysteria2.down_mbps = $hy2_down |
     .hysteria2.obfs = "salamander" |
@@ -4940,6 +5349,7 @@ cmd_pair_join() {
     --argjson reality_inbounds "$reality_inbounds" \
     --argjson hy2_enabled "$(jq -r '.direct.hysteria2.enabled // true' <<<"$bundle")" \
     --argjson hy2_port "$(jq -r '.direct.hysteria2.port' <<<"$bundle")" \
+    --argjson hy2_shared_udp443 "$(jq -r '.direct.hysteria2.shared_udp443 // false' <<<"$bundle")" \
     --argjson hy2_up "$(jq -r '.direct.hysteria2.up_mbps // 0' <<<"$bundle")" \
     --argjson hy2_down "$(jq -r '.direct.hysteria2.down_mbps // 0' <<<"$bundle")" \
     --arg hy2_obfs "$(jq -r '.direct.hysteria2.obfs_password' <<<"$bundle")" \
@@ -5233,7 +5643,11 @@ cmd_status() {
     exits: [.xray.exits[] | {name,address,port,transport}],
     reality: [.xray.reality_inbounds[] |
       {name, public_port: .port, listen_port: (.listen_port // .port), path}],
-    hysteria2: {enabled: .hysteria2.enabled, port: .hysteria2.port}
+    hysteria2: {
+      enabled: .hysteria2.enabled,
+      port: .hysteria2.port,
+      shared_udp443: (.hysteria2.shared_udp443 // false)
+    }
   }' "$STATE_FILE"
   command -v systemctl >/dev/null 2>&1 || return 0
   systemctl --no-pager --full status etxr-easytier.service 2>/dev/null | sed -n '1,8p' || true
@@ -5354,6 +5768,7 @@ menu_quick_init() {
   local shared_tcp443=false https_listen_port=8443 reality_listen_port
   local reality_port reality_path reality_target reality_sni
   local hy2_port hy2_obfs_password hy2_masquerade hy2_up hy2_down
+  local hy2_shared_udp443=false hy2_share_choice
   local et_ip et_endpoint et_port et_name et_secret
   local username user_uuid user_password user_up user_down
   local value default_uuid default_password
@@ -5434,13 +5849,25 @@ menu_quick_init() {
 
   hy2_enabled="$(prompt_bool '启用 Hysteria2' y)"
   if [[ "$hy2_enabled" == "y" ]]; then
-    hy2_port="$(prompt_port_checked 'Hysteria2 UDP 端口' '8443' udp)"
+    hy2_share_choice="$(prompt_bool '让 Hysteria2 与网站共用 443（HY2 用 UDP 443）' y)"
+    if [[ "$hy2_share_choice" == "y" ]] && confirm_hy2_udp443_share; then
+      hy2_port=443
+      hy2_shared_udp443=true
+    else
+      if [[ "$hy2_share_choice" == "y" ]]; then
+        printf '%s已取消 UDP 443 共用，请选择其他 Hysteria2 端口。%s\n' \
+          "$C_YELLOW" "$C_RESET"
+      fi
+      hy2_port="$(prompt_port_checked 'Hysteria2 UDP 端口' '8443' udp)"
+      hy2_shared_udp443=false
+    fi
     hy2_up="$(prompt_mbps 'Hysteria2 服务器总上传 Mbps，0 表示不限' '0')"
     hy2_down="$(prompt_mbps 'Hysteria2 服务器总下载 Mbps，0 表示不限' '0')"
     hy2_obfs_password="$(prompt_secret_default 'Hysteria2 混淆密码' "$(random_password)")"
     hy2_masquerade="$(prompt_url_value 'Hysteria2 伪装网站' "https://${domain}")"
   else
     hy2_port=8443
+    hy2_shared_udp443=false
     hy2_up=0
     hy2_down=0
     hy2_obfs_password="$(random_password)"
@@ -5482,7 +5909,10 @@ menu_quick_init() {
   [[ "$reality_enabled" != "y" ]] || printf '，公网 TCP %s，本地 %s，SNI %s' \
     "$reality_port" "$reality_listen_port" "$reality_sni"
   printf '\n  • Hysteria2：%s' "$([[ "$hy2_enabled" == "y" ]] && printf '开启' || printf '关闭')"
-  [[ "$hy2_enabled" != "y" ]] || printf '，UDP %s，伪装 %s' "$hy2_port" "$hy2_masquerade"
+  [[ "$hy2_enabled" != "y" ]] || printf '，UDP %s%s，伪装 %s' \
+    "$hy2_port" \
+    "$([[ "$hy2_shared_udp443" == "true" ]] && printf '（与 TCP 443 共用，自动关闭 nginx H3）')" \
+    "$hy2_masquerade"
   printf '\n  • 主从组网：TCP %s，私网 IP %s\n' "$et_port" "$et_ip"
   printf '  • 管理员：%s，上传 %s，下载 %s\n\n' \
     "$username" \
@@ -5563,9 +5993,17 @@ menu_quick_init() {
   fi
 
   if [[ "$hy2_enabled" == "y" ]]; then
-    menu_exec cmd_hy2_enable --port "$hy2_port" --up-mbps "$hy2_up" \
-      --down-mbps "$hy2_down" --obfs salamander \
-      --obfs-password "$hy2_obfs_password" --masquerade "$hy2_masquerade" || {
+    local -a hy2_args=(
+      --port "$hy2_port" --up-mbps "$hy2_up" --down-mbps "$hy2_down"
+      --obfs salamander --obfs-password "$hy2_obfs_password"
+      --masquerade "$hy2_masquerade"
+    )
+    if [[ "$hy2_shared_udp443" == "true" ]]; then
+      hy2_args+=(--share-udp443)
+    else
+      hy2_args+=(--no-share-udp443)
+    fi
+    menu_exec cmd_hy2_enable "${hy2_args[@]}" || {
         menu_pause
         return
       }
@@ -5877,7 +6315,7 @@ menu_add_reality() {
 }
 
 menu_protocols() {
-  local choice port up down masquerade name
+  local choice port up down masquerade name shared_udp443 share_choice obfs_password
   if [[ ! -f "$STATE_FILE" ]]; then
     warn "请先执行一键安装与初始化"
     menu_pause
@@ -5905,12 +6343,33 @@ menu_protocols() {
         menu_pause
         ;;
       4)
-        port="$(prompt_value 'Hysteria2 UDP 端口' '8443')"
-        up="$(prompt_value '服务器上传 Mbps，0 表示不限' '0')"
-        down="$(prompt_value '服务器下载 Mbps，0 表示不限' '0')"
-        masquerade="$(prompt_value '伪装网址' 'https://www.cloudflare.com')"
-        menu_exec cmd_hy2_enable --port "$port" --up-mbps "$up" \
-          --down-mbps "$down" --obfs salamander --masquerade "$masquerade" || true
+        shared_udp443=false
+        share_choice="$(prompt_bool '让 Hysteria2 与网站共用 443（HY2 用 UDP 443）' y)"
+        if [[ "$share_choice" == "y" ]] && confirm_hy2_udp443_share; then
+          port=443
+          shared_udp443=true
+        else
+          if [[ "$share_choice" == "y" ]]; then
+            printf '%s已取消 UDP 443 共用，请选择其他 Hysteria2 端口。%s\n' \
+              "$C_YELLOW" "$C_RESET"
+          fi
+          port="$(prompt_port_checked 'Hysteria2 UDP 端口' '8443' udp)"
+        fi
+        up="$(prompt_mbps '服务器上传 Mbps，0 表示不限' '0')"
+        down="$(prompt_mbps '服务器下载 Mbps，0 表示不限' '0')"
+        obfs_password="$(prompt_secret_default 'Hysteria2 混淆密码' "$(random_password)")"
+        masquerade="$(prompt_url_value '伪装网址' 'https://www.cloudflare.com')"
+        local -a hy2_args=(
+          --port "$port" --up-mbps "$up" --down-mbps "$down"
+          --obfs salamander --obfs-password "$obfs_password"
+          --masquerade "$masquerade"
+        )
+        if [[ "$shared_udp443" == "true" ]]; then
+          hy2_args+=(--share-udp443)
+        else
+          hy2_args+=(--no-share-udp443)
+        fi
+        menu_exec cmd_hy2_enable "${hy2_args[@]}" || true
         menu_apply_prompt || true
         menu_pause
         ;;
@@ -6036,6 +6495,7 @@ menu_pair_create() {
   local xhttp_enabled reality_enabled hy2_enabled xhttp_port xhttp_listen_port xhttp_path
   local reality_port reality_path reality_target reality_sni reality_short
   local hy2_port hy2_password hy2_obfs hy2_masquerade hy2_up hy2_down
+  local hy2_shared_udp443=false hy2_share_choice
   local relay_uuid user_uuid pair_expires_minutes
   clear_screen
   printf '%s%s【给主服务器添加从服务器】%s\n\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
@@ -6113,7 +6573,20 @@ menu_pair_create() {
   hy2_up=0
   hy2_down=0
   if [[ "$hy2_enabled" == "y" ]]; then
-    hy2_port="$(prompt_port_value 'Hysteria2 UDP 端口' '28443')"
+    hy2_share_choice="$(prompt_bool '让从服务器 Hysteria2 使用 UDP 443（与 TCP 443 共用）' y)"
+    if [[ "$hy2_share_choice" == "y" ]]; then
+      printf '\n%s从服务器加入时将自动检测 nginx H3/QUIC。%s\n' \
+        "$C_YELLOW" "$C_RESET"
+      printf '如 UDP 443 被 nginx 占用，将备份配置、关闭 H3/QUIC、保留 TCP HTTPS，并在失败时回滚。\n'
+      if menu_confirm "确认让从服务器自动配置 UDP 443"; then
+        hy2_port=443
+        hy2_shared_udp443=true
+      else
+        hy2_port="$(prompt_port_value 'Hysteria2 UDP 端口' '28443')"
+      fi
+    else
+      hy2_port="$(prompt_port_value 'Hysteria2 UDP 端口' '28443')"
+    fi
     hy2_password="$(prompt_secret_default 'Hysteria2 用户密码' "$hy2_password")"
     hy2_obfs="$(prompt_secret_default 'Hysteria2 混淆密码' "$hy2_obfs")"
     hy2_masquerade="$(prompt_url_value 'Hysteria2 伪装网站' "$hy2_masquerade")"
@@ -6163,6 +6636,11 @@ menu_pair_create() {
   [[ "$xhttp_enabled" == "y" ]] && args+=(--xhttp-enabled) || args+=(--no-xhttp)
   [[ "$reality_enabled" == "y" ]] && args+=(--reality-enabled) || args+=(--no-reality)
   [[ "$hy2_enabled" == "y" ]] && args+=(--hy2-enabled) || args+=(--no-hy2)
+  if [[ "$hy2_shared_udp443" == "true" ]]; then
+    args+=(--hy2-share-udp443)
+  else
+    args+=(--hy2-no-share-udp443)
+  fi
   [[ -z "$public_host" ]] || args+=(--public-host "$public_host")
   if menu_exec cmd_pair_create "${args[@]}"; then
     printf '\n%s下一步只有一件事：%s\n' "$C_BOLD" "$C_RESET"
@@ -6248,6 +6726,7 @@ menu_health_check() {
   fi
 
   local failures=0 xray_config sing_config cert key mode nb role limited_count
+  local health_hy2_port health_hy2_shared listener_ok
   xray_config="$(jq -r '.xray.config_path' "$STATE_FILE")"
   sing_config="$(jq -r '.hysteria2.config_path' "$STATE_FILE")"
   cert="$(jq -r '.nginx.certificate' "$STATE_FILE")"
@@ -6329,12 +6808,24 @@ menu_health_check() {
   fi
 
   if [[ "$(jq -r '.hysteria2.enabled' "$STATE_FILE")" == "true" ]]; then
+    health_hy2_port="$(jq -r '.hysteria2.port' "$STATE_FILE")"
+    health_hy2_shared="$(jq -r '.hysteria2.shared_udp443 // false' "$STATE_FILE")"
+    listener_ok=1
+    if command -v ss >/dev/null 2>&1; then
+      if ! port_is_sing_box_owned udp "$health_hy2_port"; then
+        listener_ok=0
+      elif [[ "$health_hy2_shared" == "true" ]] &&
+           port_is_nginx_owned udp "$health_hy2_port"; then
+        listener_ok=0
+      fi
+    fi
     if systemctl is-active --quiet etxr-sing-box.service &&
        [[ -s "$sing_config" ]] &&
-       "$SING_BOX_BIN" check -c "$sing_config" >/dev/null 2>&1; then
-      health_result 1 "Hysteria2" "正在运行"
+       "$SING_BOX_BIN" check -c "$sing_config" >/dev/null 2>&1 &&
+       (( listener_ok )); then
+      health_result 1 "Hysteria2" "正在运行，UDP ${health_hy2_port}"
     else
-      health_result 0 "Hysteria2" "服务或配置异常"
+      health_result 0 "Hysteria2" "服务、配置或 UDP ${health_hy2_port} 监听异常"
       ((failures+=1))
     fi
   else
@@ -6500,4 +6991,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

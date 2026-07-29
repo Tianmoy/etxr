@@ -258,7 +258,7 @@ async def run() -> None:
             "build",
             "-buildvcs=false",
             "-ldflags",
-            "-s -w -X main.version=0.11.0",
+            "-s -w -X main.version=0.12.0",
             "-o",
             str(helper),
             "./cmd/etxr-dataplane",
@@ -272,7 +272,7 @@ async def run() -> None:
         )
         stdout, _ = await version.communicate()
         assert version.returncode == 0
-        assert stdout.decode().strip() == "0.11.0"
+        assert stdout.decode().strip() == "0.12.0"
         await exercise_limiter(helper, tmp)
         await exercise_meter(helper, tmp)
 

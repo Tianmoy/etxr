@@ -15,7 +15,7 @@ def main() -> int:
     text = SCRIPT.read_text(encoding="utf-8")
     assert text.startswith("#!/usr/bin/env bash\n")
     assert "set -Eeuo pipefail" in text
-    assert 'VERSION="0.11.0"' in text
+    assert 'VERSION="0.12.0"' in text
     assert "local expires_minutes=30 expires_at" in text
     assert "--expires-minutes" in text
 
@@ -33,6 +33,14 @@ def main() -> int:
     assert "grep -Evq '(^|[[:space:]])quic([[:space:];]|$)'" in text
     assert "aod.itunes.apple.com:443" in text
     assert "shared_tcp443" in text
+    assert "shared_udp443" in text
+    assert "--share-udp443" in text
+    assert "nginx_quic_active_manifest()" in text
+    assert "nginx_quic_disable_manifest()" in text
+    assert "nginx_quic_restore_backup()" in text
+    assert "verify_hy2_udp_listener()" in text
+    assert "# etxr-hy2-udp443:" in text
+    assert "普通 HTTPS、HTTP/2 和 TCP 443 保持不变" in text
     assert "'/^(Password|PublicKey):/" not in text
     assert "'/^Password/" in text
 

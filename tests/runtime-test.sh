@@ -127,10 +127,10 @@ if [[ -n "${ETXR_TEST_DATAPLANE_BIN:-}" ]]; then
 else
   need go
   (cd "$ROOT" && go build -buildvcs=false \
-    -ldflags '-s -w -X main.version=0.11.0' \
+    -ldflags '-s -w -X main.version=0.12.0' \
     -o "$DATAPLANE_BIN" ./cmd/etxr-dataplane)
 fi
-[[ "$("$DATAPLANE_BIN" version)" == "0.11.0" ]]
+[[ "$("$DATAPLANE_BIN" version)" == "0.12.0" ]]
 export ETXR_DATAPLANE_SOURCE="$DATAPLANE_BIN"
 export ETXR_DATAPLANE_BIN="$DATAPLANE_BIN"
 
@@ -402,7 +402,8 @@ grep -q '^hysteria2://' "$TMP/subscription.txt"
   --public-relay-port 30001 --public-listen-port 29000 \
   --xhttp-enabled --xhttp-port 30443 --xhttp-listen-port 30443 \
   --xhttp-path /b1-direct-xhttp \
-  --reality-port 18443 --hy2-port 28443 >"$TMP/pair-create.txt"
+  --reality-port 18443 --hy2-port 443 --hy2-share-udp443 \
+  >"$TMP/pair-create.txt"
 PAIR_ID="$(cat "$TMP/pairs/b1.id")"
 PAIR_FINGERPRINT="$(awk '/Pair 签名指纹/ {print $NF}' "$TMP/pair-create.txt")"
 [[ "$PAIR_FINGERPRINT" =~ ^[0-9A-F]{32}$ ]]
@@ -449,6 +450,8 @@ fi
     .relay.listen_port == 29000 and
     .direct.xhttp.enabled == true and
     .direct.xhttp.public_port == 30443 and
+    .direct.hysteria2.port == 443 and
+    .direct.hysteria2.shared_udp443 == true and
     (.control.base_url | test("^https://hk\\.example\\.com/[0-9a-f]{32}$")) and
     .control.node_id == "b1" and
     (.control.token | test("^[0-9a-f]{64}$"))
@@ -521,7 +524,9 @@ XRAY_BIN="$XRAY" SING_BOX_BIN="$SING_BOX" \
 "$JQ" -e '.easytier.peer == "192.0.2.10:11010"' "$WORKER/state.json" >/dev/null
 "$JQ" -e '
   (.xray.routes[] | select(.name == "b1-xhttp") | .allow_insecure) == true and
-  .hysteria2.insecure == true
+  .hysteria2.insecure == true and
+  .hysteria2.port == 443 and
+  .hysteria2.shared_udp443 == true
 ' "$WORKER/state.json" >/dev/null
 openssl x509 -in "$WORKER/certs/b1/fullchain.pem" -noout -ext subjectAltName |
   grep -Fq 'DNS:b1.example.com'
