@@ -84,6 +84,18 @@ grep -Fq '# etxr-hy2-udp443: add_header Alt-Svc' \
 nginx_quic_restore_backup "$TMP/backup"
 cmp "$TMP/original.conf" "$TMP/nginx/sites-enabled/site.conf"
 
+# TCP 443 migration keeps QUIC lines untouched and is independently reversible.
+tcp_manifest="$TMP/tcp443.manifest"
+nginx_tcp443_active_manifest "$tcp_manifest"
+[[ -s "$tcp_manifest" ]]
+nginx_tcp443_rebind_manifest "$tcp_manifest" "$TMP/tcp443-backup" 8443
+[[ "$NGINX_TCP443_CHANGED" -eq 1 ]]
+grep -Fq 'listen 127.0.0.1:8443 ssl; # etxr-tcp443: was public 443' \
+  "$TMP/nginx/sites-enabled/site.conf"
+grep -Fq 'listen 443 quic reuseport;' "$TMP/nginx/sites-enabled/site.conf"
+nginx_tcp443_restore_backup "$TMP/tcp443-backup"
+cmp "$TMP/original.conf" "$TMP/nginx/sites-enabled/site.conf"
+
 # A post-change nginx validation failure must restore every H3/QUIC line.
 mkdir -p "$TMP/tools" "$ETXR_SYSTEMD_UNIT_DIR"
 cat >"$XRAY_BIN" <<'EOF'
@@ -160,5 +172,172 @@ if nginx_quic_file_has_active "$TMP/nginx/sites-enabled/site.conf"; then
 fi
 grep -Fq 'listen 443 ssl;' "$TMP/nginx/sites-enabled/site.conf"
 find "$ETXR_BACKUPS" -path '*/nginx-quic/manifest' -type f | grep -q .
+
+# Shared Reality + HTTPS + HY2 changes TCP 443 and QUIC together. A validation
+# failure after both rewrites must restore the complete Baota vhost.
+nginx_quic_restore_backup "$TMP/backup"
+cmp "$TMP/original.conf" "$TMP/nginx/sites-enabled/site.conf"
+mkdir -p "$TMP/nginx/tcp" "$TMP/runtime/baota"
+FORCE=1
+cmd_init --name shared-worker --role exit --domain worker.example.com \
+  --address worker.example.com --nginx-mode snippet \
+  --snippet "$TMP/runtime/baota/etxr.conf" \
+  --nginx-shared-tcp443 true --nginx-auto-rebind-https true \
+  --nginx-https-listen-port 8443 \
+  --nginx-stream-path "$TMP/nginx/tcp/etxr.conf" \
+  --cert "$TMP/cert.pem" --key "$TMP/key.pem" \
+  --xray-config "$TMP/runtime/live/xray.json" \
+  --sing-box-config "$TMP/runtime/live/sing-box.json"
+FORCE=0
+cmd_user_add --name admin \
+  --uuid 11111111-1111-4111-8111-111111111111 \
+  --password TEST-HY2-PASSWORD >/dev/null
+state_update '
+  .xray.routes = [{
+    name: "shared-xhttp",
+    listen: "127.0.0.1",
+    port: 18000,
+    public_port: 443,
+    path: "/shared-xhttp",
+    target: "direct",
+    profile: "plain",
+    host: "",
+    decryption: "none",
+    client_encryption: "none",
+    flow: "",
+    direct: true,
+    security: "none",
+    certificate: "",
+    certificate_key: "",
+    allow_insecure: true
+  }] |
+  .xray.reality_inbounds = [{
+    name: "direct",
+    listen: "127.0.0.1",
+    port: 443,
+    listen_port: 18443,
+    path: "/shared-reality",
+    target: "aod.itunes.apple.com:443",
+    server_names: ["aod.itunes.apple.com"],
+    private_key: "TEST-PRIVATE",
+    public_key: "TEST-PUBLIC",
+    short_ids: ["0123456789abcdef"]
+  }] |
+  .hysteria2.enabled = true |
+  .hysteria2.port = 443 |
+  .hysteria2.shared_udp443 = true |
+  .hysteria2.obfs_password = "test-password" |
+  .hysteria2.masquerade = "https://worker.example.com"
+'
+nginx_supports_stream_preread() { return 0; }
+cat >"$TMP/tools/nginx" <<EOF
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "-t" ]] &&
+   grep -Fq 'etxr-tcp443' "$TMP/nginx/sites-enabled/site.conf" &&
+   grep -Fq 'etxr-hy2-udp443' "$TMP/nginx/sites-enabled/site.conf"; then
+  exit 1
+fi
+exit 0
+EOF
+chmod 755 "$TMP/tools/nginx"
+if (cmd_apply >/dev/null 2>&1); then
+  echo "shared 443 apply unexpectedly accepted nginx validation failure" >&2
+  exit 1
+fi
+cmp "$TMP/original.conf" "$TMP/nginx/sites-enabled/site.conf"
+[[ ! -e "$TMP/nginx/tcp/etxr.conf" ]]
+[[ ! -e "$TMP/runtime/baota/etxr.conf" ]]
+
+cat >"$TMP/tools/nginx" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod 755 "$TMP/tools/nginx"
+cmd_apply >/dev/null
+grep -Fq 'listen 127.0.0.1:8443 ssl;' \
+  "$TMP/nginx/sites-enabled/site.conf"
+if nginx_quic_file_has_active "$TMP/nginx/sites-enabled/site.conf"; then
+  echo "shared 443 apply left nginx H3/QUIC enabled" >&2
+  exit 1
+fi
+grep -Fq 'listen 443;' "$TMP/nginx/tcp/etxr.conf"
+grep -Fq 'aod.itunes.apple.com etxr_reality_0;' \
+  "$TMP/nginx/tcp/etxr.conf"
+grep -Fq 'proxy_pass http://127.0.0.1:18000;' \
+  "$TMP/runtime/baota/etxr.conf"
+find "$ETXR_BACKUPS" -path '*/nginx-tcp443/manifest' -type f | grep -q .
+
+# Standard nginx must also remove every newly written file when validation
+# fails after adding the dynamic stream loader.
+mkdir -p "$TMP/standard/conf.d" "$TMP/standard/modules-enabled" \
+  "$TMP/standard/stream-conf.d" "$TMP/standard/live"
+cat >"$TMP/standard/nginx.conf" <<'EOF'
+include /etc/nginx/modules-enabled/*.conf;
+events {}
+http {}
+EOF
+export ETXR_NGINX_SCAN_ROOTS="$TMP/standard/nginx.conf:$TMP/standard/conf.d"
+FORCE=1
+cmd_init --name standard-worker --role exit --domain standard.example.com \
+  --address standard.example.com --nginx-mode standalone \
+  --nginx-shared-tcp443 true --nginx-https-listen-port 8443 \
+  --nginx-stream-path "$TMP/standard/stream-conf.d/etxr.conf" \
+  --nginx-stream-loader-path "$TMP/standard/modules-enabled/99-etxr-stream.conf" \
+  --cert "$TMP/cert.pem" --key "$TMP/key.pem" \
+  --xray-config "$TMP/runtime/live/xray.json" \
+  --sing-box-config "$TMP/runtime/live/sing-box.json"
+FORCE=0
+state_update '
+  .nginx.standalone_path = $site |
+  .nginx.paths_path = $paths |
+  .nginx.web_root = $root |
+  .xray.reality_inbounds = [{
+    name: "direct",
+    listen: "127.0.0.1",
+    port: 443,
+    listen_port: 18443,
+    path: "/standard-reality",
+    target: "aod.itunes.apple.com:443",
+    server_names: ["aod.itunes.apple.com"],
+    private_key: "TEST-PRIVATE",
+    public_key: "TEST-PUBLIC",
+    short_ids: ["0123456789abcdef"]
+  }]
+' --arg site "$TMP/standard/conf.d/etxr.conf" \
+  --arg paths "$TMP/standard/live/nginx-paths.conf" \
+  --arg root "$TMP/standard/www"
+cmd_user_add --name admin \
+  --uuid 11111111-1111-4111-8111-111111111111 \
+  --password TEST-HY2-PASSWORD >/dev/null
+check_baota_shared_nginx_layout() { return 0; }
+cat >"$TMP/tools/nginx" <<EOF
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "-t" &&
+      -e "$TMP/standard/modules-enabled/99-etxr-stream.conf" ]]; then
+  exit 1
+fi
+exit 0
+EOF
+chmod 755 "$TMP/tools/nginx"
+if (cmd_apply >/dev/null 2>&1); then
+  echo "standard nginx apply unexpectedly accepted validation failure" >&2
+  exit 1
+fi
+[[ ! -e "$TMP/standard/conf.d/etxr.conf" ]]
+[[ ! -e "$TMP/standard/live/nginx-paths.conf" ]]
+[[ ! -e "$TMP/standard/stream-conf.d/etxr.conf" ]]
+[[ ! -e "$TMP/standard/modules-enabled/99-etxr-stream.conf" ]]
+
+cat >"$TMP/tools/nginx" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod 755 "$TMP/tools/nginx"
+cmd_apply >/dev/null
+[[ -f "$TMP/standard/conf.d/etxr.conf" ]]
+[[ -f "$TMP/standard/live/nginx-paths.conf" ]]
+[[ -f "$TMP/standard/stream-conf.d/etxr.conf" ]]
+grep -Fq 'stream {' \
+  "$TMP/standard/modules-enabled/99-etxr-stream.conf"
 
 printf 'nginx-quic-test: PASS\n'

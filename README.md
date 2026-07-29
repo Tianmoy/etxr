@@ -1,11 +1,11 @@
-# ETXR v0.12.2
+# ETXR v0.13.0
 
 ETXR 是面向 Debian 12 空白系统的一站式中文菜单脚本，用一份脚本安装主服务器或任意数量的从服务器。它管理 Xray、sing-box、EasyTier、订阅和用户配置，并可复用宝塔 nginx 的 TCP 443。
 
 ## 主要能力
 
 - 主服务器：VLESS + XHTTP + nginx TLS，可选 Reality + XHTTP、Hysteria2；HY2 可用 UDP 443 与网站的 TCP 443 共存。
-- 从服务器：可选 XHTTP + TLS、Reality + XHTTP、Hysteria2。
+- 从服务器：粘贴 Pair ID 后在本机选择 XHTTP + TLS、Reality + XHTTP、Hysteria2；TCP/UDP 443 均可共用。
 - 主从中继：VLESS Encryption + Vision + RAW。
 - 公网中继可用时优先直连，探测失败后回退 EasyTier。
 - 没有公网端口的从服务器只使用 EasyTier。
@@ -45,6 +45,8 @@ flowchart LR
 - 检测到宝塔时复用 `/www/server/nginx/sbin/nginx`，不会安装第二套 nginx。
 - 宝塔模式可选用 `stream_ssl_preread` 按 SNI 共享 TCP 443：Reality 进入本机 Xray，其他域名进入宝塔 HTTPS。
 - Hysteria2 可选择 UDP 443。确认后会自动备份并关闭 nginx QUIC/HTTP3，但保留 HTTPS、HTTP/2 和 TCP 443。
+- 从服务器的 Reality 密钥只在从服务器本机生成，不由主服务器生成或下发。
+- 无宝塔时按需安装 Debian nginx 和 `libnginx-mod-stream`；有宝塔时只复用宝塔 nginx。
 
 ## 启动菜单
 
@@ -66,7 +68,7 @@ chmod +x etxr.sh
 0. 退出
 ```
 
-所有可填写项都提供默认值。直接回车使用默认值；域名、Path、UUID、URL、带宽和端口会在输入后检查。主服务器本机端口还会检查占用，宝塔 nginx 已监听的 HTTPS 端口允许共用。
+所有可填写项都提供默认值。直接回车使用默认值；域名、Path、UUID、URL、带宽和端口会在输入后检查。主服务器和从服务器都在本机检查协议监听端口，宝塔 nginx 已监听的 HTTPS 443 可按向导共用。
 
 ## 安装主服务器
 
@@ -146,7 +148,7 @@ nginx 的 QUIC/HTTP3 也使用 UDP 443，因此二者不能同时监听。选择
 
 ## 添加从服务器
 
-在主服务器选择主菜单 `3`，先选择线路类型：
+在主服务器选择主菜单 `3`。这里仅配置主从中继，先选择线路类型：
 
 ```text
 1. 普通/NAT/被墙机器，没有可用端口：仅 EasyTier
@@ -154,22 +156,41 @@ nginx 的 QUIC/HTTP3 也使用 UDP 443，因此二者不能同时监听。选择
 3. 普通/NAT/被墙机器，有端口映射：公网映射优先，EasyTier 自动备用
 ```
 
-向导会询问 EasyTier 私网中继端口、主从中继 UUID，以及公网线路需要的外部和内部端口。然后分别询问：
+主服务器向导只询问：
 
 ```text
-从服务器 XHTTP + TLS [y/N]
-从服务器 Reality + XHTTP [Y/n]
-从服务器 Hysteria2 [Y/n]
-Hysteria2 使用 UDP 443 [Y/n]
-直接入口 UUID [随机]
-各协议端口、Path、密码、Short ID、伪装目标和带宽
+从服务器名称
+Pair ID 有效期 [30 分钟]
+线路类型
+EasyTier 私网中继端口
+主从中继 UUID
+公网线路外部端口和从服务器实际监听端口（仅线路 2/3）
 ```
 
-从服务器端口只校验格式，因为主服务器看不到从服务器本机占用。NAT 模式会显示需要在服务商面板建立的 TCP/UDP 映射。
+NAT 模式会显示需要在服务商面板建立的主从中继 TCP 映射。协议入口不在主服务器填写，避免主服务器误判从服务器端口、宝塔和证书状态。
 
-最后会生成一个 `ER2...` 配对 ID 和 32 位签名指纹。到从服务器运行同一脚本，选择主菜单 `2`，粘贴配对 ID 并核对指纹。Xray、sing-box、EasyTier、控制 Agent、systemd 服务和所选协议会一次安装完成。
+最后会生成一个 `ER2...` 配对 ID 和 32 位签名指纹。到从服务器运行同一脚本，选择主菜单 `2`，粘贴 Pair ID 并核对指纹。验签和有效期检查通过后，从服务器现场询问：
 
-配对 ID 包含 EasyTier 网络密钥、控制令牌和协议凭据，默认 30 分钟有效，不应公开。Pair 私钥只保存在主服务器，Pair ID 本身不能重新计算有效签名。
+```text
+已解析到从服务器的域名
+客户端连接地址
+XHTTP + TLS [y/N]
+Reality + XHTTP [Y/n]
+Hysteria2 [Y/n]
+XHTTP、Reality、网站是否共用 TCP 443 [Y/n]
+Hysteria2 是否使用 UDP 443 [Y/n]
+Path、本地端口、Reality 目标/SNI/Short ID
+Hysteria2 混淆密码、伪装网站和总带宽
+证书与私钥路径
+```
+
+有宝塔时使用当前域名的宝塔证书和扩展目录。选择 Reality 共用 TCP 443 后，脚本会先列出操作，确认后备份所有宝塔 HTTPS vhost，把公开 TCP 443 改为统一的内部 HTTPS 端口，再通过 `stream_ssl_preread` 按 SNI 分流。nginx 检查、reload 或服务启动失败时会恢复 vhost、stream 文件和服务状态。
+
+没有宝塔时会安装 Debian nginx 与 stream 模块。仅 XHTTP 共用 443 时由 HTTPS Path 分流；同时启用 Reality 时，公网 TCP 443 由 stream 接收，Reality SNI 进入本机 Xray，其他 SNI 进入内部 nginx HTTPS。Hysteria2 使用独立的 UDP 443。
+
+证书与私钥存在、未过期、匹配且包含当前域名时直接使用。缺失或无效时生成自签证书，并在生成的 XHTTP/HY2 订阅中自动加入跳过证书校验参数。
+
+Pair ID 包含 EasyTier 网络密钥、控制令牌和当前用户配置，默认 30 分钟有效，不应公开。菜单流程不在 Pair ID 中携带从服务器 Reality 私钥。Pair 私钥只保存在主服务器，Pair ID 本身不能重新计算有效签名。
 
 ## 自动配置下发
 
@@ -257,6 +278,11 @@ Hysteria2 协议设置里的总上传/下载 Mbps 仍是整条共享 HY2 入站�
 /var/lib/etxr/subscriptions/
 /var/lib/etxr/usage.json
 
+# 无宝塔且启用 Reality TCP 443 共用时
+/etc/nginx/conf.d/etxr.conf
+/etc/nginx/modules-enabled/99-etxr-stream.conf
+/etc/nginx/stream-conf.d/etxr.conf
+
 /etc/systemd/system/etxr-xray.service
 /etc/systemd/system/etxr-sing-box.service
 /etc/systemd/system/etxr-easytier.service
@@ -315,7 +341,7 @@ checksums.txt
 
 脚本先校验 SHA-256 和二进制内置版本，再通过同目录临时文件原子替换；旧二进制保存在 `/etc/etxr/backups/dataplane-binary/`，失败时自动恢复。镜像站可将 `ETXR_DOWNLOAD_BASE` 设置为包含上述三个文件的 HTTPS 目录。
 
-推送 `v0.12.2` 形式的 Git 标签后，GitHub Actions 会运行完整测试、交叉编译两个 Linux 架构并创建 Release。构建使用 `CGO_ENABLED=0`，目标机不需要额外运行库。
+推送 `v0.13.0` 形式的 Git 标签后，GitHub Actions 会运行完整测试、交叉编译两个 Linux 架构并创建 Release。构建使用 `CGO_ENABLED=0`，目标机不需要额外运行库。
 
 ## 许可证
 

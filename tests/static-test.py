@@ -15,7 +15,7 @@ def main() -> int:
     text = SCRIPT.read_text(encoding="utf-8")
     assert text.startswith("#!/usr/bin/env bash\n")
     assert "set -Eeuo pipefail" in text
-    assert 'VERSION="0.12.2"' in text
+    assert 'VERSION="0.13.0"' in text
     assert "local expires_minutes=30 expires_at" in text
     assert "--expires-minutes" in text
 
@@ -38,6 +38,12 @@ def main() -> int:
     assert "nginx_quic_active_manifest()" in text
     assert "nginx_quic_disable_manifest()" in text
     assert "nginx_quic_restore_backup()" in text
+    assert "nginx_tcp443_active_manifest()" in text
+    assert "nginx_tcp443_rebind_manifest()" in text
+    assert "nginx_tcp443_restore_backup()" in text
+    assert "render_nginx_stream_loader()" in text
+    assert "/etc/nginx/modules-enabled/99-etxr-stream.conf" in text
+    assert "libnginx-mod-stream" in text
     assert "verify_hy2_udp_listener()" in text
     assert "# etxr-hy2-udp443:" in text
     assert "普通 HTTPS、HTTP/2 和 TCP 443 保持不变" in text
@@ -62,6 +68,12 @@ def main() -> int:
     assert 'key == "SHA256" || key == "SHA2256"' in text
     assert "sing-box release 没有可用的 SHA256 摘要" in text
     assert "prompt_port_checked()" in text
+    assert "prompt_worker_direct_config()" in text
+    assert "--configure-direct" in text
+    assert "--direct-config-file" in text
+    assert "tls_certificate_is_usable()" in text
+    assert "tls_certificate_matches_name()" in text
+    assert "协议、域名、证书、Path 和 443 共用全部在从服务器上选择" in text
     assert "第一次安装：这台是主服务器" in text
     assert "第一次安装：这台是从服务器" in text
     assert "这台是 A" not in text

@@ -544,6 +544,102 @@ ETXR_SUBSCRIPTIONS="$WORKER/subscriptions" \
 XRAY_BIN="$XRAY" SING_BOX_BIN="$SING_BOX" \
   "$EDGE" validate >/dev/null
 
+# The worker can ignore legacy direct-protocol values in the Pair ID and
+# configure XHTTP, Reality, HY2, certificates, and shared 443 locally.
+LOCAL_WORKER="$TMP/local-worker"
+LOCAL_DIRECT="$TMP/local-worker-direct.json"
+cat >"$LOCAL_DIRECT" <<'EOF'
+{
+  "domain": "worker.example.com",
+  "address": "worker.example.com",
+  "nginx": {
+    "mode": "standalone",
+    "tls_port": 443,
+    "https_listen_port": 8443,
+    "shared_tcp443": true,
+    "auto_rebind_https": false,
+    "certificate": "",
+    "certificate_key": "",
+    "snippet_path": ""
+  },
+  "xhttp": {
+    "enabled": true,
+    "public_port": 443,
+    "listen_port": 18000,
+    "path": "/worker-local-xhttp",
+    "behind_nginx": true
+  },
+  "reality": {
+    "enabled": true,
+    "port": 443,
+    "listen_port": 18443,
+    "path": "/worker-local-reality",
+    "target": "aod.itunes.apple.com:443",
+    "server_name": "aod.itunes.apple.com",
+    "short_id": "0123456789abcdef"
+  },
+  "hysteria2": {
+    "enabled": true,
+    "port": 443,
+    "shared_udp443": true,
+    "obfs_password": "LOCAL-HY2-OBFS",
+    "masquerade": "https://worker.example.com",
+    "up_mbps": 0,
+    "down_mbps": 0
+  }
+}
+EOF
+ETXR_STATE="$LOCAL_WORKER/state.json" \
+ETXR_RUNTIME="$LOCAL_WORKER" \
+ETXR_GENERATED="$LOCAL_WORKER/generated" \
+ETXR_SUBSCRIPTIONS="$LOCAL_WORKER/subscriptions" \
+XRAY_BIN="$XRAY" SING_BOX_BIN="$SING_BOX" \
+  "$EDGE" pair join --prepare-only --direct-config-file "$LOCAL_DIRECT" \
+    --fingerprint "$PAIR_FINGERPRINT" "$PAIR_ID" \
+    >"$TMP/local-worker-join.txt"
+"$XRAY" run -test -config "$LOCAL_WORKER/generated/xray.json"
+"$SING_BOX" check -c "$LOCAL_WORKER/generated/sing-box.json"
+"$JQ" -e '
+  .node.domain == "worker.example.com" and
+  .nginx.mode == "standalone" and
+  .nginx.shared_tcp443 == true and
+  .nginx.https_listen_port == 8443 and
+  (.xray.routes[] | select(
+    .name == "b1-xhttp" and
+    .listen == "127.0.0.1" and
+    .port == 18000 and
+    .public_port == 443 and
+    .security == "none" and
+    .allow_insecure == true
+  )) and
+  (.xray.reality_inbounds[] | select(
+    .port == 443 and
+    .listen == "127.0.0.1" and
+    .listen_port == 18443 and
+    .path == "/worker-local-reality"
+  )) and
+  .hysteria2.port == 443 and
+  .hysteria2.shared_udp443 == true and
+  .hysteria2.insecure == true
+' "$LOCAL_WORKER/state.json" >/dev/null
+PAIR_REALITY_PUBLIC="$("$EDGE" pair decode "$PAIR_ID" |
+  "$JQ" -r '.direct.reality.public_key')"
+LOCAL_REALITY_PUBLIC="$("$JQ" -r \
+  '.xray.reality_inbounds[0].public_key' "$LOCAL_WORKER/state.json")"
+[[ -n "$LOCAL_REALITY_PUBLIC" && "$LOCAL_REALITY_PUBLIC" != "$PAIR_REALITY_PUBLIC" ]]
+grep -Fq 'listen 127.0.0.1:8443 ssl;' \
+  "$LOCAL_WORKER/generated/nginx-standalone.conf"
+grep -Fq 'listen 443;' "$LOCAL_WORKER/generated/nginx-stream.conf"
+grep -Fq 'server 127.0.0.1:18443;' \
+  "$LOCAL_WORKER/generated/nginx-stream.conf"
+grep -Fq 'stream {' "$LOCAL_WORKER/generated/nginx-stream-loader.conf"
+grep -Fq 'proxy_pass http://127.0.0.1:18000;' \
+  "$LOCAL_WORKER/generated/nginx-paths.conf"
+openssl x509 -in "$LOCAL_WORKER/certs/b1/fullchain.pem" -noout \
+  -checkhost worker.example.com >/dev/null
+grep -Fq 'allowInsecure=1' "$TMP/local-worker-join.txt"
+grep -Fq 'insecure=1' "$TMP/local-worker-join.txt"
+
 # Invalid control-plane user data must be rejected without changing state.
 cp "$WORKER/state.json" "$TMP/worker-state-before-invalid-control.json"
 BAD_CONTROL_USERS="$("$JQ" '.users[0].subscription_token = "../../etc/passwd"' \
