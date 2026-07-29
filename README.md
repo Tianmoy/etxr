@@ -1,4 +1,4 @@
-# ETXR v0.13.1
+# ETXR v0.13.2
 
 ETXR 是面向 Debian 12 空白系统的一站式中文菜单脚本，用一份脚本安装主服务器或任意数量的从服务器。它管理 Xray、sing-box、EasyTier、订阅和用户配置，并可复用宝塔 nginx 的 TCP 443。
 
@@ -65,8 +65,11 @@ chmod +x etxr.sh
 5. 直接复制当前订阅
 6. 一键检查与修复
 7. 高级设置
+8. 检查并更新 ETXR
 0. 退出
 ```
+
+菜单 `8` 会从 GitHub 最新正式 Release 下载 `etxr.sh` 和 `checksums.txt`，同时强制校验两个文件的 Release API 摘要、SHA-256、脚本版本和 Bash 语法，然后原子更新 `/usr/local/sbin/etxr`、匹配版本的 Go 数据面和控制组件。更新前自动备份旧文件；校验、安装或相关服务重启失败时自动恢复。用户、线路、订阅和主从配置不会被删除，也不会把开发版本自动降级到较旧的正式版。
 
 所有可填写项都提供默认值。直接回车使用默认值；域名、Path、UUID、URL、带宽和端口会在输入后检查。主服务器和从服务器都在本机检查协议监听端口，宝塔 nginx 已监听的 HTTPS 443 可按向导共用。
 
@@ -186,6 +189,8 @@ Pair ID 可使用多少分钟 [30]
 ```
 
 `19000` 和 `29000` 是两条不同线路在从服务器上的监听端口，必须不同：`19000` 只监听 EasyTier 私网，`29000` 用于公网优先线路。手机或电脑上的代理客户端不会连接这两个端口。协议入口不在主服务器填写，避免主服务器误判从服务器端口、宝塔和证书状态。
+
+从服务器的 EasyTier 私网 IP 自动继承主服务器所在的 `/24` 网段。例如主服务器是 `10.18.8.1`，第一台、第二台从服务器会依次使用 `10.18.8.11`、`10.18.8.12`；不会切换到另一个 `10.100.0.0/24` 网段。
 
 最后会生成一个 `ER2...` 配对 ID 和 32 位签名指纹。到从服务器运行同一脚本，选择主菜单 `2`，粘贴 Pair ID 并核对指纹。验签和有效期检查通过后，从服务器现场询问：
 
@@ -357,12 +362,13 @@ tools/shellcheck-unpack/shellcheck-v0.11.0/shellcheck \
 ```text
 etxr-dataplane-linux-amd64
 etxr-dataplane-linux-arm64
+etxr.sh
 checksums.txt
 ```
 
-脚本先校验 SHA-256 和二进制内置版本，再通过同目录临时文件原子替换；旧二进制保存在 `/etc/etxr/backups/dataplane-binary/`，失败时自动恢复。镜像站可将 `ETXR_DOWNLOAD_BASE` 设置为包含上述三个文件的 HTTPS 目录。
+脚本先校验 SHA-256 和二进制内置版本，再通过同目录临时文件原子替换；旧二进制保存在 `/etc/etxr/backups/dataplane-binary/`，失败时自动恢复。镜像站可将 `ETXR_DOWNLOAD_BASE` 设置为包含两个数据面二进制和 `checksums.txt` 的 HTTPS 目录。
 
-推送 `v0.13.1` 形式的 Git 标签后，GitHub Actions 会运行完整测试、交叉编译两个 Linux 架构并创建 Release。构建使用 `CGO_ENABLED=0`，目标机不需要额外运行库。
+推送 `v0.13.2` 形式的 Git 标签后，GitHub Actions 会运行完整测试、交叉编译两个 Linux 架构并创建 Release。构建使用 `CGO_ENABLED=0`，目标机不需要额外运行库。
 
 ## 许可证
 

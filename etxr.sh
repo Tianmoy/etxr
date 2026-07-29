@@ -2,7 +2,9 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.13.1"
+VERSION="0.13.2"
+ETXR_REPOSITORY="${ETXR_REPOSITORY:-Tianmoy/etxr}"
+ETXR_RELEASE_API="${ETXR_RELEASE_API:-https://api.github.com/repos/${ETXR_REPOSITORY}/releases/latest}"
 
 STATE_FILE="${ETXR_STATE:-/etc/etxr/state.json}"
 RUNTIME_DIR="${ETXR_RUNTIME:-/etc/etxr}"
@@ -12,6 +14,7 @@ SUBSCRIPTION_DIR="${ETXR_SUBSCRIPTIONS:-/var/lib/etxr/subscriptions}"
 CONTROL_DIR="${ETXR_CONTROL_DIR:-${RUNTIME_DIR}/control}"
 CONTROL_HELPER="${ETXR_CONTROL_HELPER:-/usr/local/lib/etxr/control.py}"
 CONTROL_PORT="${ETXR_CONTROL_PORT:-18180}"
+SELF_BIN="${ETXR_SELF_BIN:-/usr/local/sbin/etxr}"
 DATAPLANE_BIN="${ETXR_DATAPLANE_BIN:-/usr/local/bin/etxr-dataplane}"
 DATAPLANE_DOWNLOAD_BASE="${ETXR_DOWNLOAD_BASE:-https://github.com/Tianmoy/etxr/releases/download/v${VERSION}}"
 LIMITER_CONFIG="${ETXR_LIMITER_CONFIG:-${RUNTIME_DIR}/live/limits.json}"
@@ -86,6 +89,7 @@ Commands:
   backup
   status
   xray status|start|stop|restart|logs|follow|monitor|check-update|update
+  self status|check-update|update
   cluster master-init
   pair create|join|list|remove
   control apply|status
@@ -4470,6 +4474,96 @@ github_asset_sha256() {
   fi
 }
 
+fetch_etxr_release_api() {
+  need_cmd curl
+  curl --proto '=https' --tlsv1.2 -fsSL \
+    --connect-timeout 15 --max-time 120 --retry 3 --retry-delay 2 \
+    "$ETXR_RELEASE_API"
+}
+
+etxr_release_version_from_api() {
+  local api_json="$1" tag
+  tag="$(jq -r '.tag_name // empty' <<<"$api_json")"
+  [[ "$tag" =~ ^v[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ ]] ||
+    die "GitHub 最新 ETXR Release 标签无效：${tag:-未找到}"
+  printf '%s\n' "${tag#v}"
+}
+
+etxr_version_compare() {
+  local left="$1" right="$2"
+  local left_major left_minor left_patch right_major right_minor right_patch
+  [[ "$left" =~ ^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ ]] ||
+    die "无效的 ETXR 版本号：$left"
+  [[ "$right" =~ ^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ ]] ||
+    die "无效的 ETXR 版本号：$right"
+  IFS=. read -r left_major left_minor left_patch <<<"$left"
+  IFS=. read -r right_major right_minor right_patch <<<"$right"
+  left_major=$((10#$left_major))
+  left_minor=$((10#$left_minor))
+  left_patch=$((10#$left_patch))
+  right_major=$((10#$right_major))
+  right_minor=$((10#$right_minor))
+  right_patch=$((10#$right_patch))
+  if (( left_major != right_major )); then
+    (( left_major < right_major )) && printf '%s\n' -1 || printf '%s\n' 1
+  elif (( left_minor != right_minor )); then
+    (( left_minor < right_minor )) && printf '%s\n' -1 || printf '%s\n' 1
+  elif (( left_patch != right_patch )); then
+    (( left_patch < right_patch )) && printf '%s\n' -1 || printf '%s\n' 1
+  else
+    printf '%s\n' 0
+  fi
+}
+
+etxr_latest_version() {
+  local api
+  need_jq
+  api="$(fetch_etxr_release_api)"
+  etxr_release_version_from_api "$api"
+}
+
+download_etxr_release_script() {
+  local destination="$1" api version script_url checksums_url
+  local expected api_expected checksums_api_expected actual checksums_actual
+  need_cmd curl
+  need_cmd sha256sum
+  need_jq
+  mkdir -p "$destination"
+  api="$(fetch_etxr_release_api)"
+  version="$(etxr_release_version_from_api "$api")"
+  script_url="$(jq -r '[.assets[] | select(.name == "etxr.sh") | .browser_download_url][0] // empty' <<<"$api")"
+  checksums_url="$(jq -r '[.assets[] | select(.name == "checksums.txt") | .browser_download_url][0] // empty' <<<"$api")"
+  [[ "$script_url" == https://* ]] || die "ETXR Release 缺少 etxr.sh 下载地址"
+  [[ "$checksums_url" == https://* ]] || die "ETXR Release 缺少 checksums.txt 下载地址"
+
+  curl --proto '=https' --tlsv1.2 -fL --retry 3 --retry-delay 2 \
+    "$checksums_url" -o "$destination/checksums.txt"
+  curl --proto '=https' --tlsv1.2 -fL --retry 3 --retry-delay 2 \
+    "$script_url" -o "$destination/etxr.sh"
+
+  checksums_api_expected="$(github_asset_sha256 "$api" checksums.txt)"
+  checksums_actual="$(sha256sum "$destination/checksums.txt" | awk '{print $1}')"
+  [[ "$checksums_api_expected" =~ ^[0-9a-fA-F]{64}$ ]] ||
+    die "GitHub Release API 没有提供 checksums.txt 的 SHA256"
+  [[ "${checksums_api_expected,,}" == "${checksums_actual,,}" ]] ||
+    die "ETXR checksums.txt 与 GitHub Release API 的 SHA256 不一致"
+  expected="$(awk '$2 == "etxr.sh" || $2 == "*etxr.sh" {print $1; exit}' \
+    "$destination/checksums.txt")"
+  api_expected="$(github_asset_sha256 "$api" etxr.sh)"
+  actual="$(sha256sum "$destination/etxr.sh" | awk '{print $1}')"
+  [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] ||
+    die "ETXR checksums.txt 中没有 etxr.sh 的 SHA256"
+  [[ "${expected,,}" == "${actual,,}" ]] || die "ETXR 脚本 SHA256 校验失败"
+  [[ "$api_expected" =~ ^[0-9a-fA-F]{64}$ ]] ||
+    die "GitHub Release API 没有提供 etxr.sh 的 SHA256"
+  [[ "${api_expected,,}" == "${actual,,}" ]] ||
+    die "ETXR 脚本与 GitHub Release API 的 SHA256 不一致"
+  bash -n "$destination/etxr.sh" || die "下载的 ETXR 脚本语法检查失败"
+  [[ "$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$destination/etxr.sh")" == "$version" ]] ||
+    die "ETXR Release 标签与脚本版本不一致"
+  printf '%s\n' "$version" >"$destination/VERSION"
+}
+
 download_xray_release() {
   local destination="$1"
   local arch api version asset_name url dgst_url
@@ -4629,7 +4723,7 @@ cmd_install() {
     [[ ",$components," != *,sing-box,* ]] || log "Would download and verify official latest sing-box"
     [[ ",$components," != *,easytier,* ]] || log "Would download and verify official latest EasyTier"
     [[ ",$components," != *,dataplane,* ]] || log "Would download and verify ETXR Go data plane ${VERSION}"
-    log "Would install this script as /usr/local/sbin/etxr"
+    log "Would install this script as $SELF_BIN"
     return
   fi
   need_root
@@ -4643,14 +4737,166 @@ cmd_install() {
   [[ ",$components," != *,sing-box,* ]] || install_sing_box
   [[ ",$components," != *,easytier,* ]] || install_easytier
   [[ ",$components," != *,dataplane,* ]] || install_data_helper
-  if [[ "$(readlink -f "$0")" != "$(readlink -f /usr/local/sbin/etxr 2>/dev/null || true)" ]]; then
-    install -m 755 "$0" /usr/local/sbin/etxr
+  if [[ "$(readlink -f "$0")" != "$(readlink -f "$SELF_BIN" 2>/dev/null || true)" ]]; then
+    ensure_parent "$SELF_BIN"
+    install -m 755 "$0" "$SELF_BIN"
   else
-    chmod 755 /usr/local/sbin/etxr
+    chmod 755 "$SELF_BIN"
   fi
   install_control_helper
   mkdir -p "$RUNTIME_DIR" "$GENERATED_DIR" "$BACKUP_DIR" "$SUBSCRIPTION_DIR"
   log "Installed etxr command"
+}
+
+etxr_installed_version() {
+  local installed
+  if [[ ! -f "$SELF_BIN" ]]; then
+    printf '未安装'
+    return
+  fi
+  installed="$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$SELF_BIN" | head -n 1)"
+  if [[ "$installed" =~ ^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ ]]; then
+    printf '%s' "$installed"
+  else
+    printf '未知'
+  fi
+}
+
+cmd_self_status() {
+  printf '当前正在运行的 ETXR：%s\n' "$VERSION"
+  printf '服务器已安装的 ETXR：%s\n' "$(etxr_installed_version)"
+  printf '脚本位置：%s\n' "$SELF_BIN"
+  if [[ -x "$DATAPLANE_BIN" ]]; then
+    printf 'Go 数据面版本：%s\n' "$($DATAPLANE_BIN version 2>/dev/null || printf '未知')"
+  else
+    printf 'Go 数据面版本：未安装\n'
+  fi
+}
+
+cmd_self_check_update() {
+  local latest comparison installed
+  latest="$(etxr_latest_version)"
+  installed="$(etxr_installed_version)"
+  comparison="$(etxr_version_compare "$VERSION" "$latest")"
+  cmd_self_status
+  printf 'GitHub 最新 Release：%s\n' "$latest"
+  if [[ "$comparison" == 0 && "$installed" == "$latest" ]]; then
+    printf '%sETXR 已经是最新版本。%s\n' "$C_GREEN" "$C_RESET"
+  elif [[ "$comparison" == 1 ]]; then
+    printf '%s当前运行的是比 GitHub 正式版更新的开发版本，不会自动降级。%s\n' \
+      "$C_YELLOW" "$C_RESET"
+  else
+    printf '%s发现 ETXR 新版本，可以执行一键更新。%s\n' "$C_YELLOW" "$C_RESET"
+  fi
+}
+
+self_update_restore_file() {
+  local backup="$1" target="$2"
+  if [[ -e "$backup" ]]; then
+    ensure_parent "$target"
+    cp -a "$backup" "$target"
+  else
+    rm -f "$target"
+  fi
+}
+
+restart_previously_active_etxr_services() {
+  local manifest="$1" service
+  command -v systemctl >/dev/null 2>&1 || return 0
+  while IFS= read -r service; do
+    [[ -n "$service" ]] || continue
+    systemctl restart "$service" || return 1
+  done <"$manifest"
+}
+
+cmd_self_update() {
+  need_root
+  need_cmd curl
+  need_cmd sha256sum
+  need_jq
+  local tmp latest stamp backup_dir service manifest installed comparison
+  local install_ok=0
+  tmp="$(mktemp -d)"
+  download_etxr_release_script "$tmp"
+  latest="$(cat "$tmp/VERSION")"
+  installed="$(etxr_installed_version)"
+  comparison="$(etxr_version_compare "$VERSION" "$latest")"
+  printf '当前运行版本：%s\n服务器安装版本：%s\n目标版本：%s\n' \
+    "$VERSION" "$installed" "$latest"
+  if [[ "$comparison" == 1 && "$FORCE" -ne 1 ]]; then
+    rm -rf "$tmp"
+    die "当前运行版本比 GitHub 最新正式版更新；如确需降级，请加 --force"
+  fi
+  if [[ "$installed" =~ ^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ ]] &&
+     [[ "$(etxr_version_compare "$installed" "$latest")" == 1 ]] &&
+     [[ "$FORCE" -ne 1 ]]; then
+    rm -rf "$tmp"
+    die "服务器已安装版本比 GitHub 最新正式版更新；如确需降级，请加 --force"
+  fi
+  if [[ "$VERSION" == "$latest" && "$installed" == "$latest" && "$FORCE" -ne 1 ]]; then
+    rm -rf "$tmp"
+    log "ETXR is already up to date"
+    return
+  fi
+  confirm "确认更新 ETXR 脚本、Go 数据面和控制组件" || {
+    rm -rf "$tmp"
+    return
+  }
+
+  if [[ -f "$STATE_FILE" ]]; then
+    ETXR_SELF_BIN="$SELF_BIN" "$tmp/etxr.sh" --state "$STATE_FILE" validate
+  fi
+
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  backup_dir="$BACKUP_DIR/self-update/${installed}-to-${latest}-${stamp}"
+  mkdir -p "$backup_dir"
+  [[ ! -e "$SELF_BIN" ]] || cp -a "$SELF_BIN" "$backup_dir/etxr"
+  [[ ! -e "$DATAPLANE_BIN" ]] || cp -a "$DATAPLANE_BIN" "$backup_dir/etxr-dataplane"
+  [[ ! -e "$CONTROL_HELPER" ]] || cp -a "$CONTROL_HELPER" "$backup_dir/control.py"
+  manifest="$backup_dir/active-services"
+  : >"$manifest"
+  if command -v systemctl >/dev/null 2>&1; then
+    for service in etxr-control.service etxr-agent.service \
+      etxr-limiter.service etxr-meter.service; do
+      systemctl is-active --quiet "$service" 2>/dev/null && printf '%s\n' "$service" >>"$manifest"
+    done
+  fi
+
+  ensure_parent "$SELF_BIN"
+  install -m 755 "$tmp/etxr.sh" "${SELF_BIN}.new"
+  mv -f "${SELF_BIN}.new" "$SELF_BIN"
+  if ETXR_SELF_BIN="$SELF_BIN" ETXR_DATAPLANE_BIN="$DATAPLANE_BIN" \
+      ETXR_CONTROL_HELPER="$CONTROL_HELPER" ETXR_RUNTIME="$RUNTIME_DIR" \
+      ETXR_BACKUPS="$BACKUP_DIR" "$SELF_BIN" install --components dataplane &&
+     [[ "$($SELF_BIN version 2>/dev/null || true)" == "$latest" ]] &&
+     [[ "$($DATAPLANE_BIN version 2>/dev/null || true)" == "$latest" ]] &&
+     restart_previously_active_etxr_services "$manifest"; then
+    install_ok=1
+  fi
+
+  if (( ! install_ok )); then
+    warn "ETXR 更新检查或服务重启失败，正在恢复旧版本"
+    self_update_restore_file "$backup_dir/etxr" "$SELF_BIN"
+    self_update_restore_file "$backup_dir/etxr-dataplane" "$DATAPLANE_BIN"
+    self_update_restore_file "$backup_dir/control.py" "$CONTROL_HELPER"
+    restart_previously_active_etxr_services "$manifest" || true
+    rm -rf "$tmp"
+    die "ETXR 更新失败，已恢复更新前版本"
+  fi
+  rm -rf "$tmp"
+  log "ETXR updated: $installed -> $latest"
+  printf '%s更新完成。重新进入菜单后会显示 v%s。%s\n' \
+    "$C_GREEN" "$latest" "$C_RESET"
+}
+
+cmd_self() {
+  local action="${1:-status}"
+  case "$action" in
+    status) cmd_self_status ;;
+    check-update) cmd_self_check_update ;;
+    update) cmd_self_update ;;
+    *) die "Usage: etxr self status|check-update|update" ;;
+  esac
 }
 
 xray_current_version() {
@@ -4980,10 +5226,22 @@ pair_decode() {
 
 validate_pair_bundle() {
   jq -e '
+    def valid_overlay_ipv4:
+      type == "string" and
+      (split(".") | length == 4 and
+        all(.[]; test("^[0-9]{1,3}$") and
+          ((tonumber) >= 0 and (tonumber) <= 255))) and
+      ((split(".")[-1] | tonumber) >= 1 and
+       (split(".")[-1] | tonumber) <= 254);
+    def subnet24:
+      split(".")[0:3] | join(".");
     (.version == 2) and
     (.expires_at | type == "number") and
     (.worker.name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")) and
-    (.worker.easytier_ip | type == "string" and test("^10\\.100\\.0\\.[0-9]{1,3}$")) and
+    (.worker.easytier_ip | valid_overlay_ipv4) and
+    (.master.easytier_ip | valid_overlay_ipv4) and
+    ((.worker.easytier_ip | subnet24) == (.master.easytier_ip | subnet24)) and
+    (.worker.easytier_ip != .master.easytier_ip) and
     (.worker.public_host | type == "string" and length <= 253 and
       (length == 0 or test("^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$"))) and
     (.master.address | type == "string" and test("^[A-Za-z0-9.-]+$")) and
@@ -5116,15 +5374,20 @@ cmd_cluster_master_init() {
 
 next_easytier_worker_ip() {
   require_state
-  local octet
+  local master_ip prefix candidate octet
+  master_ip="$(jq -r '.easytier.ipv4 // ""' "$STATE_FILE")"
+  valid_ipv4 "$master_ip" || die "主服务器 EasyTier 私网 IP 无效：${master_ip:-未设置}"
+  prefix="${master_ip%.*}"
   for ((octet=11; octet<=250; octet++)); do
-    if ! jq -e --arg ip "10.100.0.${octet}" \
+    candidate="${prefix}.${octet}"
+    [[ "$candidate" != "$master_ip" ]] || continue
+    if ! jq -e --arg ip "$candidate" \
       '.paired_nodes[]? | select(.easytier_ip == $ip)' "$STATE_FILE" >/dev/null; then
-      printf '10.100.0.%s' "$octet"
+      printf '%s' "$candidate"
       return
     fi
   done
-  die "EasyTier address pool exhausted"
+  die "主服务器 EasyTier 网段 ${prefix}.0/24 的从服务器地址池已用完"
 }
 
 cmd_pair_create() {
@@ -7607,6 +7870,27 @@ menu_quick_subscription() {
   menu_pause
 }
 
+menu_self_update() {
+  clear_screen
+  printf '%s%s【更新 ETXR 管理脚本】%s\n\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+  printf '此功能更新 ETXR 脚本、Go 数据面和控制组件，不会删除用户或线路配置。\n'
+  printf '更新前自动备份；校验、安装或服务重启失败时自动恢复旧版本。\n\n'
+  if menu_exec cmd_self_check_update; then
+    printf '\n'
+    if menu_confirm "现在更新到 GitHub 最新正式版"; then
+      YES=1
+      if menu_exec cmd_self_update; then
+        YES=0
+        printf '\n%s即将重新载入新版菜单。%s\n' "$C_GREEN" "$C_RESET"
+        sleep 1
+        exec "$SELF_BIN" menu
+      fi
+      YES=0
+    fi
+  fi
+  menu_pause
+}
+
 menu_advanced() {
   local choice
   while true; do
@@ -7620,6 +7904,7 @@ menu_advanced() {
     printf '5. 查看完整节点状态\n'
     printf '6. 管理从服务器（查看 ID / 删除 / 连接详情）\n'
     printf '7. 手动管理远程出口\n'
+    printf '8. 检查并更新 ETXR 管理脚本\n'
     printf '0. 返回新手首页\n\n'
     read -r -p '请输入数字: ' choice
     case "$choice" in
@@ -7630,6 +7915,7 @@ menu_advanced() {
       5) menu_exec cmd_status || true; menu_pause ;;
       6) menu_pair_manage ;;
       7) menu_exits ;;
+      8) menu_self_update ;;
       0) return ;;
       *) warn "请输入菜单中已有的数字"; sleep 1 ;;
     esac
@@ -7649,6 +7935,7 @@ cmd_menu() {
     printf '5. 📋 直接复制当前订阅\n'
     printf '6. 🩺 一键检查与修复\n'
     printf '7. ⚙  高级设置             （一般不用）\n'
+    printf '8. ⬆  检查并更新 ETXR\n'
     printf '0. 退出\n\n'
     read -r -p '请输入数字: ' choice
     case "$choice" in
@@ -7659,11 +7946,12 @@ cmd_menu() {
       5) menu_quick_subscription ;;
       6) menu_health_check ;;
       7) menu_advanced ;;
+      8) menu_self_update ;;
       0)
         printf '%s已退出。%s\n' "$C_GREEN" "$C_RESET"
         return
         ;;
-      *) warn "请输入 0～7 之间的数字"; sleep 1 ;;
+      *) warn "请输入 0～8 之间的数字"; sleep 1 ;;
     esac
   done
 }
@@ -7699,6 +7987,7 @@ main() {
     backup) cmd_backup "$@" ;;
     status) cmd_status "$@" ;;
     xray) cmd_xray "$@" ;;
+    self) cmd_self "$@" ;;
     cluster) cmd_cluster "$@" ;;
     pair) cmd_pair "$@" ;;
     control) cmd_control "$@" ;;

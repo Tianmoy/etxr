@@ -15,7 +15,7 @@ def main() -> int:
     text = SCRIPT.read_text(encoding="utf-8")
     assert text.startswith("#!/usr/bin/env bash\n")
     assert "set -Eeuo pipefail" in text
-    assert 'VERSION="0.13.1"' in text
+    assert 'VERSION="0.13.2"' in text
     assert "local expires_minutes=30 expires_at" in text
     assert "--expires-minutes" in text
 
@@ -58,10 +58,14 @@ def main() -> int:
     assert "menu_quick_subscription()" in text
     assert "menu_advanced()" in text
     assert "menu_pair_manage()" in text
+    assert "menu_self_update()" in text
     assert "查看配置下发状态" in text
     assert "配置接收 Agent" in text
     assert "配置下发服务" in text
     assert "cmd_xray_update()" in text
+    assert "cmd_self_update()" in text
+    assert "download_etxr_release_script()" in text
+    assert "ETXR Release 标签与脚本版本不一致" in text
     assert "download_xray_release()" in text
     assert "parse_xray_sha256_dgst()" in text
     assert "github_asset_sha256()" in text
@@ -76,6 +80,7 @@ def main() -> int:
     assert "协议、域名、证书、Path 和 443 共用全部在从服务器上选择" in text
     assert "第一次安装：这台是主服务器" in text
     assert "第一次安装：这台是从服务器" in text
+    assert "检查并更新 ETXR" in text
     assert "这台是 A" not in text
     assert "这台是 B" not in text
 
@@ -173,6 +178,10 @@ def main() -> int:
     assert "服务商提供的公网映射 TCP 端口（外部端口）" in text
     assert "从服务器本机中继 TCP 端口（映射目标端口）" in text
     assert '--nginx-auto-rebind-https "$auto_rebind_https"' in text
+    assert 'prefix="${master_ip%.*}"' in text
+    assert 'candidate="${prefix}.${octet}"' in text
+    assert '"10.100.0.${octet}"' not in text
+    assert "(.worker.easytier_ip | subnet24) == (.master.easytier_ip | subnet24)" in text
 
     # Fresh-install-only code must not carry historical import or remote-shell
     # synchronization implementations.
