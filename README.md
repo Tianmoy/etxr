@@ -1,4 +1,4 @@
-# ETXR v0.13.4
+# ETXR v0.13.5
 
 ETXR 是面向 Debian 12 空白系统的一站式中文菜单脚本，用一份脚本安装主服务器或任意数量的从服务器。它管理 Xray、sing-box、EasyTier、订阅和用户配置，并可复用宝塔 nginx 的 TCP 443。
 
@@ -219,6 +219,11 @@ Hysteria2 混淆密码、伪装网站 URL 和整条入站带宽
 TLS 完整证书链和私钥文件路径
 ```
 
+空白 Debian 从服务器如果尚未安装 `jq`、`openssl`、`gzip` 等校验工具，
+进入加入向导时会先自动安装这些基础软件。此阶段不会安装或修改 Xray、
+EasyTier、sing-box、nginx；只有 Pair ID 验签、有效期和完整字段检查通过后，
+才会安装所选协议需要的组件。
+
 Pair ID 只限制“从服务器第一次加入”的时间，不会让已经加入的从服务器到期。
 如果尚未连接就超过有效期，主服务器会显示 `Pair ID 已过期`，不再一直显示
 `等待连接`。在“主从节点管理”选择“Pair ID 已过期：为原从服务器续发新 ID”，
@@ -384,7 +389,7 @@ checksums.txt
 
 脚本先校验 SHA-256 和二进制内置版本，再通过同目录临时文件原子替换；旧二进制保存在 `/etc/etxr/backups/dataplane-binary/`，失败时自动恢复。镜像站可将 `ETXR_DOWNLOAD_BASE` 设置为包含两个数据面二进制和 `checksums.txt` 的 HTTPS 目录。
 
-推送 `v0.13.4` 形式的 Git 标签后，GitHub Actions 会运行完整测试、交叉编译两个 Linux 架构并创建 Release。构建使用 `CGO_ENABLED=0`，目标机不需要额外运行库。
+推送 `v0.13.5` 形式的 Git 标签后，GitHub Actions 会运行完整测试、交叉编译两个 Linux 架构并创建 Release。构建使用 `CGO_ENABLED=0`，目标机不需要额外运行库。
 
 ## 许可证
 

@@ -15,7 +15,7 @@ def main() -> int:
     text = SCRIPT.read_text(encoding="utf-8")
     assert text.startswith("#!/usr/bin/env bash\n")
     assert "set -Eeuo pipefail" in text
-    assert 'VERSION="0.13.4"' in text
+    assert 'VERSION="0.13.5"' in text
     assert "local expires_minutes=30 expires_at" in text
     assert "--expires-minutes" in text
 
@@ -93,6 +93,13 @@ def main() -> int:
     # Public relay is primary when configured; EasyTier is the fallback.
     assert "cmd_pair_create()" in text
     assert "cmd_pair_join()" in text
+    assert "base_packages_ready()" in text
+    assert "install_base_packages()" in text
+    assert "ensure_pair_join_tools()" in text
+    assert "首次加入从服务器：正在安装 Pair ID 验签所需的基础工具" in text
+    assert text.index("ensure_pair_join_tools\n  need_jq") < text.index(
+        'bundle="$(pair_decode'
+    )
     assert "install_easytier()" in text
     assert "EASYTIER_CONFIG=" in text
     assert "--config-file ${EASYTIER_CONFIG} --console-log-level warn" in text

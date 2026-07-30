@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.13.4"
+VERSION="0.13.5"
 ETXR_REPOSITORY="${ETXR_REPOSITORY:-Tianmoy/etxr}"
 ETXR_RELEASE_API="${ETXR_RELEASE_API:-https://api.github.com/repos/${ETXR_REPOSITORY}/releases/latest}"
 
@@ -4777,6 +4777,37 @@ install_easytier() {
   log "Installed EasyTier $version"
 }
 
+base_packages_ready() {
+  local tool
+  for tool in curl jq openssl unzip tar uuidgen python3 gzip base64 \
+    sha256sum flock; do
+    command -v "$tool" >/dev/null 2>&1 || return 1
+  done
+  [[ -s /etc/ssl/certs/ca-certificates.crt ]] || return 1
+  python3 -c 'import aiohttp' >/dev/null 2>&1 || return 1
+}
+
+install_base_packages() {
+  base_packages_ready && return 0
+  need_root
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y ca-certificates curl jq openssl unzip tar uuid-runtime \
+    python3 python3-aiohttp gzip coreutils util-linux
+  base_packages_ready ||
+    die "基础依赖安装完成后仍缺少 jq、openssl 或其他校验工具"
+}
+
+ensure_pair_join_tools() {
+  base_packages_ready && return 0
+  if (( DRY_RUN )); then
+    log "Would install Pair ID validation tools: jq openssl gzip coreutils"
+    return 0
+  fi
+  log "首次加入从服务器：正在安装 Pair ID 验签所需的基础工具"
+  install_base_packages
+}
+
 cmd_install() {
   local components="xray,sing-box,easytier,dataplane,nginx"
   while (($#)); do
@@ -4787,7 +4818,7 @@ cmd_install() {
     esac
   done
   if (( DRY_RUN )); then
-    log "Would install base packages: ca-certificates curl jq openssl unzip tar uuid-runtime python3 python3-aiohttp"
+    log "Would install base packages: ca-certificates curl jq openssl unzip tar uuid-runtime python3 python3-aiohttp gzip coreutils util-linux"
     [[ ",$components," != *,nginx,* ]] ||
       log "Would install Debian nginx with stream preread module"
     [[ ",$components," != *,xray,* ]] || log "Would download and verify official latest Xray"
@@ -4798,10 +4829,7 @@ cmd_install() {
     return
   fi
   need_root
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update
-  apt-get install -y ca-certificates curl jq openssl unzip tar uuid-runtime \
-    python3 python3-aiohttp
+  install_base_packages
   [[ ",$components," != *,nginx,* ]] ||
     apt-get install -y nginx libnginx-mod-stream
   [[ ",$components," != *,xray,* ]] || install_xray
@@ -6188,6 +6216,7 @@ EOF
     die "--configure-direct and --direct-config-file cannot be used together"
   [[ "$trusted_fingerprint" =~ ^[0-9a-fA-F]{32}$ ]] ||
     die "必须提供主服务器显示的 32 位 Pair 签名指纹"
+  ensure_pair_join_tools
   need_jq
   need_cmd openssl
   need_cmd gzip
@@ -6240,7 +6269,9 @@ EOF
 
   if (( ! prepare_only )); then
     need_root
-    # Validate the complete signed bundle before installing any dependency.
+    # Only basic validation tools are installed before this point. Xray,
+    # EasyTier, sing-box, and nginx are installed only after the signed bundle
+    # and the complete worker-local protocol configuration pass validation.
     [[ "$(jq -r '.hysteria2.enabled' <<<"$direct_config")" != "true" ]] ||
       components+=",sing-box"
     [[ "$nginx_mode" != "standalone" ]] || components+=",nginx"
@@ -7652,6 +7683,15 @@ menu_xray() {
 menu_worker_join() {
   clear_screen
   printf '%s%s【从服务器加入向导】%s\n\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+  if ! base_packages_ready; then
+    printf '首次使用需要安装 jq、openssl 等 Pair ID 验签工具。\n'
+    printf '这里只安装 Debian 基础工具，不会提前安装或修改 Xray、nginx。\n\n'
+    if ! menu_exec ensure_pair_join_tools; then
+      menu_pause
+      return
+    fi
+    printf '\n%s✓ Pair ID 验签工具已准备完成。%s\n\n' "$C_GREEN" "$C_RESET"
+  fi
   printf '把主服务器生成的配对 ID 和签名指纹粘贴到下面，然后回车。\n'
   printf '配对验证通过后，再在这台从服务器选择 XHTTP、Reality、Hysteria2 和 443 共用。\n'
   printf '协议密钥在本机生成；有宝塔就复用宝塔 nginx，没有才安装标准 nginx。\n'

@@ -147,4 +147,14 @@ test -x "$SELF_BIN"
 test -L "$SELF_LINK"
 test "$("$SELF_LINK" version)" = "$VERSION"
 
+pair_tools_installed=0
+base_packages_ready() {
+  (( pair_tools_installed == 1 ))
+}
+install_base_packages() {
+  pair_tools_installed=1
+}
+ensure_pair_join_tools
+test "$pair_tools_installed" = 1
+
 echo "self-update-test: PASS"
