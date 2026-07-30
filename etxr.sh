@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.13.2"
+VERSION="0.13.3"
 ETXR_REPOSITORY="${ETXR_REPOSITORY:-Tianmoy/etxr}"
 ETXR_RELEASE_API="${ETXR_RELEASE_API:-https://api.github.com/repos/${ETXR_REPOSITORY}/releases/latest}"
 
@@ -15,6 +15,7 @@ CONTROL_DIR="${ETXR_CONTROL_DIR:-${RUNTIME_DIR}/control}"
 CONTROL_HELPER="${ETXR_CONTROL_HELPER:-/usr/local/lib/etxr/control.py}"
 CONTROL_PORT="${ETXR_CONTROL_PORT:-18180}"
 SELF_BIN="${ETXR_SELF_BIN:-/usr/local/sbin/etxr}"
+SELF_LINK="${ETXR_SELF_LINK:-/usr/local/bin/etxr}"
 DATAPLANE_BIN="${ETXR_DATAPLANE_BIN:-/usr/local/bin/etxr-dataplane}"
 DATAPLANE_DOWNLOAD_BASE="${ETXR_DOWNLOAD_BASE:-https://github.com/Tianmoy/etxr/releases/download/v${VERSION}}"
 LIMITER_CONFIG="${ETXR_LIMITER_CONFIG:-${RUNTIME_DIR}/live/limits.json}"
@@ -4564,6 +4565,76 @@ download_etxr_release_script() {
   printf '%s\n' "$version" >"$destination/VERSION"
 }
 
+download_etxr_pinned_script() {
+  local destination="$1" version="${2:-$VERSION}" base
+  local expected actual downloaded_version
+  need_cmd curl
+  need_cmd sha256sum
+  [[ "$version" =~ ^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$ ]] ||
+    die "无效的 ETXR 版本号：$version"
+  mkdir -p "$destination"
+  base="https://github.com/${ETXR_REPOSITORY}/releases/download/v${version}"
+  curl --proto '=https' --tlsv1.2 -fL --retry 3 --retry-delay 2 \
+    "$base/checksums.txt" -o "$destination/checksums.txt"
+  curl --proto '=https' --tlsv1.2 -fL --retry 3 --retry-delay 2 \
+    "$base/etxr.sh" -o "$destination/etxr.sh"
+  expected="$(awk '$2 == "etxr.sh" || $2 == "*etxr.sh" {print $1; exit}' \
+    "$destination/checksums.txt")"
+  actual="$(sha256sum "$destination/etxr.sh" | awk '{print $1}')"
+  [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] ||
+    die "ETXR checksums.txt 中没有 etxr.sh 的 SHA256"
+  [[ "${expected,,}" == "${actual,,}" ]] || die "ETXR 脚本 SHA256 校验失败"
+  bash -n "$destination/etxr.sh" || die "下载的 ETXR 脚本语法检查失败"
+  downloaded_version="$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' \
+    "$destination/etxr.sh" | head -n 1)"
+  [[ "$downloaded_version" == "$version" ]] ||
+    die "ETXR 下载版本与脚本版本不一致"
+  chmod 755 "$destination/etxr.sh"
+}
+
+install_self_link() {
+  [[ "$SELF_LINK" != "$SELF_BIN" ]] || return 0
+  ensure_parent "$SELF_LINK"
+  if [[ -e "$SELF_LINK" && ! -L "$SELF_LINK" ]]; then
+    die "命令入口已被其他文件占用：$SELF_LINK"
+  fi
+  ln -sfn "$SELF_BIN" "$SELF_LINK"
+}
+
+install_self_command() {
+  local source="${1:-${BASH_SOURCE[0]}}" download_dir="" target_dir temp
+  if [[ ! -f "$source" || "$source" == /dev/fd/* ||
+        "$source" == /proc/*/fd/* ]]; then
+    download_dir="$(mktemp -d)"
+    download_etxr_pinned_script "$download_dir" "$VERSION"
+    source="$download_dir/etxr.sh"
+  fi
+  [[ -r "$source" ]] || die "ETXR 安装源不可读：$source"
+  target_dir="$(dirname "$SELF_BIN")"
+  mkdir -p "$target_dir"
+  if [[ "$(readlink -f "$source")" != "$(readlink -f "$SELF_BIN" 2>/dev/null || true)" ]]; then
+    temp="$(mktemp "$target_dir/.etxr.XXXXXX")"
+    install -m 755 "$source" "$temp"
+    bash -n "$temp" || {
+      rm -f "$temp"
+      die "准备安装的 ETXR 脚本语法检查失败"
+    }
+    [[ "$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$temp" | head -n 1)" == "$VERSION" ]] || {
+      rm -f "$temp"
+      die "准备安装的 ETXR 脚本版本不匹配"
+    }
+    mv -f "$temp" "$SELF_BIN"
+  else
+    chmod 755 "$SELF_BIN"
+  fi
+  install_self_link
+  [[ "$($SELF_BIN version 2>/dev/null || true)" == "$VERSION" ]] ||
+    die "安装后的 ETXR 命令执行检查失败：$SELF_BIN"
+  [[ "$($SELF_LINK version 2>/dev/null || true)" == "$VERSION" ]] ||
+    die "ETXR 命令入口执行检查失败：$SELF_LINK"
+  [[ -z "$download_dir" ]] || rm -rf "$download_dir"
+}
+
 download_xray_release() {
   local destination="$1"
   local arch api version asset_name url dgst_url
@@ -4737,15 +4808,10 @@ cmd_install() {
   [[ ",$components," != *,sing-box,* ]] || install_sing_box
   [[ ",$components," != *,easytier,* ]] || install_easytier
   [[ ",$components," != *,dataplane,* ]] || install_data_helper
-  if [[ "$(readlink -f "$0")" != "$(readlink -f "$SELF_BIN" 2>/dev/null || true)" ]]; then
-    ensure_parent "$SELF_BIN"
-    install -m 755 "$0" "$SELF_BIN"
-  else
-    chmod 755 "$SELF_BIN"
-  fi
+  install_self_command "${BASH_SOURCE[0]}"
   install_control_helper
   mkdir -p "$RUNTIME_DIR" "$GENERATED_DIR" "$BACKUP_DIR" "$SUBSCRIPTION_DIR"
-  log "Installed etxr command"
+  log "Installed etxr command: $SELF_LINK"
 }
 
 etxr_installed_version() {
@@ -7998,5 +8064,17 @@ main() {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  if [[ "${BASH_SOURCE[0]}" == /dev/fd/* ||
+        "${BASH_SOURCE[0]}" == /proc/*/fd/* ]]; then
+    if (( EUID == 0 )); then
+      if (install_self_command "${BASH_SOURCE[0]}"); then
+        log "已安装 etxr 命令；以后直接输入 etxr 即可打开菜单"
+      else
+        warn "临时运行成功，但 etxr 命令预安装失败；完成首次安装时会再次尝试"
+      fi
+    else
+      warn "当前不是 root，暂未安装 etxr 命令"
+    fi
+  fi
   main "$@"
 fi

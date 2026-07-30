@@ -80,6 +80,12 @@ curl() {
     https://fixture.invalid/checksums.txt)
       cp "$FIXTURE/checksums.txt" "$output"
       ;;
+    https://github.com/Tianmoy/etxr/releases/download/v*/etxr.sh)
+      cp "$FIXTURE/etxr.sh" "$output"
+      ;;
+    https://github.com/Tianmoy/etxr/releases/download/v*/checksums.txt)
+      cp "$FIXTURE/checksums.txt" "$output"
+      ;;
     *)
       return 22
       ;;
@@ -125,5 +131,20 @@ if (download_etxr_release_script "$TMP/version-mismatch") >/dev/null 2>&1; then
   echo "self-update unexpectedly accepted a tag/script version mismatch" >&2
   exit 1
 fi
+
+SELF_BIN="$TMP/local/sbin/etxr"
+SELF_LINK="$TMP/local/bin/etxr"
+install_self_command "$ROOT/etxr.sh"
+test -x "$SELF_BIN"
+test -L "$SELF_LINK"
+test "$("$SELF_BIN" version)" = "$VERSION"
+test "$("$SELF_LINK" version)" = "$VERSION"
+
+rm -f "$SELF_BIN" "$SELF_LINK"
+build_release_fixture "$VERSION" "$VERSION"
+install_self_command /dev/null
+test -x "$SELF_BIN"
+test -L "$SELF_LINK"
+test "$("$SELF_LINK" version)" = "$VERSION"
 
 echo "self-update-test: PASS"

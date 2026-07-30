@@ -1,4 +1,4 @@
-# ETXR v0.13.2
+# ETXR v0.13.3
 
 ETXR 是面向 Debian 12 空白系统的一站式中文菜单脚本，用一份脚本安装主服务器或任意数量的从服务器。它管理 Xray、sing-box、EasyTier、订阅和用户配置，并可复用宝塔 nginx 的 TCP 443。
 
@@ -49,6 +49,17 @@ flowchart LR
 - 无宝塔时按需安装 Debian nginx 和 `libnginx-mod-stream`；有宝塔时只复用宝塔 nginx。
 
 ## 启动菜单
+
+推荐直接使用下面的一行命令。脚本会先校验正式 Release，再安装
+`/usr/local/sbin/etxr` 和通用命令入口 `/usr/local/bin/etxr`，随后打开菜单：
+
+```bash
+bash <(curl --proto '=https' --tlsv1.2 -fsSL https://github.com/Tianmoy/etxr/releases/latest/download/etxr.sh)
+```
+
+第一次执行结束后，直接输入 `etxr` 即可再次打开菜单。通过 `<(curl ...)`
+运行时不会复制 `/dev/fd/*` 临时管道，而是重新下载同版本正式脚本和
+`checksums.txt`，完成 SHA-256、版本和 Bash 语法检查后再原子安装。
 
 ```bash
 chmod +x etxr.sh
@@ -368,7 +379,7 @@ checksums.txt
 
 脚本先校验 SHA-256 和二进制内置版本，再通过同目录临时文件原子替换；旧二进制保存在 `/etc/etxr/backups/dataplane-binary/`，失败时自动恢复。镜像站可将 `ETXR_DOWNLOAD_BASE` 设置为包含两个数据面二进制和 `checksums.txt` 的 HTTPS 目录。
 
-推送 `v0.13.2` 形式的 Git 标签后，GitHub Actions 会运行完整测试、交叉编译两个 Linux 架构并创建 Release。构建使用 `CGO_ENABLED=0`，目标机不需要额外运行库。
+推送 `v0.13.3` 形式的 Git 标签后，GitHub Actions 会运行完整测试、交叉编译两个 Linux 架构并创建 Release。构建使用 `CGO_ENABLED=0`，目标机不需要额外运行库。
 
 ## 许可证
 

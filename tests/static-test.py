@@ -15,7 +15,7 @@ def main() -> int:
     text = SCRIPT.read_text(encoding="utf-8")
     assert text.startswith("#!/usr/bin/env bash\n")
     assert "set -Eeuo pipefail" in text
-    assert 'VERSION="0.13.2"' in text
+    assert 'VERSION="0.13.3"' in text
     assert "local expires_minutes=30 expires_at" in text
     assert "--expires-minutes" in text
 
@@ -65,6 +65,9 @@ def main() -> int:
     assert "cmd_xray_update()" in text
     assert "cmd_self_update()" in text
     assert "download_etxr_release_script()" in text
+    assert "download_etxr_pinned_script()" in text
+    assert "install_self_command()" in text
+    assert 'SELF_LINK="${ETXR_SELF_LINK:-/usr/local/bin/etxr}"' in text
     assert "ETXR Release 标签与脚本版本不一致" in text
     assert "download_xray_release()" in text
     assert "parse_xray_sha256_dgst()" in text
