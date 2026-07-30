@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.13.5"
+VERSION="0.13.6"
 ETXR_REPOSITORY="${ETXR_REPOSITORY:-Tianmoy/etxr}"
 ETXR_RELEASE_API="${ETXR_RELEASE_API:-https://api.github.com/repos/${ETXR_REPOSITORY}/releases/latest}"
 
@@ -181,6 +181,37 @@ port_is_sing_box_owned() {
   esac | grep -q 'users:(("sing-box"'
 }
 
+wait_for_nginx_udp_release() {
+  local port="$1" timeout_seconds="${2:-30}" attempt attempts
+  [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || return 2
+  attempts="$((10#$timeout_seconds * 2))"
+  for ((attempt=0; attempt<attempts; attempt++)); do
+    port_is_nginx_owned udp "$port" || return 0
+    sleep 0.5
+  done
+  port_is_nginx_owned udp "$port" && return 1
+  return 0
+}
+
+nginx_effective_config_files() {
+  local nb="${ETXR_NGINX_EFFECTIVE_BIN:-}"
+  [[ -z "${ETXR_NGINX_SCAN_ROOTS:-}" ]] || return 0
+  if [[ -n "$nb" ]]; then
+    :
+  elif [[ -f "$STATE_FILE" ]] && command -v jq >/dev/null 2>&1; then
+    nb="$(nginx_bin 2>/dev/null || true)"
+  elif [[ -x /www/server/nginx/sbin/nginx ]]; then
+    nb=/www/server/nginx/sbin/nginx
+  elif [[ -x /usr/sbin/nginx ]]; then
+    nb=/usr/sbin/nginx
+  elif command -v nginx >/dev/null 2>&1; then
+    nb="$(command -v nginx)"
+  fi
+  [[ -n "$nb" && -x "$nb" ]] || return 0
+  "$nb" -T 2>&1 |
+    sed -n 's/^# configuration file \(.*\):$/\1/p'
+}
+
 nginx_config_candidates() {
   local root candidate resolved
   local -a roots=()
@@ -220,6 +251,16 @@ nginx_config_candidates() {
       fi
     )
   done
+  if [[ -z "${ETXR_NGINX_SCAN_ROOTS:-}" ]]; then
+    while IFS= read -r candidate; do
+      [[ -n "$candidate" ]] || continue
+      resolved="$(readlink -f -- "$candidate" 2>/dev/null || true)"
+      [[ -n "$resolved" && -f "$resolved" &&
+         -z "${seen[$resolved]:-}" ]] || continue
+      seen["$resolved"]=1
+      printf '%s\0' "$resolved"
+    done < <(nginx_effective_config_files)
+  fi
 }
 
 nginx_quic_file_has_active() {
@@ -3943,7 +3984,7 @@ cmd_apply() {
   local rollback_dir="" rollback_service quic_manifest="" tcp443_manifest=""
   local hy2_enabled hy2_port hy2_shared_udp443 nginx_was_running=0
   local nginx_should_reload=0 nginx_quic_backup="" nginx_tcp443_backup=""
-  local auto_rebind_https https_listen_port
+  local auto_rebind_https https_listen_port post_quic_manifest=""
   xray_config="$(jq -r '.xray.config_path' "$STATE_FILE")"
   sing_config="$(jq -r '.hysteria2.config_path' "$STATE_FILE")"
   mode="$(jq -r '.nginx.mode' "$STATE_FILE")"
@@ -4301,10 +4342,27 @@ cmd_apply() {
        { (( nginx_was_running )) || [[ "$mode" != "disabled" ]]; }; then
       "$nb" -s reload ||
         { rollback_apply; die "nginx reload 失败，已恢复 H3/QUIC 和其他配置"; }
-      if [[ "$hy2_shared_udp443" == "true" ]] &&
-         port_is_nginx_owned udp "$hy2_port"; then
-        rollback_apply
-        die "nginx reload 后仍占用 UDP $hy2_port，已恢复原配置"
+      if [[ "$hy2_shared_udp443" == "true" ]]; then
+        post_quic_manifest="$(mktemp)"
+        nginx_quic_active_manifest "$post_quic_manifest"
+        if [[ -s "$post_quic_manifest" ]]; then
+          while IFS= read -r -d '' rollback_service; do
+            warn "nginx 实际加载配置中仍有 H3/QUIC：$rollback_service"
+          done <"$post_quic_manifest"
+          rm -f "$post_quic_manifest"
+          post_quic_manifest=""
+          rollback_apply
+          die "nginx reload 后仍有 H3/QUIC 配置，已恢复原配置"
+        fi
+        rm -f "$post_quic_manifest"
+        post_quic_manifest=""
+        if port_is_nginx_owned udp "$hy2_port"; then
+          log "正在等待旧 nginx worker 释放 UDP $hy2_port（最多 30 秒）"
+        fi
+        if ! wait_for_nginx_udp_release "$hy2_port" 30; then
+          rollback_apply
+          die "等待 30 秒后 nginx 仍占用 UDP $hy2_port，已恢复原配置"
+        fi
       fi
     fi
     if [[ "$(jq -r '.easytier.enabled // false' "$STATE_FILE")" == "true" ]]; then

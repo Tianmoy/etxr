@@ -15,7 +15,7 @@ def main() -> int:
     text = SCRIPT.read_text(encoding="utf-8")
     assert text.startswith("#!/usr/bin/env bash\n")
     assert "set -Eeuo pipefail" in text
-    assert 'VERSION="0.13.5"' in text
+    assert 'VERSION="0.13.6"' in text
     assert "local expires_minutes=30 expires_at" in text
     assert "--expires-minutes" in text
 
@@ -38,6 +38,9 @@ def main() -> int:
     assert "nginx_quic_active_manifest()" in text
     assert "nginx_quic_disable_manifest()" in text
     assert "nginx_quic_restore_backup()" in text
+    assert "nginx_effective_config_files()" in text
+    assert "wait_for_nginx_udp_release()" in text
+    assert "正在等待旧 nginx worker 释放 UDP" in text
     assert "nginx_tcp443_active_manifest()" in text
     assert "nginx_tcp443_rebind_manifest()" in text
     assert "nginx_tcp443_restore_backup()" in text

@@ -1,4 +1,4 @@
-# ETXR v0.13.5
+# ETXR v0.13.6
 
 ETXR 是面向 Debian 12 空白系统的一站式中文菜单脚本，用一份脚本安装主服务器或任意数量的从服务器。它管理 Xray、sing-box、EasyTier、订阅和用户配置，并可复用宝塔 nginx 的 TCP 443。
 
@@ -159,6 +159,10 @@ nginx 的 QUIC/HTTP3 也使用 UDP 443，因此二者不能同时监听。选择
 5. 保留 `listen 443 ssl`、`http2 on` 和普通网站 HTTPS。
 6. 使用实际 nginx 二进制执行 `nginx -t`，先 reload 释放 UDP 443，再启动 sing-box。
 7. nginx 检查、reload、sing-box 启动或 UDP 监听验证任一步失败，恢复所有文件和服务状态。
+
+宝塔 nginx reload 后，旧 worker 可能短时间继续持有原 QUIC socket。ETXR 会先用
+`nginx -T` 复查实际加载的全部配置，再等待最多 30 秒让旧 worker 释放 UDP 443；
+只有配置仍含 H3/QUIC，或等待结束后仍由 nginx 占用时才会回滚。
 
 宝塔优先使用 `/www/server/nginx/sbin/nginx`。自动扫描宝塔 vhost、宝塔主配置以及标准 `/etc/nginx` 配置目录。
 
@@ -389,7 +393,7 @@ checksums.txt
 
 脚本先校验 SHA-256 和二进制内置版本，再通过同目录临时文件原子替换；旧二进制保存在 `/etc/etxr/backups/dataplane-binary/`，失败时自动恢复。镜像站可将 `ETXR_DOWNLOAD_BASE` 设置为包含两个数据面二进制和 `checksums.txt` 的 HTTPS 目录。
 
-推送 `v0.13.5` 形式的 Git 标签后，GitHub Actions 会运行完整测试、交叉编译两个 Linux 架构并创建 Release。构建使用 `CGO_ENABLED=0`，目标机不需要额外运行库。
+推送 `v0.13.6` 形式的 Git 标签后，GitHub Actions 会运行完整测试、交叉编译两个 Linux 架构并创建 Release。构建使用 `CGO_ENABLED=0`，目标机不需要额外运行库。
 
 ## 许可证
 

@@ -84,6 +84,47 @@ grep -Fq '# etxr-hy2-udp443: add_header Alt-Svc' \
 nginx_quic_restore_backup "$TMP/backup"
 cmp "$TMP/original.conf" "$TMP/nginx/sites-enabled/site.conf"
 
+# nginx reload is asynchronous: old workers may hold UDP 443 briefly.
+udp_owner_checks=0
+port_is_nginx_owned() {
+  if [[ "$1" == "udp" && "$2" == "443" ]]; then
+    udp_owner_checks="$((udp_owner_checks + 1))"
+    (( udp_owner_checks < 4 ))
+    return
+  fi
+  return 1
+}
+sleep() { :; }
+wait_for_nginx_udp_release 443 5
+[[ "$udp_owner_checks" -eq 4 ]]
+
+port_is_nginx_owned() {
+  [[ "$1" == "udp" && "$2" == "443" ]]
+}
+if wait_for_nginx_udp_release 443 1; then
+  echo "persistent nginx UDP ownership was accepted" >&2
+  exit 1
+fi
+
+# Parse files from nginx -T so custom Baota include paths are also scanned.
+mkdir -p "$TMP/effective"
+cat >"$TMP/effective/custom-vhost.any-name" <<'EOF'
+server {
+    listen 443 quic;
+}
+EOF
+cat >"$TMP/effective/nginx" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' '# configuration file $TMP/effective/custom-vhost.any-name:'
+EOF
+chmod 755 "$TMP/effective/nginx"
+unset ETXR_NGINX_SCAN_ROOTS
+export ETXR_NGINX_EFFECTIVE_BIN="$TMP/effective/nginx"
+effective_file="$(nginx_effective_config_files)"
+[[ "$effective_file" == "$TMP/effective/custom-vhost.any-name" ]]
+unset ETXR_NGINX_EFFECTIVE_BIN
+export ETXR_NGINX_SCAN_ROOTS="$TMP/nginx/nginx.conf:$TMP/nginx/sites-enabled"
+
 # TCP 443 migration keeps QUIC lines untouched and is independently reversible.
 tcp_manifest="$TMP/tcp443.manifest"
 nginx_tcp443_active_manifest "$tcp_manifest"
