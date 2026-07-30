@@ -15,7 +15,7 @@ def main() -> int:
     text = SCRIPT.read_text(encoding="utf-8")
     assert text.startswith("#!/usr/bin/env bash\n")
     assert "set -Eeuo pipefail" in text
-    assert 'VERSION="0.13.6"' in text
+    assert 'VERSION="0.13.7"' in text
     assert "local expires_minutes=30 expires_at" in text
     assert "--expires-minutes" in text
 
@@ -125,6 +125,13 @@ def main() -> int:
     assert "easytier-only" in text
     assert "--public-listen-port" in text
     assert "--xhttp-enabled" in text
+    assert "random_path()" in text
+    assert 'xhttp_path="${xhttp_path:-$(random_path)}"' in text
+    assert 'reality_path="${reality_path:-$(random_path)}"' in text
+    assert 'route_path="$(random_path)"' in text
+    assert 'xhttp_path="/${name}-xhttp-' not in text
+    assert 'reality_path="/${name}-reality-' not in text
+    assert 'route_path="/${name}-' not in text
 
     # The control plane shares nginx 443 through a random path and binds only
     # to localhost behind nginx. Worker pairing uses schema version 2.

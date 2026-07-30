@@ -462,6 +462,8 @@ PAIR_REMAINING="$((PAIR_EXPIRES_AT - $(date +%s)))"
 PAIR_CONTROL_TOKEN="$("$EDGE" pair decode "$PAIR_ID" | "$JQ" -r '.control.token')"
 PAIR_ROUTE_PATH="$("$JQ" -r '.paired_nodes[] | select(.name == "b1") | .route_path' \
   "$TMP/state.json")"
+[[ "$PAIR_ROUTE_PATH" =~ ^/[0-9a-f]{24}$ ]]
+[[ "$PAIR_ROUTE_PATH" != /b1-* ]]
 "$JQ" --argjson expired "$(( $(date +%s) - 1 ))" '
   .paired_nodes |= map(
     if .name == "b1" then .expires_at = $expired else . end
@@ -532,11 +534,22 @@ grep -Fq 'proxy_pass http://127.0.0.1:18180/;' "$TMP/generated/nginx-paths.conf"
 # A worker without a public relay uses EasyTier only.
 "$EDGE" pair create --name b2 --no-xhttp --no-reality --no-hy2 \
   --private-relay-port 19001 >"$TMP/pair-create-b2.txt"
+B2_PAIR_ID="$(tr -d '\r\n' <"$TMP/pairs/b2.id")"
+"$EDGE" pair decode "$B2_PAIR_ID" |
+  "$JQ" -e '
+    (.direct.xhttp.path | test("^/[0-9a-f]{24}$")) and
+    (.direct.reality.path | test("^/[0-9a-f]{24}$")) and
+    (.direct.xhttp.path | startswith("/b2-") | not) and
+    (.direct.reality.path | startswith("/b2-") | not)
+  ' >/dev/null
 "$JQ" -e '.xray.exits[] | select(
   .name == "b2" and
   .address == "10.100.0.12" and .port == 19001 and
   .backup_address == "" and
   .connection_preference == "easytier-only"
+)' "$TMP/state.json" >/dev/null
+"$JQ" -e '.xray.routes[] | select(
+  .name == "b2" and (.path | test("^/[0-9a-f]{24}$"))
 )' "$TMP/state.json" >/dev/null
 
 WORKER="$TMP/worker"

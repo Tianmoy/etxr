@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.13.6"
+VERSION="0.13.7"
 ETXR_REPOSITORY="${ETXR_REPOSITORY:-Tianmoy/etxr}"
 ETXR_RELEASE_API="${ETXR_RELEASE_API:-https://api.github.com/repos/${ETXR_REPOSITORY}/releases/latest}"
 
@@ -778,6 +778,11 @@ random_hex() {
   openssl rand -hex "$bytes"
 }
 
+random_path() {
+  local bytes="${1:-12}"
+  printf '/%s' "$(random_hex "$bytes")"
+}
+
 random_uuid() {
   if command -v uuidgen >/dev/null 2>&1; then
     uuidgen | tr '[:upper:]' '[:lower:]'
@@ -809,7 +814,7 @@ ensure_control_state() {
   role="$(jq -r '.node.role' "$STATE_FILE")"
   [[ "$role" != "exit" ]] || return 0
   base_path="$(jq -r '.control.base_path // ""' "$STATE_FILE")"
-  base_path="${base_path:-/$(random_hex 16)}"
+  base_path="${base_path:-$(random_path 16)}"
   state_update '
     .control = ((.control // {}) + {
       enabled: true,
@@ -1010,7 +1015,7 @@ EOF
     die "State already exists: $STATE_FILE (use --force to replace)"
 
   address="${address:-$domain}"
-  control_path="/$(random_hex 16)"
+  control_path="$(random_path 16)"
   ensure_parent "$STATE_FILE"
 
   jq -n \
@@ -5643,8 +5648,8 @@ EOF
         ( "$hy2_enabled" != "true" || "$hy2_port" != "443" ) ]]; then
     die "Worker Hysteria2 UDP 443 sharing requires enabled HY2 on port 443"
   fi
-  xhttp_path="${xhttp_path:-/${name}-xhttp-$(random_hex 8)}"
-  reality_path="${reality_path:-/${name}-reality-$(random_hex 8)}"
+  xhttp_path="${xhttp_path:-$(random_path)}"
+  reality_path="${reality_path:-$(random_path)}"
   xhttp_path="$(normalize_path "$xhttp_path")"
   reality_path="$(normalize_path "$reality_path")"
   valid_http_path "$xhttp_path" || die "Invalid XHTTP Path"
@@ -5688,7 +5693,7 @@ EOF
       die "无法解析 xray x25519 输出"
   fi
   route_port="$(next_route_port)"
-  route_path="/${name}-$(random_hex 10)"
+  route_path="$(random_path)"
   control_token="$(random_hex 32)"
   control_url="$(control_base_url)"
 
@@ -6089,7 +6094,7 @@ prompt_worker_direct_config() {
     xhttp_listen="$xhttp_public"
   fi
 
-  xhttp_path="/${name}-xhttp-$(random_hex 10)"
+  xhttp_path="$(random_path)"
   if [[ "$xhttp_enabled" == "y" ]]; then
     if [[ "$shared_choice" == "y" ]]; then
       xhttp_public=443
@@ -6097,10 +6102,10 @@ prompt_worker_direct_config() {
       xhttp_listen="$(prompt_port_checked 'Xray XHTTP 本机接收 TCP 端口' '18000' tcp)"
       xhttp_behind=true
     fi
-    xhttp_path="$(prompt_path_value 'XHTTP 连接 Path（直接回车使用随机值）' "$xhttp_path")"
+    xhttp_path="$(prompt_path_value 'XHTTP 连接 Path（纯随机，不包含节点名或协议名）' "$xhttp_path")"
   fi
 
-  reality_path="/${name}-reality-$(random_hex 10)"
+  reality_path="$(random_path)"
   reality_target="aod.itunes.apple.com:443"
   reality_sni="aod.itunes.apple.com"
   reality_short="$(random_hex 8)"
@@ -6114,7 +6119,7 @@ prompt_worker_direct_config() {
         "$([[ "$xhttp_enabled" == "y" ]] && printf '18443' || printf '443')")"
       reality_listen="$reality_port"
     fi
-    reality_path="$(prompt_path_value 'Reality 的 XHTTP 连接 Path（直接回车使用随机值）' "$reality_path")"
+    reality_path="$(prompt_path_value 'Reality 的 XHTTP 连接 Path（纯随机，不包含节点名或协议名）' "$reality_path")"
     reality_target="$(prompt_target_value 'Reality 握手转发目标（域名:443）' "$reality_target")"
     reality_sni="$(prompt_hostname_value 'Reality 客户端填写的伪装域名（SNI）' \
       "${reality_target%%:*}")"
@@ -7087,11 +7092,11 @@ menu_quick_init() {
       break
     done
     route_port="$(prompt_port_checked 'Xray XHTTP 本机接收 TCP 端口（无需开放防火墙）' '18001' tcp)"
-    route_path="$(prompt_path_value 'XHTTP 连接 Path（直接回车使用随机值）' "/$(random_hex 12)")"
+    route_path="$(prompt_path_value 'XHTTP 连接 Path（纯随机，不包含节点名或协议名）' "$(random_path)")"
   else
     tls_port=443
     route_port=18001
-    route_path="/$(random_hex 12)"
+    route_path="$(random_path)"
   fi
 
   printf '\n%s【客户端连接主服务器：Reality + XHTTP】%s\n' "$C_BOLD" "$C_RESET"
@@ -7118,13 +7123,13 @@ menu_quick_init() {
       reality_port="$(prompt_port_checked 'Reality 公网 TCP 端口（需在防火墙放行）' '18443' tcp)"
       reality_listen_port="$reality_port"
     fi
-    reality_path="$(prompt_path_value 'Reality 的 XHTTP 连接 Path（直接回车使用随机值）' "/$(random_hex 12)")"
+    reality_path="$(prompt_path_value 'Reality 的 XHTTP 连接 Path（纯随机，不包含节点名或协议名）' "$(random_path)")"
     reality_target="$(prompt_target_value 'Reality 握手转发目标（域名:443）' 'aod.itunes.apple.com:443')"
     reality_sni="$(prompt_hostname_value 'Reality 客户端填写的伪装域名（SNI）' "${reality_target%%:*}")"
   else
     reality_port=18443
     reality_listen_port=18443
-    reality_path="/$(random_hex 12)"
+    reality_path="$(random_path)"
     reality_target="aod.itunes.apple.com:443"
     reality_sni="aod.itunes.apple.com"
   fi
@@ -7461,7 +7466,7 @@ menu_routes() {
       2|3)
         printf '此处是高级功能：客户端用 Path 进入主服务器，nginx 再转到 Xray 本机端口。\n'
         name="$(prompt_value '线路名称（仅用于菜单和订阅显示）')"
-        path="$(prompt_value '客户端连接主服务器时使用的 Path' "/$(random_hex 12)")"
+        path="$(prompt_value '客户端连接主服务器时使用的 Path（默认纯随机）' "$(random_path)")"
         port="$(prompt_value 'Xray 本机接收 TCP 端口（无需开放防火墙）' "$(next_route_port)")"
         cmd_exit_list || true
         target="$(prompt_value '流量从哪里出去（direct=主服务器本机，或填写从服务器名称）' 'direct')"
@@ -7520,7 +7525,7 @@ menu_exits() {
         server_name="$(prompt_value 'TLS 证书域名（SNI）' "$address")"
         host="$(prompt_value 'XHTTP Host（通常与 TLS SNI 相同）' "$server_name")"
         port="$(prompt_value '出口服务器公网 TCP 端口' '443')"
-        path="$(prompt_value '出口服务器中继 Path' "/$(random_hex 12)")"
+        path="$(prompt_value '出口服务器中继 Path（默认纯随机）' "$(random_path)")"
         uuid="$(prompt_value '主从中继 UUID（留空自动生成）')"
         uuid="${uuid:-$(random_uuid)}"
         menu_exec cmd_exit_add --name "$name" --address "$address" --port "$port" \
@@ -7535,7 +7540,7 @@ menu_exits() {
         address="$(prompt_value '主服务器连接的出口服务器公网 IP 或域名')"
         port="$(prompt_value '出口服务器 Reality 公网 TCP 端口' '443')"
         server_name="$(prompt_value 'Reality 客户端 SNI')"
-        path="$(prompt_value 'Reality 的 XHTTP 连接 Path' "/$(random_hex 12)")"
+        path="$(prompt_value 'Reality 的 XHTTP 连接 Path（默认纯随机）' "$(random_path)")"
         uuid="$(prompt_value '主从中继 UUID（留空自动生成）')"
         uuid="${uuid:-$(random_uuid)}"
         public_key="$(prompt_value 'Reality 公钥')"
@@ -7550,7 +7555,7 @@ menu_exits() {
         name="$(prompt_value '出口名称（仅用于菜单显示）')"
         address="$(prompt_value '出口服务器的 EasyTier/WireGuard 私网 IP')"
         port="$(prompt_value '出口服务器私网中继 TCP 端口' '18000')"
-        path="$(prompt_value '私网中继的 XHTTP Path' "/$(random_hex 12)")"
+        path="$(prompt_value '私网中继的 XHTTP Path（默认纯随机）' "$(random_path)")"
         uuid="$(prompt_value '主从中继 UUID（留空自动生成）')"
         uuid="${uuid:-$(random_uuid)}"
         if generate_vlessenc_pair; then
@@ -7595,7 +7600,7 @@ menu_add_reality() {
     port="$(prompt_value 'Reality 公网 TCP 端口（需在防火墙放行）' '8444')"
     listen_port="$port"
   fi
-  path="$(prompt_value 'Reality 的 XHTTP 连接 Path' "/$(random_hex 12)")"
+  path="$(prompt_value 'Reality 的 XHTTP 连接 Path（默认纯随机）' "$(random_path)")"
   target="$(prompt_value 'Reality 握手转发目标（域名:443）' 'aod.itunes.apple.com:443')"
   sni="$(prompt_value 'Reality 客户端填写的伪装域名（SNI）' "${target%%:*}")"
   menu_exec cmd_reality_add --name "$name" --port "$port" \

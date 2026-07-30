@@ -1,4 +1,4 @@
-# ETXR v0.13.6
+# ETXR v0.13.7
 
 ETXR 是面向 Debian 12 空白系统的一站式中文菜单脚本，用一份脚本安装主服务器或任意数量的从服务器。它管理 Xray、sing-box、EasyTier、订阅和用户配置，并可复用宝塔 nginx 的 TCP 443。
 
@@ -82,7 +82,7 @@ chmod +x etxr.sh
 
 菜单 `8` 会从 GitHub 最新正式 Release 下载 `etxr.sh` 和 `checksums.txt`，同时强制校验两个文件的 Release API 摘要、SHA-256、脚本版本和 Bash 语法，然后原子更新 `/usr/local/sbin/etxr`、匹配版本的 Go 数据面和控制组件。更新前自动备份旧文件；校验、安装或相关服务重启失败时自动恢复。用户、线路、订阅和主从配置不会被删除，也不会把开发版本自动降级到较旧的正式版。
 
-所有可填写项都提供默认值。直接回车使用默认值；域名、Path、UUID、URL、带宽和端口会在输入后检查。主服务器和从服务器都在本机检查协议监听端口，宝塔 nginx 已监听的 HTTPS 443 可按向导共用。
+所有可填写项都提供默认值。直接回车使用默认值；域名、Path、UUID、URL、带宽和端口会在输入后检查。自动生成的 XHTTP、Reality 和主从中继 Path 只包含随机十六进制字符，不再带节点名或 `xhttp`、`reality` 等协议标识；已有配置的旧 Path 不会被自动修改。主服务器和从服务器都在本机检查协议监听端口，宝塔 nginx 已监听的 HTTPS 443 可按向导共用。
 
 ## 安装主服务器
 
@@ -393,7 +393,7 @@ checksums.txt
 
 脚本先校验 SHA-256 和二进制内置版本，再通过同目录临时文件原子替换；旧二进制保存在 `/etc/etxr/backups/dataplane-binary/`，失败时自动恢复。镜像站可将 `ETXR_DOWNLOAD_BASE` 设置为包含两个数据面二进制和 `checksums.txt` 的 HTTPS 目录。
 
-推送 `v0.13.6` 形式的 Git 标签后，GitHub Actions 会运行完整测试、交叉编译两个 Linux 架构并创建 Release。构建使用 `CGO_ENABLED=0`，目标机不需要额外运行库。
+推送 `v0.13.7` 形式的 Git 标签后，GitHub Actions 会运行完整测试、交叉编译两个 Linux 架构并创建 Release。构建使用 `CGO_ENABLED=0`，目标机不需要额外运行库。
 
 ## 许可证
 
