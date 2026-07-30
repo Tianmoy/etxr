@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.13.3"
+VERSION="0.13.4"
 ETXR_REPOSITORY="${ETXR_REPOSITORY:-Tianmoy/etxr}"
 ETXR_RELEASE_API="${ETXR_RELEASE_API:-https://api.github.com/repos/${ETXR_REPOSITORY}/releases/latest}"
 
@@ -92,7 +92,7 @@ Commands:
   xray status|start|stop|restart|logs|follow|monitor|check-update|update
   self status|check-update|update
   cluster master-init
-  pair create|join|list|remove
+  pair create|join|renew|list|remove
   control apply|status
   version
 
@@ -6450,10 +6450,113 @@ EOF
   cmd_subscription "$(jq -r '.[0].name' <<<"$worker_users")"
 }
 
+pair_node_status() {
+  local name="$1" expires_at="${2:-0}" now remaining report_status
+  if [[ -f "$CONTROL_DIR/reports/${name}.json" ]]; then
+    report_status="$(jq -r '.status // "已连接"' \
+      "$CONTROL_DIR/reports/${name}.json" 2>/dev/null || printf '已连接')"
+    case "$report_status" in
+      connected|applied|ok|success) printf '已连接' ;;
+      *) printf '已连接（%s）' "$report_status" ;;
+    esac
+    return
+  fi
+  if [[ ! "$expires_at" =~ ^[0-9]+$ ]]; then
+    printf 'Pair 状态未知'
+    return
+  fi
+  now="$(date +%s)"
+  if (( 10#$expires_at <= now )); then
+    printf 'Pair ID 已过期'
+  elif [[ ! -s "$RUNTIME_DIR/pairs/${name}.id" ]]; then
+    printf 'Pair ID 文件缺失'
+  else
+    remaining="$(( (10#$expires_at - now + 59) / 60 ))"
+    printf '等待连接（剩余约 %s 分钟）' "$remaining"
+  fi
+}
+
+cmd_pair_renew() {
+  local name="${1:-}" expires_minutes=30 expires_at pair_file pairing_id
+  local bundle renewed fingerprint
+  [[ -n "$name" ]] || die "Usage: etxr pair renew WORKER [--expires-minutes 30]"
+  shift || true
+  while (($#)); do
+    case "$1" in
+      --expires-minutes) expires_minutes="$2"; shift 2 ;;
+      --help)
+        echo "Usage: etxr pair renew WORKER [--expires-minutes 30]"
+        return
+        ;;
+      *) die "Unknown pair renew option: $1" ;;
+    esac
+  done
+  valid_name "$name" || die "Invalid worker name"
+  [[ "$expires_minutes" =~ ^[0-9]+$ ]] ||
+    die "有效期必须是整数分钟"
+  (( 10#$expires_minutes >= 1 && 10#$expires_minutes <= 525600 )) ||
+    die "有效期必须是 1 到 525600 分钟"
+  expires_minutes="$((10#$expires_minutes))"
+  require_state
+  ensure_control_state
+  [[ "$(jq -r '.node.role' "$STATE_FILE")" != "exit" ]] ||
+    die "只能在主服务器续发 Pair ID"
+  jq -e --arg name "$name" \
+    '.paired_nodes[]? | select(.name == $name)' "$STATE_FILE" >/dev/null ||
+    die "未找到从服务器：$name"
+  pair_file="$RUNTIME_DIR/pairs/${name}.id"
+  [[ -s "$pair_file" ]] ||
+    die "原 Pair ID 文件不存在；请删除该从服务器后重新添加"
+  (( $(wc -c <"$pair_file") <= PAIR_ID_MAX_BYTES + 1 )) ||
+    die "原 Pair ID 文件超过大小限制"
+  pairing_id="$(tr -d '\r\n' <"$pair_file")"
+  fingerprint="$(pair_public_fingerprint)"
+  bundle="$(pair_decode "$pairing_id" "$fingerprint")"
+  validate_pair_bundle "$bundle" ||
+    die "原 Pair ID 内容无效；请删除该从服务器后重新添加"
+  [[ "$(jq -r '.worker.name' <<<"$bundle")" == "$name" ]] ||
+    die "原 Pair ID 与从服务器名称不匹配"
+  expires_at="$(( $(date +%s) + expires_minutes * 60 ))"
+  renewed="$(jq -c --argjson expires "$expires_at" \
+    --argjson users "$(jq '.users' "$STATE_FILE")" \
+    '.expires_at = $expires | .users = $users' <<<"$bundle")"
+  validate_pair_bundle "$renewed" || die "续发后的 Pair ID 内容校验失败"
+  pairing_id="$(pair_encode "$renewed")"
+  state_update '
+    .paired_nodes |= map(
+      if .name == $name then
+        .expires_at = $expires |
+        .pair_issued_at = $issued
+      else . end
+    )
+  ' --arg name "$name" --argjson expires "$expires_at" \
+    --arg issued "$(date -u +%FT%TZ)"
+  printf '%s\n' "$pairing_id" | atomic_write "$pair_file"
+  printf '\n%s新的 Pair ID（旧 ID 不会被延长）：%s\n\n%s\n\n' \
+    "$C_GREEN" "$C_RESET" "$pairing_id"
+  printf 'Pair 签名指纹：%s\n' "$fingerprint"
+  printf '新的加入有效期：%s 分钟，到期时间约为 %s\n' \
+    "$expires_minutes" "$(date -d "@$expires_at" '+%F %T %Z')"
+  printf '线路、端口、Path、UUID 和 EasyTier IP 均保持不变。\n'
+}
+
 cmd_pair_list() {
   require_state
-  jq -r '(.paired_nodes // [])[] |
-    "\(.name)\tET=\(.easytier_ip)\tpublic=\(.public_host // "-")\tpath=\(.route_path)"' "$STATE_FILE"
+  local node name expires status public_host
+  printf '从服务器\tEasyTier IP\t公网地址\t主服务器 Path\tPair/连接状态\n'
+  while IFS= read -r node; do
+    [[ -n "$node" ]] || continue
+    name="$(jq -r '.name' <<<"$node")"
+    expires="$(jq -r '.expires_at // 0' <<<"$node")"
+    public_host="$(jq -r '.public_host // ""' <<<"$node")"
+    status="$(pair_node_status "$name" "$expires")"
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "$name" \
+      "$(jq -r '.easytier_ip' <<<"$node")" \
+      "${public_host:--}" \
+      "$(jq -r '.route_path' <<<"$node")" \
+      "$status"
+  done < <(jq -c '(.paired_nodes // [])[]' "$STATE_FILE")
 }
 
 cmd_pair_remove() {
@@ -6514,7 +6617,7 @@ cmd_control_apply() {
 
 cmd_control_status() {
   require_state
-  local role node name desired report
+  local role node name desired report expires pair_status
   role="$(jq -r '.node.role' "$STATE_FILE")"
   if [[ "$role" == "exit" ]]; then
     printf 'Agent：%s\n' "$(systemctl is-active etxr-agent.service 2>/dev/null || true)"
@@ -6536,7 +6639,9 @@ cmd_control_status() {
         "$(jq -r '.status // "-"' "$report")" \
         "$(jq -r '.received_at // "-"' "$report")"
     else
-      printf '%s\t%s\t-\t等待连接\t-\n' "$name" "${desired:0:12}"
+      expires="$(jq -r '.expires_at // 0' <<<"$node")"
+      pair_status="$(pair_node_status "$name" "$expires")"
+      printf '%s\t%s\t-\t%s\t-\n' "$name" "${desired:0:12}" "$pair_status"
     fi
   done < <(jq -c '(.paired_nodes // [])[]' "$STATE_FILE")
 }
@@ -6565,6 +6670,7 @@ cmd_pair() {
   case "$action" in
     create) cmd_pair_create "$@" ;;
     join) cmd_pair_join "$@" ;;
+    renew) cmd_pair_renew "$@" ;;
     list) cmd_pair_list ;;
     remove) cmd_pair_remove "$@" ;;
     decode)
@@ -6575,7 +6681,7 @@ cmd_pair() {
       }
       pair_decode "$id" "$fingerprint" | jq .
       ;;
-    *) die "Usage: etxr pair create|join|list|remove" ;;
+    *) die "Usage: etxr pair create|join|renew|list|remove" ;;
   esac
 }
 
@@ -7703,16 +7809,17 @@ menu_pair_manage() {
     menu_pause
     return
   fi
-  local choice name
+  local choice name expires pair_expires_minutes
   while true; do
     menu_header
     printf '%s主从节点管理%s\n' "$C_BOLD" "$C_RESET"
     printf '1. 查看所有从服务器\n'
     printf '2. 添加从服务器并生成配对 ID\n'
-    printf '3. 再次显示某个从服务器的配对 ID\n'
-    printf '4. 删除从服务器\n'
-    printf '5. 查看 EasyTier 节点\n'
-    printf '6. 查看配置下发状态\n'
+    printf '3. 再次显示仍在有效期内的 Pair ID\n'
+    printf '4. Pair ID 已过期：为原从服务器续发新 ID\n'
+    printf '5. 删除从服务器\n'
+    printf '6. 查看 EasyTier 节点\n'
+    printf '7. 查看配置下发状态\n'
     printf '0. 返回主菜单\n\n'
     read -r -p '请选择: ' choice
     case "$choice" in
@@ -7721,14 +7828,36 @@ menu_pair_manage() {
       3)
         name="$(prompt_value '从服务器名称（添加时填写的短名字）')"
         if [[ -f "$RUNTIME_DIR/pairs/${name}.id" ]]; then
-          cat "$RUNTIME_DIR/pairs/${name}.id"
-          printf '\n'
+          expires="$(jq -r --arg name "$name" \
+            '.paired_nodes[]? | select(.name == $name) | .expires_at // 0' \
+            "$STATE_FILE")"
+          if [[ "$expires" =~ ^[0-9]+$ ]] &&
+             (( 10#$expires <= $(date +%s) )); then
+            warn "这个 Pair ID 已过期，从服务器不能再使用它加入"
+            printf '请选择第 4 项，为同一个从服务器续发新的 Pair ID。\n'
+          else
+            cat "$RUNTIME_DIR/pairs/${name}.id"
+            printf '\n'
+          fi
         else
           warn "未找到该配对 ID"
         fi
         menu_pause
         ;;
       4)
+        name="$(prompt_value '要续发 Pair ID 的从服务器名称')"
+        pair_expires_minutes="$(prompt_value '新的 Pair ID 可使用多少分钟' '30')"
+        if [[ ! "$pair_expires_minutes" =~ ^[0-9]+$ ]] ||
+           (( 10#$pair_expires_minutes < 1 ||
+              10#$pair_expires_minutes > 525600 )); then
+          warn "有效期必须是 1 到 525600 分钟之间的整数"
+        else
+          menu_exec cmd_pair_renew "$name" \
+            --expires-minutes "$pair_expires_minutes" || true
+        fi
+        menu_pause
+        ;;
+      5)
         name="$(prompt_value '要删除的从服务器名称（添加时填写的短名字）')"
         if menu_confirm "确认删除 ${name} 的线路与出口"; then
           menu_exec cmd_pair_remove "$name" || true
@@ -7736,7 +7865,7 @@ menu_pair_manage() {
         fi
         menu_pause
         ;;
-      5)
+      6)
         if [[ -x "$EASYTIER_CLI_BIN" ]]; then
           "$EASYTIER_CLI_BIN" peer || true
           "$EASYTIER_CLI_BIN" route || true
@@ -7745,7 +7874,7 @@ menu_pair_manage() {
         fi
         menu_pause
         ;;
-      6) menu_exec cmd_control_status || true; menu_pause ;;
+      7) menu_exec cmd_control_status || true; menu_pause ;;
       0) return ;;
       *) warn "无效选项"; sleep 1 ;;
     esac

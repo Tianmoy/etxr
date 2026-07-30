@@ -459,6 +459,44 @@ fi
 PAIR_EXPIRES_AT="$("$EDGE" pair decode "$PAIR_ID" | "$JQ" -r '.expires_at')"
 PAIR_REMAINING="$((PAIR_EXPIRES_AT - $(date +%s)))"
 (( PAIR_REMAINING >= 1700 && PAIR_REMAINING <= 1800 ))
+PAIR_CONTROL_TOKEN="$("$EDGE" pair decode "$PAIR_ID" | "$JQ" -r '.control.token')"
+PAIR_ROUTE_PATH="$("$JQ" -r '.paired_nodes[] | select(.name == "b1") | .route_path' \
+  "$TMP/state.json")"
+"$JQ" --argjson expired "$(( $(date +%s) - 1 ))" '
+  .paired_nodes |= map(
+    if .name == "b1" then .expires_at = $expired else . end
+  )
+' "$TMP/state.json" >"$TMP/state-expired.json"
+mv "$TMP/state-expired.json" "$TMP/state.json"
+"$EDGE" pair list >"$TMP/pair-list-expired.txt"
+grep -Fq 'Pair ID 已过期' "$TMP/pair-list-expired.txt"
+"$EDGE" control status >"$TMP/control-status-expired.txt"
+grep -Fq 'Pair ID 已过期' "$TMP/control-status-expired.txt"
+"$EDGE" pair renew b1 --expires-minutes 60 >"$TMP/pair-renew.txt"
+RENEWED_PAIR_ID="$(tr -d '\r\n' <"$TMP/pairs/b1.id")"
+[[ "$RENEWED_PAIR_ID" != "$PAIR_ID" ]]
+"$EDGE" pair decode --fingerprint "$PAIR_FINGERPRINT" "$RENEWED_PAIR_ID" |
+  "$JQ" -e --arg token "$PAIR_CONTROL_TOKEN" '
+    .worker.name == "b1" and
+    .control.token == $token and
+    .relay.public_port == 30001 and
+    .relay.listen_port == 29000
+  ' >/dev/null
+RENEWED_EXPIRES_AT="$("$EDGE" pair decode "$RENEWED_PAIR_ID" |
+  "$JQ" -r '.expires_at')"
+RENEWED_REMAINING="$((RENEWED_EXPIRES_AT - $(date +%s)))"
+(( RENEWED_REMAINING >= 3500 && RENEWED_REMAINING <= 3600 ))
+"$JQ" -e --arg path "$PAIR_ROUTE_PATH" --argjson expires "$RENEWED_EXPIRES_AT" '
+  .paired_nodes[] | select(
+    .name == "b1" and
+    .route_path == $path and
+    .easytier_ip == "10.100.0.11" and
+    .expires_at == $expires
+  )
+' "$TMP/state.json" >/dev/null
+"$EDGE" pair list >"$TMP/pair-list-renewed.txt"
+grep -Fq '等待连接（剩余约 60 分钟）' "$TMP/pair-list-renewed.txt"
+PAIR_ID="$RENEWED_PAIR_ID"
 "$EDGE" render
 "$XRAY" run -test -config "$TMP/generated/xray.json"
 CONTROL_PATH="$("$JQ" -r '.control.base_path' "$TMP/state.json")"

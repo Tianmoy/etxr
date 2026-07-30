@@ -15,7 +15,7 @@ def main() -> int:
     text = SCRIPT.read_text(encoding="utf-8")
     assert text.startswith("#!/usr/bin/env bash\n")
     assert "set -Eeuo pipefail" in text
-    assert 'VERSION="0.13.3"' in text
+    assert 'VERSION="0.13.4"' in text
     assert "local expires_minutes=30 expires_at" in text
     assert "--expires-minutes" in text
 
@@ -58,6 +58,9 @@ def main() -> int:
     assert "menu_quick_subscription()" in text
     assert "menu_advanced()" in text
     assert "menu_pair_manage()" in text
+    assert "cmd_pair_renew()" in text
+    assert "Pair ID 已过期：为原从服务器续发新 ID" in text
+    assert "等待连接（剩余约 %s 分钟）" in text
     assert "menu_self_update()" in text
     assert "查看配置下发状态" in text
     assert "配置接收 Agent" in text
