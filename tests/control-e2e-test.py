@@ -60,6 +60,8 @@ async def run() -> None:
         state = tmp / "master-state.json"
         control = tmp / "control"
         desired = control / "nodes" / f"{NODE}.json"
+        refresh_log = tmp / "subscription-refresh.log"
+        fake_hub_etxr = tmp / "fake-hub-etxr"
         port = free_port()
 
         env = dict(os.environ)
@@ -87,6 +89,15 @@ async def run() -> None:
             "issued_at": issued_at,
             "users": users,
         })
+        fake_hub_etxr.write_text(
+            "#!/usr/bin/env bash\n"
+            "printf '%s\\n' \"$*\" >>\"$ETXR_TEST_REFRESH_LOG\"\n",
+            encoding="utf-8",
+        )
+        fake_hub_etxr.chmod(0o755)
+        hub_env = dict(os.environ)
+        hub_env["ETXR_TEST_REFRESH_LOG"] = str(refresh_log)
+        write_json(control / "reports" / f"{NODE}.json", [])
 
         hub = await asyncio.create_subprocess_exec(
             sys.executable,
@@ -96,10 +107,15 @@ async def run() -> None:
             str(state),
             "--control-dir",
             str(control),
+            "--etxr-bin",
+            str(fake_hub_etxr),
+            "--subscription-dir",
+            str(tmp / "subscriptions"),
             "--listen",
             "127.0.0.1",
             "--port",
             str(port),
+            env=hub_env,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -121,6 +137,25 @@ async def run() -> None:
                     assert response.status == 401
 
                 headers = {"Authorization": "Bearer " + TOKEN}
+                entry = {
+                    "schema": 1,
+                    "node": {
+                        "name": NODE,
+                        "domain": "worker.example.com",
+                        "address": "worker.example.com",
+                    },
+                    "nginx": {"tls_port": 443},
+                    "xray": {"routes": [], "reality_inbounds": []},
+                    "hysteria2": {"enabled": False},
+                }
+                async with session.post(
+                    f"{base_url}/report/{NODE}",
+                    headers=headers,
+                    json={"status": "current", "entry": entry},
+                ) as response:
+                    assert response.status == 200
+                await wait_until(refresh_log.exists)
+                assert "subscriptions refresh" in refresh_log.read_text(encoding="utf-8")
                 async with session.get(
                     f"{base_url}/config/{NODE}", headers=headers
                 ) as response:
@@ -150,6 +185,14 @@ async def run() -> None:
             usage_file = worker / "usage.json"
             fake_etxr = worker / "fake-etxr"
             write_json(worker_state, {
+                "node": {
+                    "name": NODE,
+                    "domain": "worker.example.com",
+                    "address": "worker.example.com",
+                },
+                "nginx": {"tls_port": 443},
+                "xray": {"routes": [], "reality_inbounds": []},
+                "hysteria2": {"enabled": False},
                 "control": {"agent": {
                     "enabled": True,
                     "base_url": base_url,
@@ -217,6 +260,7 @@ async def run() -> None:
                 report = json.loads(report_file.read_text(encoding="utf-8"))
                 assert report["usage"]["users"]["alice"]["uplink"] == 1234
                 assert report["usage"]["users"]["alice"]["downlink"] == 5678
+                assert report["entry"]["node"]["name"] == NODE
             finally:
                 agent.terminate()
                 await agent.wait()

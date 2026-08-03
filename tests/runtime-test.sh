@@ -144,12 +144,21 @@ EDGE="$ROOT/etxr.sh"
 "$EDGE" exit add --name tw --address tw.example.com --port 443 \
   --transport tls --server-name tw.example.com --host tw.example.com \
   --path /relay-tw --uuid 22222222-2222-4222-8222-222222222222
+"$EDGE" exit add --name socks-tw --address 127.0.0.1 --port 1080 \
+  --transport socks5 --username proxy-user --password proxy-pass
+if "$EDGE" exit add --name invalid-socks --address 127.0.0.1 --port 1081 \
+  --transport socks5 --username proxy-user >/dev/null 2>&1; then
+  echo "SOCKS5 exit accepted incomplete authentication" >&2
+  exit 1
+fi
 "$EDGE" route add --name hk --path /entry-hk --port 18001 --target direct
 "$EDGE" route add --name tw --path /entry-tw --port 18002 --target tw
 "$EDGE" route add --name pq --path /entry-pq --port 18003 --target direct \
   --profile vlessenc-vision \
   --decryption "$server_decryption" \
   --client-encryption "$client_encryption"
+"$EDGE" route add --name socks-tw --path /entry-socks --port 18004 \
+  --target socks-tw
 "$EDGE" reality add --name backup --port 18443 --path /reality-backup \
   --target www.microsoft.com:443 --server-names www.microsoft.com \
   --private-key "$reality_private" --public-key "$reality_public" \
@@ -297,7 +306,7 @@ grep -q '^old subscription$' "$FAULT_SUBS/old"
 grep -q '^old unit$' "$FAULT_UNITS/etxr-xray.service"
 [[ ! -e "$FAULT_UNITS/etxr-sing-box.service" ]]
 
-"$JQ" -e '.inbounds | length == 6' "$TMP/generated/xray.json" >/dev/null
+"$JQ" -e '.inbounds | length == 7' "$TMP/generated/xray.json" >/dev/null
 "$JQ" -e '.users[] | select(
   .name == "alice" and
   .speed_limit.up_mbps == 5 and
@@ -310,6 +319,21 @@ grep -q '^old unit$' "$FAULT_UNITS/etxr-xray.service"
   .tag == "limit-socks-alice" and
   .settings.servers[0].address == "127.0.0.1" and
   .settings.servers[0].port == 18181
+)' "$TMP/generated/xray.json" >/dev/null
+"$JQ" -e '.outbounds[] | select(
+  .tag == "exit-socks-tw" and
+  .protocol == "socks" and
+  .settings.servers[0].address == "127.0.0.1" and
+  .settings.servers[0].port == 1080 and
+  .settings.servers[0].users == [{"user":"proxy-user","pass":"proxy-pass"}]
+)' "$TMP/generated/xray.json" >/dev/null
+"$JQ" -e '.outbounds[] | select(
+  .tag == "limit-exit-alice-socks-tw" and
+  .protocol == "socks" and
+  .streamSettings.sockopt.dialerProxy == "limit-socks-alice"
+)' "$TMP/generated/xray.json" >/dev/null
+"$JQ" -e '.routing.rules[] | select(
+  .inboundTag == ["path-socks-tw"] and .outboundTag == "exit-socks-tw"
 )' "$TMP/generated/xray.json" >/dev/null
 "$JQ" -e '.routing.rules[] | select(
   .user == ["alice@hk"] and .outboundTag == "limit-direct-alice"
@@ -383,10 +407,26 @@ curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${SOCKS_PORT}" \
 stop_test_processes
 
 "$EDGE" subscription alice >"$TMP/subscription.txt"
+"$EDGE" subscriptions snapshot >"$TMP/master-entry.json"
+if grep -Eq 'proxy-user|proxy-pass|socks_username|socks_password' \
+  "$TMP/master-entry.json"; then
+  echo "SOCKS5 credentials leaked into the subscription entry snapshot" >&2
+  exit 1
+fi
 grep -Eq 'Subscription URL: https://hk\.example\.com/522b276a/[0-9a-f]{40}$' \
   "$TMP/subscription.txt"
 if grep -q '/sub/' "$TMP/subscription.txt"; then
   echo "fixed /sub/ subscription URL exists" >&2
+  exit 1
+fi
+grep -Fq '#hk-XHTTP' "$TMP/subscription.txt"
+grep -Fq '#hk-tw-XHTTP' "$TMP/subscription.txt"
+grep -Fq '#hk-socks-tw-XHTTP' "$TMP/subscription.txt"
+grep -Fq '#hk-VLESS-Encryption-XHTTP' "$TMP/subscription.txt"
+grep -Fq '#hk-Reality-XHTTP' "$TMP/subscription.txt"
+grep -Fq '#hk-Hysteria2' "$TMP/subscription.txt"
+if grep -Eq '#[^[:space:]]*example\.com' "$TMP/subscription.txt"; then
+  echo "subscription label contains a domain" >&2
   exit 1
 fi
 "$EDGE" client alice --route pq --out "$TMP/client-pq.json"
@@ -588,6 +628,30 @@ openssl x509 -in "$WORKER/certs/b1/fullchain.pem" -noout -ext subjectAltName |
   (.control.agent.base_url | test("^https://hk\\.example\\.com/[0-9a-f]{32}$")) and
   (.control.agent.token | test("^[0-9a-f]{64}$"))
 ' "$WORKER/state.json" >/dev/null
+"$JQ" -e '.subscription.enabled == false' "$WORKER/state.json" >/dev/null
+if ETXR_STATE="$WORKER/state.json" ETXR_RUNTIME="$WORKER" \
+   ETXR_GENERATED="$WORKER/generated" ETXR_SUBSCRIPTIONS="$WORKER/subscriptions" \
+   "$EDGE" subscription alice >/dev/null 2>&1; then
+  echo "worker unexpectedly generated a subscription" >&2
+  exit 1
+fi
+if grep -q 'location = /522b276a/' "$WORKER/generated/nginx-paths.conf" 2>/dev/null; then
+  echo "worker nginx unexpectedly exposed a subscription endpoint" >&2
+  exit 1
+fi
+
+# Worker public entries are reported through the control channel and merged
+# into the master-owned subscription.
+mkdir -p "$TMP/control/reports"
+ETXR_STATE="$WORKER/state.json" ETXR_RUNTIME="$WORKER" \
+  "$EDGE" subscriptions snapshot >"$TMP/worker-entry.json"
+"$JQ" -n --slurpfile entry "$TMP/worker-entry.json" \
+  '{status: "current", entry: $entry[0]}' >"$TMP/control/reports/b1.json"
+"$EDGE" render >/dev/null
+"$EDGE" subscription alice >"$TMP/master-central-subscription.txt"
+grep -Fq '#b1-XHTTP' "$TMP/master-central-subscription.txt"
+grep -Fq '#b1-Reality-XHTTP' "$TMP/master-central-subscription.txt"
+grep -Fq '#b1-Hysteria2' "$TMP/master-central-subscription.txt"
 ETXR_STATE="$WORKER/state.json" \
 ETXR_RUNTIME="$WORKER" \
 ETXR_GENERATED="$WORKER/generated" \

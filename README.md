@@ -1,4 +1,4 @@
-# ETXR v0.13.7
+# ETXR v0.14.0
 
 ETXR 是面向 Debian 12 空白系统的一站式中文菜单脚本，用一份脚本安装主服务器或任意数量的从服务器。它管理 Xray、sing-box、EasyTier、订阅和用户配置，并可复用宝塔 nginx 的 TCP 443。
 
@@ -11,7 +11,8 @@ ETXR 是面向 Debian 12 空白系统的一站式中文菜单脚本，用一份�
 - 没有公网端口的从服务器只使用 EasyTier。
 - 从服务器开机时先等待 EasyTier 私网地址建立，再启动绑定私网地址的 Xray 中继。
 - 用户新增、暂停、恢复和删除后，通过 WSS 通知从服务器，再由从服务器通过 HTTPS 拉取签名配置。
-- 自动生成订阅，多用户共用协议监听端口，不创建单用户端口。
+- 主服务器统一生成订阅并自动合并所有从服务器入口；从服务器不暴露订阅 URL。
+- 主服务器和从服务器都可添加仅出站 SOCKS5，并使用现有 XHTTP + TLS Path 分流到该出口。
 - 按用户统计上传、下载和总流量，主服务器自动汇总所有从服务器。
 - 按用户分别设置上传和下载 Mbps，`0` 表示不限速；设置会自动下发。
 - Xray 与 sing-box 均配置 BT 拒绝规则。
@@ -77,6 +78,7 @@ chmod +x etxr.sh
 6. 一键检查与修复
 7. 高级设置
 8. 检查并更新 ETXR
+9. 出口分流设置（SOCKS5 / 远程出口）
 0. 退出
 ```
 
@@ -290,6 +292,8 @@ https://DOMAIN/SHA1_PREFIX/SUBSCRIPTION_TOKEN
 - `SHA1_PREFIX`：用户名 SHA1 的前 8 位。
 - `SUBSCRIPTION_TOKEN`：40 位随机十六进制令牌。
 - 不使用固定订阅目录。
+- 从服务器通过现有 WSS/HTTPS 控制通道回报公开入口参数，订阅始终在主服务器生成和读取。
+- 节点名称不包含域名，格式为 `入口机器-XHTTP`、`入口机器-出口机器-XHTTP`、`入口机器-Reality-XHTTP` 或 `入口机器-Hysteria2`。
 
 包含订阅令牌和控制 Path 的 nginx 扩展配置使用 `0600`；订阅正文使用 `root:nginx-worker-group 0640`，只允许 Nginx worker 读取。
 
@@ -307,6 +311,33 @@ XHTTP/Reality 的有限速用户由 Xray 送入只监听 `127.0.0.1` 的 Go 认�
 - 清零操作通过控制通道自动下发到所有从服务器。
 
 Hysteria2 协议设置里的总上传/下载 Mbps 仍是整条共享 HY2 入站的容量参数；用户菜单中的数值才是单用户限速。
+
+## SOCKS5 出口分流
+
+主服务器和从服务器都可在主菜单选择 `9. 出口分流设置`，再选择
+`添加 SOCKS5 出口和 XHTTP Path`。向导会询问：
+
+```text
+出口机器名称（用于订阅节点名称）
+SOCKS5 地址和端口
+可选的 SOCKS5 用户名与密码
+XHTTP Path 和 Xray 本机端口
+```
+
+客户端入口仍是当前服务器的 `VLESS + XHTTP + nginx TLS`。Xray 根据 Path
+把流量送往 SOCKS5 出口，不会创建或开放 SOCKS5 入站端口。SOCKS5 用户名和
+密码只保存在当前机器权限为 `0600` 的状态与生成配置中，不会回报给主服务器，
+也不会写入订阅。
+
+命令行等价操作：
+
+```bash
+etxr exit add --name EXIT_NAME --address SOCKS_HOST --port SOCKS_PORT \
+  --transport socks5 --username SOCKS_USER --password SOCKS_PASS
+etxr route add --name ROUTE_NAME --path /RANDOM_PATH --port 18001 \
+  --target EXIT_NAME
+etxr apply
+```
 
 ## 服务和文件
 
@@ -359,6 +390,8 @@ etxr xray check-update       # 检查 Xray 更新
 etxr xray update             # 更新 Xray 并验证配置
 etxr validate                # 生成并检查所有配置
 etxr apply                   # 备份、生成、检查并应用
+etxr exit list               # 查看 SOCKS5 和远程出口
+etxr subscriptions refresh  # 主服务器立即重建集中订阅
 ```
 
 ## 测试
@@ -393,7 +426,7 @@ checksums.txt
 
 脚本先校验 SHA-256 和二进制内置版本，再通过同目录临时文件原子替换；旧二进制保存在 `/etc/etxr/backups/dataplane-binary/`，失败时自动恢复。镜像站可将 `ETXR_DOWNLOAD_BASE` 设置为包含两个数据面二进制和 `checksums.txt` 的 HTTPS 目录。
 
-推送 `v0.13.7` 形式的 Git 标签后，GitHub Actions 会运行完整测试、交叉编译两个 Linux 架构并创建 Release。构建使用 `CGO_ENABLED=0`，目标机不需要额外运行库。
+推送 `v0.14.0` 形式的 Git 标签后，GitHub Actions 会运行完整测试、交叉编译两个 Linux 架构并创建 Release。构建使用 `CGO_ENABLED=0`，目标机不需要额外运行库。
 
 ## 许可证
 

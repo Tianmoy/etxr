@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.13.7"
+VERSION="0.14.0"
 ETXR_REPOSITORY="${ETXR_REPOSITORY:-Tianmoy/etxr}"
 ETXR_RELEASE_API="${ETXR_RELEASE_API:-https://api.github.com/repos/${ETXR_REPOSITORY}/releases/latest}"
 
@@ -86,6 +86,7 @@ Commands:
   apply
   install [--components xray,sing-box,easytier,nginx]
   subscription USER
+  subscriptions refresh|snapshot
   client USER --route ROUTE [--socks-port 10808] [--out FILE]
   backup
   status
@@ -893,6 +894,7 @@ valid_http_path() {
 }
 valid_absolute_path() { [[ "$1" =~ ^/[A-Za-z0-9._/-]+$ ]]; }
 valid_secret_value() { [[ "$1" =~ ^[A-Za-z0-9._:@+-]{1,256}$ ]]; }
+valid_socks_credential() { [[ ${#1} -le 255 && ! "$1" =~ [[:cntrl:]] ]]; }
 valid_bearer_token() { [[ "$1" =~ ^[0-9a-fA-F]{40}$ ]]; }
 valid_subscription_prefix() { [[ "$1" =~ ^[0-9a-fA-F]{8}$ ]]; }
 valid_control_token() { [[ "$1" =~ ^[0-9a-fA-F]{64}$ ]]; }
@@ -1110,7 +1112,7 @@ EOF
         hy2_bridge_port: $hy2_bridge_port
       },
       subscription: {
-        enabled: true,
+        enabled: ($role != "exit"),
         base_path: ""
       },
       users: []
@@ -1480,6 +1482,7 @@ cmd_route() {
 cmd_exit_add() {
   local name="" address="" port=443 transport="tls" server_name="" host="" path=""
   local uuid="" encryption="none" flow="" public_key="" short_id="" fingerprint="chrome"
+  local socks_username="" socks_password=""
   while (($#)); do
     case "$1" in
       --name) name="$2"; shift 2 ;;
@@ -1495,6 +1498,8 @@ cmd_exit_add() {
       --public-key) public_key="$2"; shift 2 ;;
       --short-id) short_id="$2"; shift 2 ;;
       --fingerprint) fingerprint="$2"; shift 2 ;;
+      --username) socks_username="$2"; shift 2 ;;
+      --password) socks_password="$2"; shift 2 ;;
       --help)
         cat <<'EOF'
 Usage:
@@ -1510,7 +1515,10 @@ Usage:
     --transport none --path /RELAY_PATH --uuid UUID \
     --encryption CLIENT_VLESS_ENCRYPTION --flow xtls-rprx-vision
 
-transport: tls | reality | none
+  etxr exit add --name socks-tw --address 127.0.0.1 --port 1080 \
+    --transport socks5 [--username USER --password PASS]
+
+transport: tls | reality | none | socks5
 For transport=none, use a private overlay address or VLESS Encryption.
 EOF
         return ;;
@@ -1518,27 +1526,46 @@ EOF
     esac
   done
   require_state
-  [[ -n "$name" && -n "$address" && -n "$path" && -n "$uuid" ]] ||
-    die "exit add requires --name, --address, --path, and --uuid"
+  [[ -n "$name" && -n "$address" ]] ||
+    die "exit add requires --name and --address"
   valid_name "$name" || die "Invalid exit name"
   valid_port "$port" || die "Invalid port"
-  valid_uuid "$uuid" || die "Invalid UUID"
   [[ "$address" =~ ^[A-Za-z0-9.-]+$ ]] || die "Invalid exit address"
-  [[ "$transport" == "tls" || "$transport" == "reality" || "$transport" == "none" ]] ||
-    die "--transport must be tls, reality, or none"
-  path="$(normalize_path "$path")"
-  valid_http_path "$path" || die "Path may contain only letters, digits, /, ., _, ~, and -"
-  [[ "$path" != "/" ]] || die "Root path / is not allowed"
-  server_name="${server_name:-$address}"
-  host="${host:-$server_name}"
-  valid_hostname "$server_name" || die "Invalid server name"
-  valid_hostname "$host" || die "Invalid HTTP host"
-  if [[ "$transport" == "reality" ]]; then
-    [[ -n "$public_key" && -n "$short_id" ]] ||
-      die "Reality exit needs --public-key and --short-id"
-  fi
-  if [[ "$transport" == "none" && "$encryption" == "none" ]]; then
-    warn "Unencrypted VLESS is only suitable for a trusted private overlay"
+  [[ "$transport" == "tls" || "$transport" == "reality" ||
+     "$transport" == "none" || "$transport" == "socks5" ]] ||
+    die "--transport must be tls, reality, none, or socks5"
+  if [[ "$transport" == "socks5" ]]; then
+    valid_socks_credential "$socks_username" || die "Invalid SOCKS5 username"
+    valid_socks_credential "$socks_password" || die "Invalid SOCKS5 password"
+    [[ ( -z "$socks_username" && -z "$socks_password" ) ||
+       ( -n "$socks_username" && -n "$socks_password" ) ]] ||
+      die "SOCKS5 username and password must be provided together"
+    path=""
+    uuid=""
+    server_name=""
+    host=""
+    encryption="none"
+    flow=""
+    public_key=""
+    short_id=""
+  else
+    [[ -n "$path" && -n "$uuid" ]] ||
+      die "VLESS exit requires --path and --uuid"
+    valid_uuid "$uuid" || die "Invalid UUID"
+    path="$(normalize_path "$path")"
+    valid_http_path "$path" || die "Path may contain only letters, digits, /, ., _, ~, and -"
+    [[ "$path" != "/" ]] || die "Root path / is not allowed"
+    server_name="${server_name:-$address}"
+    host="${host:-$server_name}"
+    valid_hostname "$server_name" || die "Invalid server name"
+    valid_hostname "$host" || die "Invalid HTTP host"
+    if [[ "$transport" == "reality" ]]; then
+      [[ -n "$public_key" && -n "$short_id" ]] ||
+        die "Reality exit needs --public-key and --short-id"
+    fi
+    if [[ "$transport" == "none" && "$encryption" == "none" ]]; then
+      warn "Unencrypted VLESS is only suitable for a trusted private overlay"
+    fi
   fi
   jq -e --arg name "$name" '.xray.exits[]? | select(.name == $name)' "$STATE_FILE" >/dev/null &&
     die "Exit already exists: $name"
@@ -1549,6 +1576,7 @@ EOF
       server_name: $server_name, host: $host, path: $path, uuid: $uuid,
       encryption: $encryption, flow: $flow, public_key: $public_key,
       short_id: $short_id, fingerprint: $fingerprint,
+      socks_username: $socks_username, socks_password: $socks_password,
       xmux: {
         maxConcurrency: "16-32", maxConnections: 0,
         cMaxReuseTimes: "64-128", cMaxLifetimeMs: 0,
@@ -1559,6 +1587,7 @@ EOF
     --arg server_name "$server_name" --arg host "$host" --arg path "$path" \
     --arg uuid "$uuid" --arg encryption "$encryption" --arg flow "$flow" \
     --arg public_key "$public_key" --arg short_id "$short_id" \
+    --arg socks_username "$socks_username" --arg socks_password "$socks_password" \
     --arg fingerprint "$fingerprint" --argjson port "$port"
   log "Added exit $name"
 }
@@ -1574,7 +1603,12 @@ cmd_exit_remove() {
 cmd_exit_list() {
   require_state
   jq -r '.xray.exits[]? |
-    "\(.name)\t\(.transport)://\(.address):\(.port)\tpath=\(.path)\tflow=\(.flow // "")"' "$STATE_FILE"
+    if .transport == "socks5" then
+      "\(.name)\tsocks5://\(.address):\(.port)\tauth=" +
+      (if (.socks_username // "") == "" then "no" else "yes" end)
+    else
+      "\(.name)\t\(.transport)://\(.address):\(.port)\tpath=\(.path)\tflow=\(.flow // "")"
+    end' "$STATE_FILE"
 }
 
 cmd_exit() {
@@ -1851,61 +1885,89 @@ render_xray() {
       ));
 
     def outbound_for_exit($e; $tag; $address; $port; $dialer):
-      {
-        tag: $tag,
-        protocol: "vless",
-        settings: {
-          vnext: [{
-            address: $address,
-            port: $port,
-            users: [{
-              id: $e.uuid,
-              encryption: ($e.encryption // "none"),
-              level: 0
-            } + (if ($e.flow // "") == "" then {} else {flow: $e.flow} end)]
-          }]
-        },
-        streamSettings:
-          ({
-            network: ($e.network // "xhttp"),
-            security: ($e.transport // "none"),
+      if ($e.transport // "none") == "socks5" then
+        {
+          tag: $tag,
+          protocol: "socks",
+          settings: {
+            servers: [
+              {
+                address: $address,
+                port: $port
+              }
+              + (if ($e.socks_username // "") == "" then {}
+                else {
+                  users: [{
+                    user: $e.socks_username,
+                    pass: ($e.socks_password // "")
+                  }]
+                } end)
+            ]
+          },
+          streamSettings: {
             sockopt: ({
               tcpFastOpen: true,
               tcpNoDelay: true
             } + (if $dialer == "" then {} else {dialerProxy: $dialer} end))
           }
-          + (if ($e.network // "xhttp") == "xhttp" then {
-              xhttpSettings: {
-                host: ($e.host // ""),
-                path: $e.path,
-                mode: "auto",
-                extra: {
-                  noGRPCHeader: false,
-                  scMaxEachPostBytes: 1000000,
-                  scMinPostsIntervalMs: 30,
-                  xPaddingBytes: "100-1000",
-                  xmux: ($e.xmux // {})
+        }
+      else
+        {
+          tag: $tag,
+          protocol: "vless",
+          settings: {
+            vnext: [{
+              address: $address,
+              port: $port,
+              users: [{
+                id: $e.uuid,
+                encryption: ($e.encryption // "none"),
+                level: 0
+              } + (if ($e.flow // "") == "" then {} else {flow: $e.flow} end)]
+            }]
+          },
+          streamSettings:
+            ({
+              network: ($e.network // "xhttp"),
+              security: ($e.transport // "none"),
+              sockopt: ({
+                tcpFastOpen: true,
+                tcpNoDelay: true
+              } + (if $dialer == "" then {} else {dialerProxy: $dialer} end))
+            }
+            + (if ($e.network // "xhttp") == "xhttp" then {
+                xhttpSettings: {
+                  host: ($e.host // ""),
+                  path: $e.path,
+                  mode: "auto",
+                  extra: {
+                    noGRPCHeader: false,
+                    scMaxEachPostBytes: 1000000,
+                    scMinPostsIntervalMs: 30,
+                    xPaddingBytes: "100-1000",
+                    xmux: ($e.xmux // {})
+                  }
                 }
-              }
-            } else {} end)
-          + (if ($e.transport // "none") == "tls" then {
-              tlsSettings: {
-                serverName: $e.server_name,
-                allowInsecure: false,
-                alpn: ["h2"],
-                fingerprint: ($e.fingerprint // "chrome")
-              }
-            } elif ($e.transport // "none") == "reality" then {
-              realitySettings: {
-                show: false,
-                serverName: $e.server_name,
-                fingerprint: ($e.fingerprint // "chrome"),
-                publicKey: $e.public_key,
-                shortId: $e.short_id,
-                spiderX: "/"
-              }
-            } else {} end))
-      };
+              } else {} end)
+            + (if ($e.transport // "none") == "tls" then {
+                tlsSettings: {
+                  serverName: $e.server_name,
+                  allowInsecure: false,
+                  alpn: ["h2"],
+                  fingerprint: ($e.fingerprint // "chrome")
+                }
+              } elif ($e.transport // "none") == "reality" then {
+                realitySettings: {
+                  show: false,
+                  serverName: $e.server_name,
+                  fingerprint: ($e.fingerprint // "chrome"),
+                  publicKey: $e.public_key,
+                  shortId: $e.short_id,
+                  spiderX: "/"
+                }
+              } else {} end))
+        }
+      end;
 
     def exit_outbounds:
       $exits[0] | map(
@@ -2640,18 +2702,136 @@ active_user_json() {
     )' "$STATE_FILE"
 }
 
+subscription_entry_from_state() {
+  jq -c '{
+    schema: 1,
+    node: {
+      name: .node.name,
+      domain: .node.domain,
+      address: .node.address
+    },
+    nginx: {
+      tls_port: .nginx.tls_port
+    },
+    xray: {
+      routes: [.xray.routes[]? | {
+        name,
+        path,
+        port,
+        public_port: (.public_port // .port),
+        target,
+        profile,
+        host: (.host // ""),
+        client_encryption: (.client_encryption // "none"),
+        flow: (.flow // ""),
+        security: (.security // "tls"),
+        direct: (.direct // false),
+        allow_insecure: (.allow_insecure // false)
+      }],
+      reality_inbounds: [.xray.reality_inbounds[]? | {
+        name,
+        port,
+        path,
+        server_names,
+        public_key: (.public_key // ""),
+        short_ids
+      }]
+    },
+    hysteria2: {
+      enabled: (.hysteria2.enabled // false),
+      port: (.hysteria2.port // 443),
+      obfs: (.hysteria2.obfs // "none"),
+      obfs_password: (.hysteria2.obfs_password // ""),
+      insecure: (.hysteria2.insecure // false)
+    }
+  }' "$STATE_FILE"
+}
+
+validate_worker_subscription_entry() {
+  local expected="$1" entry="$2"
+  jq -e --arg expected "$expected" '
+    def valid_name:
+      type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$");
+    def valid_host:
+      type == "string" and
+      test("^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$");
+    def valid_port:
+      type == "number" and floor == . and . >= 1 and . <= 65535;
+    def valid_path:
+      type == "string" and test("^/[A-Za-z0-9._~/-]+$") and
+      (contains("//") | not) and (contains("..") | not);
+    .schema == 1 and
+    .node.name == $expected and
+    (.node.name | valid_name) and
+    (.node.domain | valid_host) and
+    (.node.address | valid_host) and
+    (.nginx.tls_port | valid_port) and
+    (.xray.routes | type == "array") and
+    all(.xray.routes[];
+      (.name | valid_name) and
+      (.path | valid_path) and
+      (.port | valid_port) and
+      (.public_port | valid_port) and
+      (.target == "direct" or (.target | valid_name)) and
+      (.profile == "plain" or .profile == "vlessenc-vision") and
+      (.host == "" or (.host | valid_host)) and
+      (.client_encryption | type == "string" and length <= 4096 and
+        (test("[\u0000-\u001f\u007f]") | not)) and
+      (.flow == "" or .flow == "xtls-rprx-vision") and
+      (.security == "none" or .security == "tls") and
+      (.direct | type == "boolean") and
+      (.allow_insecure | type == "boolean")
+    ) and
+    (.xray.reality_inbounds | type == "array") and
+    all(.xray.reality_inbounds[];
+      (.name | valid_name) and
+      (.port | valid_port) and
+      (.path | valid_path) and
+      (.server_names | type == "array" and length > 0 and
+        all(.[]; valid_host)) and
+      (.public_key | type == "string" and test("^[A-Za-z0-9_-]{20,128}$")) and
+      (.short_ids | type == "array" and length > 0 and
+        all(.[]; type == "string" and test("^[0-9a-fA-F]{2,32}$")))
+    ) and
+    (.hysteria2.enabled | type == "boolean") and
+    (.hysteria2.port | valid_port) and
+    (.hysteria2.obfs == "none" or .hysteria2.obfs == "salamander") and
+    (.hysteria2.obfs_password | type == "string" and length <= 512 and
+      (test("[\u0000-\u001f\u007f]") | not)) and
+    (.hysteria2.insecure | type == "boolean")
+  ' <<<"$entry" >/dev/null
+}
+
+subscription_worker_entries() {
+  local node name report entry
+  [[ "$(jq -r '.node.role' "$STATE_FILE")" != "exit" ]] || return 0
+  while IFS= read -r node; do
+    [[ -n "$node" ]] || continue
+    name="$(jq -r '.name' <<<"$node")"
+    report="$CONTROL_DIR/reports/${name}.json"
+    [[ -f "$report" ]] || continue
+    entry="$(jq -ce '.entry // empty' "$report" 2>/dev/null || true)"
+    [[ -n "$entry" ]] || continue
+    if validate_worker_subscription_entry "$name" "$entry"; then
+      printf '%s\n' "$entry"
+    else
+      warn "忽略从服务器 ${name} 回报的无效订阅入口参数"
+    fi
+  done < <(jq -c '(.paired_nodes // [])[]' "$STATE_FILE")
+}
+
 vless_link_for_route() {
-  local route="$1" user="$2"
-  local uuid domain address port name path profile encryption flow host query security
+  local route="$1" user="$2" entry="$3"
+  local uuid domain address port path profile encryption flow host query security
+  local entry_name target protocol fragment
   uuid="$(jq -r '.uuid' <<<"$user")"
-  domain="$(jq -r '.node.domain' "$STATE_FILE")"
-  address="$(jq -r '.node.address' "$STATE_FILE")"
+  domain="$(jq -r '.node.domain' <<<"$entry")"
+  address="$(jq -r '.node.address' <<<"$entry")"
   if [[ "$(jq -r '.direct // false' <<<"$route")" == "true" ]]; then
     port="$(jq -r '.public_port // .port' <<<"$route")"
   else
-    port="$(jq -r '.nginx.tls_port' "$STATE_FILE")"
+    port="$(jq -r '.nginx.tls_port' <<<"$entry")"
   fi
-  name="$(jq -r '.name' <<<"$route")"
   path="$(jq -r '.path' <<<"$route")"
   profile="$(jq -r '.profile' <<<"$route")"
   encryption="$(jq -r '.client_encryption // "none"' <<<"$route")"
@@ -2669,15 +2849,21 @@ vless_link_for_route() {
     extra='{"xmux":{"maxConcurrency":"16-32","maxConnections":0,"cMaxReuseTimes":"64-128","cMaxLifetimeMs":0,"hMaxRequestTimes":"800-900","hKeepAlivePeriod":0}}'
     query+="&extra=$(urlencode "$extra")"
   fi
+  entry_name="$(jq -r '.node.name' <<<"$entry")"
+  target="$(jq -r '.target' <<<"$route")"
+  protocol="XHTTP"
+  [[ "$profile" != "vlessenc-vision" ]] || protocol="VLESS-Encryption-XHTTP"
+  fragment="${entry_name}-${protocol}"
+  [[ "$target" == "direct" ]] || fragment="${entry_name}-${target}-${protocol}"
   printf 'vless://%s@%s:%s?%s#%s\n' \
-    "$uuid" "$address" "$port" "$query" "$(urlencode "${name}-${domain}")"
+    "$uuid" "$address" "$port" "$query" "$(urlencode "$fragment")"
 }
 
 vless_link_for_reality() {
-  local reality="$1" user="$2"
-  local uuid address name port path sni public_key short_id query
+  local reality="$1" user="$2" entry="$3"
+  local uuid address name port path sni public_key short_id query entry_name
   uuid="$(jq -r '.uuid' <<<"$user")"
-  address="$(jq -r '.node.address' "$STATE_FILE")"
+  address="$(jq -r '.node.address' <<<"$entry")"
   name="$(jq -r '.name' <<<"$reality")"
   port="$(jq -r '.port' <<<"$reality")"
   path="$(jq -r '.path' <<<"$reality")"
@@ -2690,46 +2876,60 @@ vless_link_for_reality() {
     return 0
   fi
   query="encryption=none&security=reality&sni=$(urlencode "$sni")&fp=chrome&pbk=$(urlencode "$public_key")&sid=$(urlencode "$short_id")&type=xhttp&path=$(urlencode "$path")&mode=auto"
+  entry_name="$(jq -r '.node.name' <<<"$entry")"
   printf 'vless://%s@%s:%s?%s#%s\n' \
-    "$uuid" "$address" "$port" "$query" "$(urlencode "${name}-reality")"
+    "$uuid" "$address" "$port" "$query" \
+    "$(urlencode "${entry_name}-Reality-XHTTP")"
 }
 
 hy2_link_for_user() {
-  local user="$1" password address domain port name query
+  local user="$1" entry="$2" password address domain port query entry_name
   password="$(jq -r '.hy2_password' <<<"$user")"
-  name="$(jq -r '.name' <<<"$user")"
-  address="$(jq -r '.node.address' "$STATE_FILE")"
-  domain="$(jq -r '.node.domain' "$STATE_FILE")"
-  port="$(jq -r '.hysteria2.port' "$STATE_FILE")"
+  address="$(jq -r '.node.address' <<<"$entry")"
+  domain="$(jq -r '.node.domain' <<<"$entry")"
+  port="$(jq -r '.hysteria2.port' <<<"$entry")"
   query="sni=$(urlencode "$domain")"
-  if [[ "$(jq -r '.hysteria2.insecure // false' "$STATE_FILE")" == "true" ]]; then
+  if [[ "$(jq -r '.hysteria2.insecure // false' <<<"$entry")" == "true" ]]; then
     query+="&insecure=1"
   fi
-  if [[ "$(jq -r '.hysteria2.obfs' "$STATE_FILE")" != "none" ]]; then
-    query+="&obfs=$(urlencode "$(jq -r '.hysteria2.obfs' "$STATE_FILE")")"
-    query+="&obfs-password=$(urlencode "$(jq -r '.hysteria2.obfs_password' "$STATE_FILE")")"
+  if [[ "$(jq -r '.hysteria2.obfs' <<<"$entry")" != "none" ]]; then
+    query+="&obfs=$(urlencode "$(jq -r '.hysteria2.obfs' <<<"$entry")")"
+    query+="&obfs-password=$(urlencode "$(jq -r '.hysteria2.obfs_password' <<<"$entry")")"
   fi
+  entry_name="$(jq -r '.node.name' <<<"$entry")"
   printf 'hysteria2://%s@%s:%s/?%s#%s\n' \
-    "$(urlencode "$password")" "$address" "$port" "$query" "$(urlencode "${name}-hy2")"
+    "$(urlencode "$password")" "$address" "$port" "$query" \
+    "$(urlencode "${entry_name}-Hysteria2")"
 }
 
-subscription_plain() {
-  local name="$1" user route reality
-  user="$(active_user_json "$name")" || die "Enabled user not found: $name"
+subscription_links_for_entry() {
+  local user="$1" entry="$2" route reality route_name
   while IFS= read -r route; do
     [[ -n "$route" ]] || continue
-    local route_name
     route_name="$(jq -r '.name' <<<"$route")"
     jq -e --arg r "$route_name" '(.routes | index("*")) != null or (.routes | index($r)) != null' <<<"$user" >/dev/null ||
       continue
-    vless_link_for_route "$route" "$user"
-  done < <(jq -c '.xray.routes[]?' "$STATE_FILE")
+    vless_link_for_route "$route" "$user" "$entry"
+  done < <(jq -c '.xray.routes[]?' <<<"$entry")
   while IFS= read -r reality; do
     [[ -n "$reality" ]] || continue
-    vless_link_for_reality "$reality" "$user"
-  done < <(jq -c '.xray.reality_inbounds[]?' "$STATE_FILE")
-  if [[ "$(jq -r '.hysteria2.enabled' "$STATE_FILE")" == "true" ]]; then
-    hy2_link_for_user "$user"
+    vless_link_for_reality "$reality" "$user" "$entry"
+  done < <(jq -c '.xray.reality_inbounds[]?' <<<"$entry")
+  if [[ "$(jq -r '.hysteria2.enabled' <<<"$entry")" == "true" ]]; then
+    hy2_link_for_user "$user" "$entry"
+  fi
+}
+
+subscription_plain() {
+  local name="$1" user entry
+  user="$(active_user_json "$name")" || die "Enabled user not found: $name"
+  entry="$(subscription_entry_from_state)"
+  subscription_links_for_entry "$user" "$entry"
+  if [[ "$(jq -r '.node.role' "$STATE_FILE")" != "exit" ]]; then
+    while IFS= read -r entry; do
+      [[ -n "$entry" ]] || continue
+      subscription_links_for_entry "$user" "$entry"
+    done < <(subscription_worker_entries)
   fi
 }
 
@@ -2738,6 +2938,8 @@ render_subscriptions() {
   [[ -n "$target_dir" && "$target_dir" != "/" ]] || die "Unsafe subscription directory"
   mkdir -p "$target_dir"
   find "$target_dir" -mindepth 1 -maxdepth 1 -type f -delete
+  [[ "$(jq -r '.subscription.enabled // false' "$STATE_FILE")" == "true" ]] ||
+    return 0
   while IFS= read -r user; do
     [[ -n "$user" ]] || continue
     token="$(jq -r '.subscription_token' <<<"$user")"
@@ -2925,6 +3127,29 @@ validate_state_semantics() {
     [.xray.exits[].name] | length > 0
   ' "$STATE_FILE" >/dev/null; then
     warn "One or more routes reference a missing exit"
+    errors=1
+  fi
+  if ! jq -e '
+    all(.xray.exits[];
+      (.transport == "tls" or .transport == "reality" or
+       .transport == "none" or .transport == "socks5") and
+      (.address | type == "string" and test("^[A-Za-z0-9.-]+$")) and
+      (.port | type == "number" and floor == . and . >= 1 and . <= 65535) and
+      (if .transport == "socks5" then
+        ((.socks_username // "") | type == "string" and length <= 255 and
+          (test("[\u0000-\u001f\u007f]") | not)) and
+        ((.socks_password // "") | type == "string" and length <= 255 and
+          (test("[\u0000-\u001f\u007f]") | not)) and
+        ((((.socks_username // "") == "") and ((.socks_password // "") == "")) or
+         (((.socks_username // "") != "") and ((.socks_password // "") != "")))
+      else
+        (.uuid | type == "string" and
+          test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$")) and
+        (.path | type == "string" and test("^/[A-Za-z0-9._~/-]+$"))
+      end)
+    )
+  ' "$STATE_FILE" >/dev/null; then
+    warn "One or more exit definitions are invalid"
     errors=1
   fi
   if jq -e '
@@ -3213,6 +3438,7 @@ import hmac
 import json
 import os
 import random
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -3259,9 +3485,11 @@ def atomic_json(path, value):
 
 
 class Hub:
-    def __init__(self, state_path, control_dir):
+    def __init__(self, state_path, control_dir, etxr_bin, subscription_dir):
         self.state_path = state_path
         self.control_dir = Path(control_dir)
+        self.etxr_bin = etxr_bin
+        self.subscription_dir = subscription_dir
         self.connection_limit = asyncio.Semaphore(128)
 
     def node(self, node_id):
@@ -3289,17 +3517,56 @@ class Hub:
             previous = read_json(report_path)
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             previous = {}
-        if (
-            "usage" not in report
-            and isinstance(previous, dict)
-            and isinstance(previous.get("usage"), dict)
-        ):
-            report["usage"] = previous["usage"]
+        if not isinstance(previous, dict):
+            previous = {}
+        for key in ("usage", "entry"):
+            if key not in report and isinstance(previous.get(key), dict):
+                report[key] = previous[key]
+        entry = report.get("entry")
+        entry_changed = (
+            isinstance(entry, dict)
+            and entry.get("schema") == 1
+            and isinstance(entry.get("node"), dict)
+            and entry["node"].get("name") == node_id
+            and entry != previous.get("entry")
+        )
         report["node_id"] = node_id
         report["received_at"] = int(time.time())
         if request is not None:
             report["remote"] = request.remote
         atomic_json(report_path, report)
+        return entry_changed
+
+    def refresh_subscriptions(self):
+        env = dict(os.environ)
+        env["ETXR_CONTROL_DIR"] = str(self.control_dir)
+        env["ETXR_SUBSCRIPTIONS"] = self.subscription_dir
+        try:
+            result = subprocess.run(
+                [
+                    self.etxr_bin,
+                    "--state",
+                    self.state_path,
+                    "subscriptions",
+                    "refresh",
+                ],
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            print(f"etxr-control: subscription refresh failed: {error}", flush=True)
+            return
+        if result.returncode != 0:
+            message = result.stderr.decode(errors="replace")[-1000:]
+            print(
+                f"etxr-control: subscription refresh exited "
+                f"{result.returncode}: {message}",
+                flush=True,
+            )
 
     async def health(self, request):
         return web.json_response({"status": "ok"})
@@ -3332,9 +3599,11 @@ class Hub:
         except (json.JSONDecodeError, aiohttp.ContentTypeError):
             raise web.HTTPBadRequest()
         try:
-            self.save_report(node_id, report, request)
+            entry_changed = self.save_report(node_id, report, request)
         except ValueError:
             raise web.HTTPBadRequest()
+        if entry_changed:
+            await asyncio.to_thread(self.refresh_subscriptions)
         return web.json_response({"status": "accepted"})
 
     async def websocket(self, request):
@@ -3377,9 +3646,13 @@ class Hub:
                     continue
                 if payload.get("type") == "report":
                     try:
-                        self.save_report(node_id, payload, request)
+                        entry_changed = self.save_report(
+                            node_id, payload, request
+                        )
                     except ValueError:
                         continue
+                    if entry_changed:
+                        await asyncio.to_thread(self.refresh_subscriptions)
             elif message.type in {
                 aiohttp.WSMsgType.CLOSE,
                 aiohttp.WSMsgType.CLOSED,
@@ -3434,6 +3707,59 @@ class Agent:
             "users": users,
         }
 
+    def entry_snapshot(self):
+        state = read_json(self.state_path)
+        node = state.get("node", {})
+        nginx = state.get("nginx", {})
+        xray = state.get("xray", {})
+        hysteria2 = state.get("hysteria2", {})
+        routes = []
+        for route in xray.get("routes", []):
+            routes.append({
+                "name": route.get("name", ""),
+                "path": route.get("path", ""),
+                "port": route.get("port", 0),
+                "public_port": route.get("public_port", route.get("port", 0)),
+                "target": route.get("target", "direct"),
+                "profile": route.get("profile", "plain"),
+                "host": route.get("host", ""),
+                "client_encryption": route.get("client_encryption", "none"),
+                "flow": route.get("flow", ""),
+                "security": route.get("security", "tls"),
+                "direct": bool(route.get("direct", False)),
+                "allow_insecure": bool(route.get("allow_insecure", False)),
+            })
+        realities = []
+        for reality in xray.get("reality_inbounds", []):
+            realities.append({
+                "name": reality.get("name", ""),
+                "port": reality.get("port", 0),
+                "path": reality.get("path", ""),
+                "server_names": reality.get("server_names", []),
+                "public_key": reality.get("public_key", ""),
+                "short_ids": reality.get("short_ids", []),
+            })
+        return {
+            "schema": 1,
+            "node": {
+                "name": node.get("name", ""),
+                "domain": node.get("domain", ""),
+                "address": node.get("address", ""),
+            },
+            "nginx": {"tls_port": nginx.get("tls_port", 443)},
+            "xray": {
+                "routes": routes,
+                "reality_inbounds": realities,
+            },
+            "hysteria2": {
+                "enabled": bool(hysteria2.get("enabled", False)),
+                "port": hysteria2.get("port", 443),
+                "obfs": hysteria2.get("obfs", "none"),
+                "obfs_password": hysteria2.get("obfs_password", ""),
+                "insecure": bool(hysteria2.get("insecure", False)),
+            },
+        }
+
     @staticmethod
     def validate_base_url(value):
         parsed = urlsplit(value)
@@ -3445,6 +3771,7 @@ class Agent:
         payload = dict(payload)
         payload["hostname"] = os.uname().nodename
         payload["usage"] = self.usage()
+        payload["entry"] = self.entry_snapshot()
         try:
             async with session.post(
                 f"{base_url}/report/{node_id}", json=payload
@@ -3610,6 +3937,10 @@ def main():
     hub_parser = subparsers.add_parser("hub")
     hub_parser.add_argument("--state", required=True)
     hub_parser.add_argument("--control-dir", required=True)
+    hub_parser.add_argument("--etxr-bin", default="/usr/local/sbin/etxr")
+    hub_parser.add_argument(
+        "--subscription-dir", default="/var/lib/etxr/subscriptions"
+    )
     hub_parser.add_argument("--listen", default="127.0.0.1")
     hub_parser.add_argument("--port", type=int, default=18180)
     agent_parser = subparsers.add_parser("agent")
@@ -3620,7 +3951,12 @@ def main():
     )
     args = parser.parse_args()
     if args.mode == "hub":
-        hub = Hub(args.state, args.control_dir)
+        hub = Hub(
+            args.state,
+            args.control_dir,
+            args.etxr_bin,
+            args.subscription_dir,
+        )
         web.run_app(hub.app(), host=args.listen, port=args.port, access_log=None)
     else:
         asyncio.run(Agent(args.state, args.etxr_bin, args.usage_file).run())
@@ -3856,7 +4192,7 @@ User=root
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
-ExecStart=/usr/bin/python3 ${CONTROL_HELPER} hub --state ${STATE_FILE} --control-dir ${CONTROL_DIR} --listen 127.0.0.1 --port $(jq -r '.control.port' "$STATE_FILE")
+ExecStart=/usr/bin/python3 ${CONTROL_HELPER} hub --state ${STATE_FILE} --control-dir ${CONTROL_DIR} --etxr-bin ${SELF_BIN} --subscription-dir ${SUBSCRIPTION_DIR} --listen 127.0.0.1 --port $(jq -r '.control.port' "$STATE_FILE")
 Restart=always
 RestartSec=3s
 
@@ -6541,7 +6877,7 @@ EOF
     "$(jq -r '.worker.easytier_ip' <<<"$bundle")" \
     "$(jq -r '.master.address' <<<"$bundle")" \
     "$(jq -r '.master.tcp_port' <<<"$bundle")"
-  cmd_subscription "$(jq -r '.[0].name' <<<"$worker_users")"
+  printf '订阅由主服务器统一生成；这台从服务器不提供订阅地址。\n'
 }
 
 pair_node_status() {
@@ -6782,6 +7118,8 @@ cmd_pair() {
 cmd_subscription() {
   local name="${1:-}"; [[ -n "$name" ]] || die "Usage: etxr subscription USER"
   require_state
+  [[ "$(jq -r '.node.role' "$STATE_FILE")" != "exit" ]] ||
+    die "从服务器不生成订阅，请到主服务器查看"
   local user token prefix domain
   user="$(active_user_json "$name")" || die "Enabled user not found: $name"
   subscription_plain "$name"
@@ -6794,6 +7132,54 @@ cmd_subscription() {
     [[ "$port" == "443" ]] || suffix=":${port}"
     printf '\nSubscription URL: https://%s%s/%s/%s\n' "$domain" "$suffix" "$prefix" "$token"
   fi
+}
+
+cmd_subscriptions_snapshot() {
+  require_state
+  subscription_entry_from_state
+}
+
+cmd_subscriptions_refresh() {
+  require_state
+  need_root
+  [[ "$(jq -r '.node.role' "$STATE_FILE")" != "exit" ]] ||
+    die "从服务器不生成订阅，请到主服务器刷新"
+  local parent staging previous subscription_group=www-data
+  parent="$(dirname "$SUBSCRIPTION_DIR")"
+  [[ -n "$SUBSCRIPTION_DIR" && "$SUBSCRIPTION_DIR" != "/" ]] ||
+    die "Unsafe subscription directory"
+  state_lock_acquire
+  mkdir -p "$parent"
+  staging="$(mktemp -d "$parent/.etxr-subscriptions.XXXXXX")"
+  previous="$parent/.etxr-subscriptions-previous.$$"
+  render_subscriptions "$staging"
+  getent passwd www >/dev/null 2>&1 && subscription_group=www
+  chown root:"$subscription_group" "$staging"
+  chmod 750 "$staging"
+  find "$staging" -mindepth 1 -maxdepth 1 -type f \
+    -exec chown root:"$subscription_group" {} + \
+    -exec chmod 640 {} +
+  if [[ -e "$SUBSCRIPTION_DIR" ]]; then
+    mv "$SUBSCRIPTION_DIR" "$previous"
+  fi
+  if ! mv "$staging" "$SUBSCRIPTION_DIR"; then
+    [[ ! -e "$previous" ]] || mv "$previous" "$SUBSCRIPTION_DIR"
+    rm -rf "$staging"
+    state_lock_release
+    die "刷新主服务器订阅失败，已恢复原订阅"
+  fi
+  rm -rf "$previous"
+  state_lock_release
+  log "主服务器订阅已合并最新从服务器入口"
+}
+
+cmd_subscriptions() {
+  local action="${1:-}"; shift || true
+  case "$action" in
+    snapshot) cmd_subscriptions_snapshot "$@" ;;
+    refresh) cmd_subscriptions_refresh "$@" ;;
+    *) die "Usage: etxr subscriptions refresh|snapshot" ;;
+  esac
 }
 
 cmd_client() {
@@ -7319,6 +7705,11 @@ menu_users() {
     menu_pause
     return
   fi
+  if [[ "$(jq -r '.node.role' "$STATE_FILE")" == "exit" ]]; then
+    warn "从服务器的用户和订阅由主服务器统一管理，请到主服务器操作"
+    menu_pause
+    return
+  fi
   while true; do
     menu_header
     printf '%s【用户和订阅】%s\n' "$C_BOLD" "$C_RESET"
@@ -7501,6 +7892,7 @@ menu_routes() {
 
 menu_exits() {
   local choice name address port server_name host path uuid public_key short_id
+  local socks_username socks_password route_name route_port default_name
   if [[ ! -f "$STATE_FILE" ]]; then
     warn "请先执行一键安装与初始化"
     menu_pause
@@ -7508,20 +7900,53 @@ menu_exits() {
   fi
   while true; do
     menu_header
-    printf '%s远程出口管理%s\n' "$C_BOLD" "$C_RESET"
-    printf '1. 查看远程出口\n'
-    printf '2. 添加 TLS/XHTTP 出口\n'
-    printf '3. 添加 Reality/XHTTP 出口\n'
-    printf '4. 添加私网 VLESS Encryption 出口\n'
-    printf '5. 删除出口\n'
+    printf '%s出口分流管理%s\n' "$C_BOLD" "$C_RESET"
+    printf '1. 查看已有出口\n'
+    printf '2. 添加 SOCKS5 出口和 XHTTP Path\n'
+    printf '3. 添加 TLS/XHTTP 出口\n'
+    printf '4. 添加 Reality/XHTTP 出口\n'
+    printf '5. 添加私网 VLESS Encryption 出口\n'
+    printf '6. 删除出口\n'
     printf '0. 返回主菜单\n\n'
     read -r -p '请选择: ' choice
     case "$choice" in
       1) menu_exec cmd_exit_list || true; menu_pause ;;
       2)
-        printf '主服务器将通过 TLS/XHTTP 连接远程出口服务器。两端的域名、端口、Path 和 UUID 必须一致。\n'
+        printf '客户端仍连接当前服务器的 XHTTP Path，流量再从指定 SOCKS5 代理出去。\n'
+        printf '此功能只添加 SOCKS5 出口，不会开放 SOCKS5 入站端口。\n\n'
+        default_name="socks$(( $(jq '.xray.exits | length' "$STATE_FILE") + 1 ))"
+        name="$(prompt_name_value '出口机器名称（订阅中显示，例如 tw 或 us）' "$default_name")"
+        address="$(prompt_value 'SOCKS5 服务器地址（本机代理填 127.0.0.1）' '127.0.0.1')"
+        port="$(prompt_port_value 'SOCKS5 服务器端口' '10808')"
+        socks_username="$(prompt_value 'SOCKS5 用户名（无需认证直接回车）')"
+        socks_password=""
+        if [[ -n "$socks_username" ]]; then
+          socks_password="$(prompt_secret 'SOCKS5 密码')"
+          while [[ -z "$socks_password" ]]; do
+            warn "填写用户名后，密码不能为空"
+            socks_password="$(prompt_secret 'SOCKS5 密码')"
+          done
+        fi
+        route_name="$(prompt_name_value '这条 XHTTP 线路的管理名称' "${name}-socks")"
+        path="$(prompt_value '客户端连接当前服务器时使用的 XHTTP Path（默认纯随机）' "$(random_path)")"
+        route_port="$(prompt_port_checked 'Xray 本机接收 TCP 端口（无需开放防火墙）' "$(next_route_port)" tcp)"
+        if menu_exec cmd_exit_add --name "$name" --address "$address" \
+          --port "$port" --transport socks5 --username "$socks_username" \
+          --password "$socks_password"; then
+          if menu_exec cmd_route_add --name "$route_name" --path "$path" \
+            --port "$route_port" --target "$name"; then
+            menu_apply_prompt || true
+          else
+            cmd_exit_remove "$name" >/dev/null 2>&1 || true
+            warn "XHTTP Path 创建失败，已删除刚才添加的 SOCKS5 出口"
+          fi
+        fi
+        menu_pause
+        ;;
+      3)
+        printf '当前入口服务器将通过 TLS/XHTTP 连接远程出口服务器。两端的域名、端口、Path 和 UUID 必须一致。\n'
         name="$(prompt_value '出口名称（仅用于菜单显示，例如 tw 或 us）')"
-        address="$(prompt_value '主服务器连接的出口服务器公网 IP 或域名')"
+        address="$(prompt_value '当前入口服务器连接的出口服务器公网 IP 或域名')"
         server_name="$(prompt_value 'TLS 证书域名（SNI）' "$address")"
         host="$(prompt_value 'XHTTP Host（通常与 TLS SNI 相同）' "$server_name")"
         port="$(prompt_value '出口服务器公网 TCP 端口' '443')"
@@ -7534,10 +7959,10 @@ menu_exits() {
         printf '\n请在出口机创建：UUID=%s  Path=%s\n' "$uuid" "$path"
         menu_pause
         ;;
-      3)
-        printf '主服务器将通过 Reality/XHTTP 连接远程出口服务器。以下参数必须与出口服务器一致。\n'
+      4)
+        printf '当前入口服务器将通过 Reality/XHTTP 连接远程出口服务器。以下参数必须与出口服务器一致。\n'
         name="$(prompt_value '出口名称（仅用于菜单显示）')"
-        address="$(prompt_value '主服务器连接的出口服务器公网 IP 或域名')"
+        address="$(prompt_value '当前入口服务器连接的出口服务器公网 IP 或域名')"
         port="$(prompt_value '出口服务器 Reality 公网 TCP 端口' '443')"
         server_name="$(prompt_value 'Reality 客户端 SNI')"
         path="$(prompt_value 'Reality 的 XHTTP 连接 Path（默认纯随机）' "$(random_path)")"
@@ -7550,8 +7975,8 @@ menu_exits() {
           --uuid "$uuid" --public-key "$public_key" --short-id "$short_id" || true
         menu_pause
         ;;
-      4)
-        printf '主服务器将通过 EasyTier/WireGuard 私网连接出口服务器，不需要开放公网中继端口。\n'
+      5)
+        printf '当前入口服务器将通过 EasyTier/WireGuard 私网连接出口服务器，不需要开放公网中继端口。\n'
         name="$(prompt_value '出口名称（仅用于菜单显示）')"
         address="$(prompt_value '出口服务器的 EasyTier/WireGuard 私网 IP')"
         port="$(prompt_value '出口服务器私网中继 TCP 端口' '18000')"
@@ -7568,7 +7993,7 @@ menu_exits() {
         fi
         menu_pause
         ;;
-      5)
+      6)
         cmd_exit_list || true
         name="$(prompt_value '要删除的出口名称')"
         if menu_confirm "确认删除 ${name}"; then
@@ -8152,6 +8577,11 @@ menu_quick_subscription() {
     menu_pause
     return
   fi
+  if [[ "$(jq -r '.node.role' "$STATE_FILE")" == "exit" ]]; then
+    warn "从服务器不提供订阅，请到主服务器复制集中订阅"
+    menu_pause
+    return
+  fi
   local count username
   count="$(jq -r '[.users[] | select(.enabled == true)] | length' "$STATE_FILE")"
   if (( count == 0 )); then
@@ -8201,7 +8631,7 @@ menu_advanced() {
     printf '4. Xray 启停、日志、监控和更新\n'
     printf '5. 查看完整节点状态\n'
     printf '6. 管理从服务器（查看 ID / 删除 / 连接详情）\n'
-    printf '7. 手动管理远程出口\n'
+    printf '7. 管理出口分流          （SOCKS5 / 远程出口）\n'
     printf '8. 检查并更新 ETXR 管理脚本\n'
     printf '0. 返回新手首页\n\n'
     read -r -p '请输入数字: ' choice
@@ -8234,6 +8664,7 @@ cmd_menu() {
     printf '6. 🩺 一键检查与修复\n'
     printf '7. ⚙  高级设置             （一般不用）\n'
     printf '8. ⬆  检查并更新 ETXR\n'
+    printf '9. ↗  出口分流设置          （SOCKS5 / 远程出口）\n'
     printf '0. 退出\n\n'
     read -r -p '请输入数字: ' choice
     case "$choice" in
@@ -8245,11 +8676,12 @@ cmd_menu() {
       6) menu_health_check ;;
       7) menu_advanced ;;
       8) menu_self_update ;;
+      9) menu_exits ;;
       0)
         printf '%s已退出。%s\n' "$C_GREEN" "$C_RESET"
         return
         ;;
-      *) warn "请输入 0～8 之间的数字"; sleep 1 ;;
+      *) warn "请输入 0～9 之间的数字"; sleep 1 ;;
     esac
   done
 }
@@ -8281,6 +8713,7 @@ main() {
     apply) cmd_apply "$@" ;;
     install) cmd_install "$@" ;;
     subscription|sub) cmd_subscription "$@" ;;
+    subscriptions) cmd_subscriptions "$@" ;;
     client) cmd_client "$@" ;;
     backup) cmd_backup "$@" ;;
     status) cmd_status "$@" ;;

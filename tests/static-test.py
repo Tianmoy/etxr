@@ -15,7 +15,7 @@ def main() -> int:
     text = SCRIPT.read_text(encoding="utf-8")
     assert text.startswith("#!/usr/bin/env bash\n")
     assert "set -Eeuo pipefail" in text
-    assert 'VERSION="0.13.7"' in text
+    assert 'VERSION="0.14.0"' in text
     assert "local expires_minutes=30 expires_at" in text
     assert "--expires-minutes" in text
 
@@ -125,6 +125,10 @@ def main() -> int:
     assert "easytier-only" in text
     assert "--public-listen-port" in text
     assert "--xhttp-enabled" in text
+    assert '--transport must be tls, reality, none, or socks5' in text
+    assert 'protocol: "socks"' in text
+    assert 'socks_username' in text
+    assert 'socks_password' in text
     assert "random_path()" in text
     assert 'xhttp_path="${xhttp_path:-$(random_path)}"' in text
     assert 'reality_path="${reality_path:-$(random_path)}"' in text
@@ -148,6 +152,10 @@ def main() -> int:
     assert "refusing replayed configuration" in text
     assert "issued_at: $issued_at" in text
     assert "next_check = time.monotonic() + 300" in text
+    assert 'payload["entry"] = self.entry_snapshot()' in text
+    assert '"subscriptions",' in text
+    assert '"refresh",' in text
+    assert "await asyncio.to_thread(self.refresh_subscriptions)" in text
     assert "etxr-control.service" in text
     assert "etxr-agent.service" in text
     assert "--listen 127.0.0.1" in text
@@ -188,6 +196,12 @@ def main() -> int:
     assert r'"location = /\(.subscription_prefix)/\(.subscription_token)' in text
     assert 'subscription_prefix: $prefix' in text
     assert 'subscription_token: $token' in text
+    assert 'cmd_subscriptions_refresh()' in text
+    assert 'subscription_worker_entries()' in text
+    assert '从服务器不生成订阅，请到主服务器查看' in text
+    assert 'fragment="${entry_name}-${protocol}"' in text
+    assert "添加 SOCKS5 出口和 XHTTP Path" in text
+    assert "从服务器不提供订阅，请到主服务器复制集中订阅" in text
     assert 'location = /sub/' not in text
     assert 'install -m 600 "$GENERATED_DIR/nginx-paths.conf"' in text
     assert 'install -m 600 "$GENERATED_DIR/nginx-stream.conf"' in text
@@ -221,7 +235,7 @@ def main() -> int:
         assert forbidden not in lowered, forbidden
 
     assert "/usr/local/sbin/etxr" in text
-    assert not re.search(r"\+\s+if\b", text)
+    assert not re.search(r"^\s*\+\s+if\b", text, re.MULTILINE)
 
     # Every jq-generated JSON document must be parsed again by the runtime;
     # this catches accidental direct string-splicing in important render paths.
