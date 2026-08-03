@@ -752,8 +752,11 @@ grep -Fq 'proxy_pass http://127.0.0.1:18000;' \
   "$LOCAL_WORKER/generated/nginx-paths.conf"
 openssl x509 -in "$LOCAL_WORKER/certs/b1/fullchain.pem" -noout \
   -checkhost worker.example.com >/dev/null
-grep -Fq 'allowInsecure=1' "$TMP/local-worker-join.txt"
-grep -Fq 'insecure=1' "$TMP/local-worker-join.txt"
+grep -Fq '订阅由主服务器统一生成' "$TMP/local-worker-join.txt"
+if grep -Eq '^(vless|hysteria2)://' "$TMP/local-worker-join.txt"; then
+  echo "worker join unexpectedly printed a local subscription" >&2
+  exit 1
+fi
 
 # Invalid control-plane user data must be rejected without changing state.
 cp "$WORKER/state.json" "$TMP/worker-state-before-invalid-control.json"
