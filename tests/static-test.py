@@ -15,7 +15,7 @@ def main() -> int:
     text = SCRIPT.read_text(encoding="utf-8")
     assert text.startswith("#!/usr/bin/env bash\n")
     assert "set -Eeuo pipefail" in text
-    assert 'VERSION="0.15.0"' in text
+    assert 'VERSION="0.16.0"' in text
     assert "local expires_minutes=30 expires_at" in text
     assert "--expires-minutes" in text
 
@@ -189,6 +189,16 @@ def main() -> int:
     assert "cmd_user_limit()" in text
     assert "cmd_user_usage()" in text
     assert "cmd_user_reset_usage()" in text
+    assert "cmd_user_domains()" in text
+    assert "cmd_user_reset_domains()" in text
+    assert "cmd_domain()" in text
+    assert "domain_audit" in text
+    assert "etxr-domain-audit.service" in text
+    assert "--domain-file" in text
+    assert "DOMAIN_REPORT_INTERVAL_SECONDS = 300" in text
+    assert "webhook: {url: $domain_webhook, deduplication: 0}" in text
+    assert "查看用户访问域名" in text
+    assert "设置访问域名统计" in text
     assert 'DATAPLANE_BIN="${ETXR_DATAPLANE_BIN:-/usr/local/bin/etxr-dataplane}"' in text
     assert "DATAPLANE_DOWNLOAD_BASE=" in text
     assert "ETXR_DOWNLOAD_BASE" in text

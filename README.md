@@ -1,4 +1,4 @@
-# ETXR v0.15.0
+# ETXR v0.16.0
 
 ETXR 是面向 Debian 12 空白系统的一站式中文菜单脚本，用一份脚本安装主服务器或任意数量的从服务器。它管理 Xray、sing-box、EasyTier、订阅和用户配置，并可复用宝塔 nginx 的 TCP 443。
 
@@ -124,6 +124,7 @@ Hysteria2 是否使用公网 UDP 443 [Y/n]
 选择管理员可以使用的节点（编号多选）
 选中 Hysteria2 节点时：管理员 Hysteria2 登录密码 [随机]
 该用户上传/下载限速 Mbps [0]
+是否启用按用户访问域名统计 [y/N]
 
 主服务器的 EasyTier 私网 IP [10.100.0.1]
 从服务器连接的主服务器公网地址 [自动检测]
@@ -283,7 +284,10 @@ etxr control status
 8. 查看用户流量
 9. 设置用户限速
 10. 清零用户流量
-11. 导出单线路配置
+11. 查看用户访问域名
+12. 设置访问域名统计
+13. 清空访问域名历史
+14. 导出单线路配置
 ```
 
 订阅 URL：
@@ -318,6 +322,28 @@ XHTTP/Reality 的有限速用户由 Xray 送入只监听 `127.0.0.1` 的 Go 认�
 - 清零操作通过控制通道自动下发到所有从服务器。
 
 Hysteria2 协议设置里的总上传/下载 Mbps 仍是整条共享 HY2 入站的容量参数；用户菜单中的数值才是单用户限速。
+
+### 用户访问域名统计
+
+域名统计默认关闭。启用后，Xray 通过仅本机可访问的 Unix Socket Webhook
+把已认证用户和路由目标交给 Go 数据面。XHTTP、Reality 和 Hysteria2 使用同一套
+统计逻辑，从服务器通过现有加密控制连接回报，主服务器自动汇总；新记录最多约
+5 分钟后显示。
+
+只保存以下字段：
+
+- 用户名和用户 UUID，用于拒绝旧用户或伪造报告。
+- 目标域名、连接次数、首次和最近访问时间、记录节点。
+- 无法识别域名的连接总数，例如 IP-only、ECH 或无法嗅探的连接。
+
+不会保存完整 URL、URL 查询参数、HTTP 请求内容、DNS 报文或客户端 IP。
+默认保留 30 天，每用户每台节点最多保留 500 个域名；菜单可设置为 1～365 天和
+10～5000 个。停止统计后不再记录新连接，已有历史保留到过期或手动清空。
+清空操作会更新独立的域名统计代次并自动下发到所有从服务器，不影响累计流量。
+
+受 ECH、直接连接 IP、未被 Xray 嗅探的协议以及域名复用影响，这项数据用于了解
+大致访问去向，不等同于完整浏览历史。每台从服务器只回报最近的 1500 条域名
+记录以限制控制报文大小；完整的节点内记录仍保存在本机。
 
 ## SOCKS5 出口分流
 
@@ -366,6 +392,7 @@ etxr apply
 /etc/etxr/live/limits.json
 /var/lib/etxr/subscriptions/
 /var/lib/etxr/usage.json
+/var/lib/etxr/domains.json
 
 # 无宝塔且启用 Reality TCP 443 共用时
 /etc/nginx/conf.d/etxr.conf
@@ -377,6 +404,7 @@ etxr apply
 /etc/systemd/system/etxr-easytier.service
 /etc/systemd/system/etxr-limiter.service
 /etc/systemd/system/etxr-meter.service
+/etc/systemd/system/etxr-domain-audit.service
 /etc/systemd/system/etxr-control.service
 /etc/systemd/system/etxr-agent.service
 ```
@@ -390,6 +418,10 @@ etxr control status          # 配置下发状态
 etxr user usage              # 汇总所有用户流量
 etxr user limit USER --up-mbps 10 --down-mbps 50
 etxr user reset-usage USER   # 清零并自动下发
+etxr user domains [USER]     # 汇总查看用户访问域名
+etxr user reset-domains USER # 清空域名历史并自动下发
+etxr domain enable           # 启用域名统计，随后执行 etxr apply
+etxr domain disable          # 停止域名统计，随后执行 etxr apply
 etxr xray status             # Xray 状态和版本
 etxr xray logs               # Xray 最近日志
 etxr xray monitor            # Xray 实时资源监控
@@ -433,7 +465,7 @@ checksums.txt
 
 脚本先校验 SHA-256 和二进制内置版本，再通过同目录临时文件原子替换；旧二进制保存在 `/etc/etxr/backups/dataplane-binary/`，失败时自动恢复。镜像站可将 `ETXR_DOWNLOAD_BASE` 设置为包含两个数据面二进制和 `checksums.txt` 的 HTTPS 目录。
 
-推送 `v0.15.0` 形式的 Git 标签后，GitHub Actions 会运行完整测试、交叉编译两个 Linux 架构并创建 Release。构建使用 `CGO_ENABLED=0`，目标机不需要额外运行库。
+推送 `v0.16.0` 形式的 Git 标签后，GitHub Actions 会运行完整测试、交叉编译两个 Linux 架构并创建 Release。构建使用 `CGO_ENABLED=0`，目标机不需要额外运行库。
 
 ## 许可证
 

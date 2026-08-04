@@ -119,6 +119,8 @@ export ETXR_STATE="$TMP/state.json"
 export ETXR_RUNTIME="$TMP"
 export ETXR_GENERATED="$TMP/generated"
 export ETXR_SUBSCRIPTIONS="$TMP/subscriptions"
+export ETXR_DOMAIN_FILE="$TMP/domains.json"
+export ETXR_DOMAIN_SOCKET="$TMP/domain-audit.sock"
 export XRAY_BIN="$XRAY"
 export SING_BOX_BIN="$SING_BOX"
 DATAPLANE_BIN="$TMP/etxr-dataplane"
@@ -232,6 +234,8 @@ fi
 "$JQ" '(.users[] | select(.name == "alice")) |= del(.enabled_nodes)' \
   "$TMP/state.json" >"$TMP/state-legacy.json"
 mv "$TMP/state-legacy.json" "$TMP/state.json"
+"$EDGE" domain enable
+"$EDGE" domain configure --retention-days 14 --max-domains 200
 "$EDGE" render
 "$JQ" -e '
   ([.inbounds[] | select(.tag == "path-tw") |
@@ -240,6 +244,25 @@ mv "$TMP/state-legacy.json" "$TMP/state.json"
     .settings.clients[].email] | index("alice@backup")) != null and
   ([.inbounds[] | select(.tag == "hy2-bridge-in") |
     .settings.clients[].email] | index("alice@hy2")) != null
+' "$TMP/generated/xray.json" >/dev/null
+"$JQ" -e --arg webhook "$TMP/domain-audit.sock:/event" '
+  (.routing.rules[] | select(
+    .inboundTag == ["path-hk"] and .outboundTag == "direct"
+  ) | .webhook.url == $webhook and .webhook.deduplication == 0) and
+  (.routing.rules[] | select(
+    .user == ["alice@backup"] and .outboundTag == "limit-direct-alice"
+  ) | .webhook.url == $webhook) and
+  (.routing.rules[] | select(
+    .user == ["alice@hy2"] and .outboundTag == "limit-direct-alice"
+  ) | .webhook.url == $webhook) and
+  (.routing.rules[] | select(
+    .inboundTag == ["reality-backup"] and .outboundTag == "direct" and
+    (.user | not)
+  ) | .webhook.url == $webhook) and
+  (.routing.rules[] | select(
+    .inboundTag == ["hy2-bridge-in"] and .outboundTag == "direct" and
+    (.user | not)
+  ) | .webhook.url == $webhook)
 ' "$TMP/generated/xray.json" >/dev/null
 
 "$XRAY" run -test -config "$TMP/generated/xray.json"
@@ -379,6 +402,7 @@ grep -q '^old xray$' "$FAULT_LIVE/xray.json"
 grep -q '^old subscription$' "$FAULT_SUBS/old"
 grep -q '^old unit$' "$FAULT_UNITS/etxr-xray.service"
 [[ ! -e "$FAULT_UNITS/etxr-sing-box.service" ]]
+[[ ! -e "$FAULT_UNITS/etxr-domain-audit.service" ]]
 
 "$JQ" -e '.inbounds | length == 7' "$TMP/generated/xray.json" >/dev/null
 "$JQ" -e '.users[] | select(
@@ -434,6 +458,10 @@ TEST_PIDS+=("$!")
 "$DATAPLANE_BIN" limiter --config "$TMP/generated/limits.json" \
   >"$TMP/limiter.log" 2>&1 &
 TEST_PIDS+=("$!")
+"$DATAPLANE_BIN" auditor --state "$TMP/state.json" \
+  --domain-file "$TMP/domains.json" --socket "$TMP/domain-audit.sock" \
+  --flush-interval 1 >"$TMP/domain-audit.log" 2>&1 &
+TEST_PIDS+=("$!")
 "$XRAY" run -config "$TMP/generated/xray.json" >"$TMP/xray-live.log" 2>&1 &
 TEST_PIDS+=("$!")
 "$SING_BOX" run -c "$TMP/generated/sing-box.json" \
@@ -472,7 +500,32 @@ wait_tcp "$HTTP_PORT"
 wait_tcp "$SOCKS_PORT"
 sleep 1
 curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${SOCKS_PORT}" \
-  "http://127.0.0.1:${HTTP_PORT}/" | grep -Fq 'etxr protocol e2e'
+  "http://localhost:${HTTP_PORT}/" | grep -Fq 'etxr protocol e2e'
+for _ in $(seq 1 30); do
+  "$JQ" -e '.users.alice.domains.localhost.connections > 0' \
+    "$TMP/domains.json" >/dev/null 2>&1 && break
+  sleep 0.2
+done
+"$JQ" -e '.users.alice |
+  .uuid == "11111111-1111-4111-8111-111111111111" and
+  (.domain_epoch | length > 0) and
+  .domains.localhost.connections > 0
+' "$TMP/domains.json" >/dev/null
+"$EDGE" user domains alice 10 | grep -Fq 'localhost'
+old_domain_epoch="$("$JQ" -r '.users[] | select(.name == "alice") | .domain_epoch' \
+  "$TMP/state.json")"
+"$EDGE" user reset-domains alice >/dev/null
+new_domain_epoch="$("$JQ" -r '.users[] | select(.name == "alice") | .domain_epoch' \
+  "$TMP/state.json")"
+[[ -n "$new_domain_epoch" && "$new_domain_epoch" != "$old_domain_epoch" ]]
+for _ in $(seq 1 30); do
+  "$JQ" -e '.users.alice.domains | length == 0' "$TMP/domains.json" \
+    >/dev/null 2>&1 && break
+  sleep 0.2
+done
+"$JQ" -e --arg epoch "$new_domain_epoch" '.users.alice |
+  .domain_epoch == $epoch and (.domains | length == 0) and .unresolved == 0
+' "$TMP/domains.json" >/dev/null
 "$DATAPLANE_BIN" meter --state "$TMP/state.json" \
   --usage-file "$TMP/usage.json" --xray-bin "$XRAY" --once
 "$JQ" -e '.users.alice |
@@ -732,7 +785,7 @@ grep -Fq '#b1-Hysteria2' "$TMP/master-central-subscription.txt"
 "$EDGE" user nodes xonly \
   --nodes b1/xhttp/b1-xhttp,b1/reality/direct,b1/hy2 >/dev/null
 "$EDGE" render >/dev/null
-"$JQ" -c '.users' "$TMP/control/nodes/b1.json" |
+"$JQ" -c '{users, domain_audit}' "$TMP/control/nodes/b1.json" |
   ETXR_STATE="$WORKER/state.json" ETXR_RUNTIME="$WORKER" \
   ETXR_GENERATED="$WORKER/generated" \
   ETXR_SUBSCRIPTIONS="$WORKER/subscriptions" \
@@ -750,6 +803,11 @@ grep -Fq '#b1-Hysteria2' "$TMP/master-central-subscription.txt"
   [.inbounds[] | select(.tag == "hy2-in") | .users[].name] |
   index("xonly") != null
 ' "$WORKER/generated/sing-box.json" >/dev/null
+"$JQ" -e '
+  .domain_audit.enabled == true and
+  .domain_audit.retention_days == 14 and
+  .domain_audit.max_domains_per_user == 200
+' "$WORKER/state.json" >/dev/null
 "$EDGE" subscription xonly >"$TMP/xonly-worker-subscription.txt"
 grep -Fq '#b1-XHTTP' "$TMP/xonly-worker-subscription.txt"
 grep -Fq '#b1-Reality-XHTTP' "$TMP/xonly-worker-subscription.txt"
@@ -886,7 +944,8 @@ mkdir -p "$SEMANTIC"
 cp "$WORKER/state.json" "$SEMANTIC/state.json"
 "$JQ" '
   .easytier.ipv4 = "10.100.0.999" |
-  .xray.reality_inbounds[0].port = .xray.relay_inbounds[0].port
+  .xray.reality_inbounds[0].port = .xray.relay_inbounds[0].port |
+  .domain_audit.retention_days = 0
 ' "$SEMANTIC/state.json" >"$SEMANTIC/state.invalid.json"
 mv "$SEMANTIC/state.invalid.json" "$SEMANTIC/state.json"
 if ETXR_STATE="$SEMANTIC/state.json" \

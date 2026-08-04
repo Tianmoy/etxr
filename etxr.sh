@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.15.0"
+VERSION="0.16.0"
 ETXR_REPOSITORY="${ETXR_REPOSITORY:-Tianmoy/etxr}"
 ETXR_RELEASE_API="${ETXR_RELEASE_API:-https://api.github.com/repos/${ETXR_REPOSITORY}/releases/latest}"
 
@@ -21,6 +21,8 @@ DATAPLANE_DOWNLOAD_BASE="${ETXR_DOWNLOAD_BASE:-https://github.com/Tianmoy/etxr/r
 LIMITER_CONFIG="${ETXR_LIMITER_CONFIG:-${RUNTIME_DIR}/live/limits.json}"
 LIMITER_PORT="${ETXR_LIMITER_PORT:-18181}"
 USAGE_FILE="${ETXR_USAGE_FILE:-/var/lib/etxr/usage.json}"
+DOMAIN_FILE="${ETXR_DOMAIN_FILE:-/var/lib/etxr/domains.json}"
+DOMAIN_SOCKET="${ETXR_DOMAIN_SOCKET:-/run/etxr/domain-audit.sock}"
 XRAY_API_PORT="${ETXR_XRAY_API_PORT:-18182}"
 HY2_BRIDGE_PORT="${ETXR_HY2_BRIDGE_PORT:-18183}"
 SYSTEMD_UNIT_DIR="${ETXR_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
@@ -75,7 +77,8 @@ Global options:
 Commands:
   menu                Open the Chinese numbered menu
   init                Initialize a node state file
-  user add|remove|list|limit|usage|reset-usage
+  user add|remove|list|limit|usage|reset-usage|domains|reset-domains
+  domain enable|disable|show|configure
   route add|remove|list
   exit add|remove|list
   reality add|remove|list
@@ -885,20 +888,34 @@ render_control_desired() {
     name="$(jq -r '.name' <<<"$node")"
     token="$(jq -r '.control_token // ""' <<<"$node")"
     [[ -n "$token" ]] || continue
-    base="$(jq -c --arg node "$name" '{node_id: $node, users: .users}' "$STATE_FILE")"
+    base="$(jq -c --arg node "$name" '{
+      node_id: $node,
+      users: .users,
+      domain_audit: {
+        enabled: (.domain_audit.enabled // false),
+        retention_days: (.domain_audit.retention_days // 30),
+        max_domains_per_user: (.domain_audit.max_domains_per_user // 500)
+      }
+    }' "$STATE_FILE")"
     version="$(printf '%s' "$base" | sha256sum | awk '{print $1}')"
     issued_at="$(date +%s)"
     output="$(jq -n -c \
       --arg node "$name" --arg version "$version" \
       --arg generated "$(date -u +%FT%TZ)" \
       --argjson issued_at "$issued_at" \
-      --argjson users "$(jq '.users' "$STATE_FILE")" '
+      --argjson users "$(jq '.users' "$STATE_FILE")" \
+      --argjson domain_audit "$(jq '{
+        enabled: (.domain_audit.enabled // false),
+        retention_days: (.domain_audit.retention_days // 30),
+        max_domains_per_user: (.domain_audit.max_domains_per_user // 500)
+      }' "$STATE_FILE")" '
       {
         node_id: $node,
         version: $version,
         issued_at: $issued_at,
         generated_at: $generated,
-        users: $users
+        users: $users,
+        domain_audit: $domain_audit
       }
     ')"
     printf '%s\n' "$output" | atomic_write "$CONTROL_DIR/nodes/${name}.json"
@@ -1152,6 +1169,11 @@ EOF
         xray_api_port: $xray_api_port,
         hy2_bridge_port: $hy2_bridge_port
       },
+      domain_audit: {
+        enabled: false,
+        retention_days: 30,
+        max_domains_per_user: 500
+      },
       subscription: {
         enabled: ($role != "exit"),
         base_path: ""
@@ -1189,7 +1211,7 @@ enabled_nodes_need_hy2() {
 cmd_user_add() {
   local name="" uuid="" password="" expires="" routes="*" nodes=""
   local routes_set=0 nodes_set=0 sub_token sub_prefix
-  local up_mbps=0 down_mbps=0 usage_epoch
+  local up_mbps=0 down_mbps=0 usage_epoch domain_epoch
   while (($#)); do
     case "$1" in
       --name) name="$2"; shift 2 ;;
@@ -1219,6 +1241,7 @@ EOF
     die "用户已存在：$name"
   uuid="${uuid:-$(random_uuid)}"
   usage_epoch="$(random_hex 8)"
+  domain_epoch="$(random_hex 8)"
   valid_uuid "$uuid" || die "UUID 格式不正确"
   valid_mbps "$up_mbps" || die "上传限速格式不正确"
   valid_mbps "$down_mbps" || die "下载限速格式不正确"
@@ -1273,11 +1296,13 @@ EOF
         up_mbps: $up_mbps,
         down_mbps: $down_mbps
       },
-      usage_epoch: $usage_epoch
+      usage_epoch: $usage_epoch,
+      domain_epoch: $domain_epoch
     }]' \
     --arg name "$name" --arg uuid "$uuid" --arg password "$password" \
     --arg expires "$expires" --arg prefix "$sub_prefix" \
     --arg token "$sub_token" --arg usage_epoch "$usage_epoch" \
+    --arg domain_epoch "$domain_epoch" \
     --argjson routes "$routes_json" --argjson up_mbps "$up_mbps" \
     --argjson enabled_nodes "$nodes_json" --argjson down_mbps "$down_mbps"
   log "已添加用户：$name"
@@ -1425,6 +1450,22 @@ cmd_user_reset_usage() {
   log "Usage reset requested for $name"
 }
 
+cmd_user_reset_domains() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "用法：etxr user reset-domains 用户名|all"
+  require_state
+  if [[ "$name" == "all" ]]; then
+    state_update '.users |= map(.domain_epoch = $epoch)' \
+      --arg epoch "$(random_hex 8)"
+  else
+    jq -e --arg name "$name" '.users[]? | select(.name == $name)' \
+      "$STATE_FILE" >/dev/null || die "用户不存在：$name"
+    state_update '(.users[] | select(.name == $name) | .domain_epoch) = $epoch' \
+      --arg name "$name" --arg epoch "$(random_hex 8)"
+  fi
+  log "已请求清空 ${name} 的访问域名历史"
+}
+
 format_bytes() {
   local value="${1:-0}"
   if command -v numfmt >/dev/null 2>&1; then
@@ -1510,6 +1551,179 @@ cmd_user_usage() {
   ' "$STATE_FILE")
 }
 
+collect_domain_sources() {
+  local output="$1" report
+  : >"$output"
+  if [[ -f "$DOMAIN_FILE" ]] && jq -e '
+    .schema == 1 and (.users | type == "object")
+  ' "$DOMAIN_FILE" >/dev/null 2>&1; then
+    jq -c '.' "$DOMAIN_FILE" >>"$output"
+  fi
+  if [[ "$(jq -r '.node.role' "$STATE_FILE")" != "exit" &&
+        -d "$CONTROL_DIR/reports" ]]; then
+    while IFS= read -r -d '' report; do
+      jq -c 'select(.domains | type == "object") | .domains' \
+        "$report" >>"$output" 2>/dev/null || true
+    done < <(find "$CONTROL_DIR/reports" -maxdepth 1 -type f -name '*.json' -print0)
+  fi
+}
+
+cmd_user_domains() {
+  local name="${1:-}" limit="${2:-50}" sources entries unresolved enabled
+  require_state
+  [[ -z "$name" ]] || jq -e --arg name "$name" \
+    '.users[]? | select(.name == $name)' "$STATE_FILE" >/dev/null ||
+    die "用户不存在：$name"
+  if [[ ! "$limit" =~ ^[0-9]+$ ]] || (( limit < 1 || limit > 5000 )); then
+    die "显示数量必须是 1 到 5000"
+  fi
+  enabled="$(jq -r '.domain_audit.enabled // false' "$STATE_FILE")"
+  printf '域名统计：%s（保留 %s 天，每用户最多 %s 个域名）\n' \
+    "$([[ "$enabled" == "true" ]] && printf '已启用' || printf '未启用')" \
+    "$(jq -r '.domain_audit.retention_days // 30' "$STATE_FILE")" \
+    "$(jq -r '.domain_audit.max_domains_per_user // 500' "$STATE_FILE")"
+  sources="$(mktemp)"
+  collect_domain_sources "$sources"
+  entries="$(jq -s --slurpfile state "$STATE_FILE" --arg name "$name" \
+    --argjson limit "$limit" '
+    $state[0].users as $configured |
+    [
+      .[] as $source |
+      (if (($source.node // "") | type == "string" and
+          test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"))
+       then $source.node else "-" end) as $node |
+      (($source.users // {}) | to_entries[]) as $user |
+      $configured[] |
+      select(
+        .name == $user.key and
+        .uuid == ($user.value.uuid // "") and
+        ((.domain_epoch // "") == ($user.value.domain_epoch // "")) and
+        ($name == "" or .name == $name)
+      ) as $identity |
+      (($user.value.domains // {}) | to_entries[]) |
+      select(
+        (.key | type == "string" and
+          test("^[A-Za-z0-9._-]{1,253}$")) and
+        (.value.connections | type == "number") and
+        (.value.last_seen | type == "number")
+      ) |
+      {
+        user: $identity.name,
+        domain: .key,
+        connections: .value.connections,
+        first_seen: (.value.first_seen // .value.last_seen),
+        last_seen: .value.last_seen,
+        node: $node
+      }
+    ] |
+    group_by([.user, .domain]) |
+    map({
+      user: .[0].user,
+      domain: .[0].domain,
+      connections: (map(.connections) | add),
+      first_seen: (map(.first_seen) | min),
+      last_seen: (map(.last_seen) | max),
+      nodes: (map(.node) | unique | join(","))
+    }) |
+    sort_by(.user, (-.last_seen), (-.connections), .domain) |
+    group_by(.user) | map(.[0:$limit]) | flatten
+  ' "$sources")"
+  if [[ "$(jq 'length' <<<"$entries")" == "0" ]]; then
+    printf '暂无可识别的域名记录。启用后产生新连接才会开始统计。\n'
+  else
+    jq -r '
+      ["用户","域名","连接次数","首次访问(UTC)","最近访问(UTC)","记录节点"],
+      (.[] | [
+        .user, .domain, (.connections | tostring),
+        (.first_seen | todateiso8601), (.last_seen | todateiso8601), .nodes
+      ]) | @tsv
+    ' <<<"$entries" | column -t -s $'\t' 2>/dev/null ||
+      jq -r '.[] | "用户=\(.user) 域名=\(.domain) 次数=\(.connections) 最近=\(.last_seen | todateiso8601) 节点=\(.nodes)"' \
+        <<<"$entries"
+  fi
+  unresolved="$(jq -s --slurpfile state "$STATE_FILE" --arg name "$name" '
+    $state[0].users as $configured |
+    [
+      .[] as $source |
+      (($source.users // {}) | to_entries[]) as $user |
+      $configured[] |
+      select(
+        .name == $user.key and
+        .uuid == ($user.value.uuid // "") and
+        ((.domain_epoch // "") == ($user.value.domain_epoch // "")) and
+        ($name == "" or .name == $name)
+      ) |
+      {user: .name, count: ($user.value.unresolved // 0)} |
+      select(.count > 0)
+    ] |
+    group_by(.user) |
+    map({user: .[0].user, count: (map(.count) | add)})
+  ' "$sources")"
+  rm -f "$sources"
+  if [[ "$(jq 'length' <<<"$unresolved")" != "0" ]]; then
+    printf '\n无法识别域名的连接（IP-only、ECH 或非 HTTP/TLS/QUIC）：\n'
+    jq -r '.[] | "  \(.user)：\(.count) 次"' <<<"$unresolved"
+  fi
+}
+
+cmd_domain() {
+  local action="${1:-show}" retention="" maximum=""
+  shift || true
+  require_state
+  case "$action" in
+    enable)
+      state_update '.domain_audit = ((.domain_audit // {}) + {enabled: true,
+        retention_days: (.domain_audit.retention_days // 30),
+        max_domains_per_user: (.domain_audit.max_domains_per_user // 500)})'
+      log "已启用用户访问域名统计"
+      ;;
+    disable)
+      state_update '.domain_audit = ((.domain_audit // {}) + {enabled: false,
+        retention_days: (.domain_audit.retention_days // 30),
+        max_domains_per_user: (.domain_audit.max_domains_per_user // 500)})'
+      log "已停止记录新的访问域名；已有历史仍保留"
+      ;;
+    configure)
+      while (($#)); do
+        case "$1" in
+          --retention-days) retention="$2"; shift 2 ;;
+          --max-domains) maximum="$2"; shift 2 ;;
+          *) die "未知的域名统计参数：$1" ;;
+        esac
+      done
+      retention="${retention:-$(jq -r '.domain_audit.retention_days // 30' "$STATE_FILE")}"
+      maximum="${maximum:-$(jq -r '.domain_audit.max_domains_per_user // 500' "$STATE_FILE")}"
+      if [[ ! "$retention" =~ ^[0-9]+$ ]] ||
+         (( retention < 1 || retention > 365 )); then
+        die "保留天数必须是 1 到 365"
+      fi
+      if [[ ! "$maximum" =~ ^[0-9]+$ ]] ||
+         (( maximum < 10 || maximum > 5000 )); then
+        die "每用户域名上限必须是 10 到 5000"
+      fi
+      state_update '.domain_audit = ((.domain_audit // {}) + {
+        enabled: (.domain_audit.enabled // false),
+        retention_days: $retention,
+        max_domains_per_user: $maximum
+      })' --argjson retention "$retention" --argjson maximum "$maximum"
+      log "域名统计设置已更新：保留 ${retention} 天，每用户最多 ${maximum} 个"
+      ;;
+    show)
+      jq -r --arg file "$DOMAIN_FILE" '
+        "状态：\(if (.domain_audit.enabled // false) then "已启用" else "未启用" end)\n" +
+        "保留天数：\(.domain_audit.retention_days // 30)\n" +
+        "每用户域名上限：\(.domain_audit.max_domains_per_user // 500)\n" +
+        "本机数据文件：\($file)"
+      ' "$STATE_FILE"
+      if command -v systemctl >/dev/null 2>&1; then
+        printf '本机服务：%s\n' \
+          "$(systemctl is-active etxr-domain-audit.service 2>/dev/null || true)"
+      fi
+      ;;
+    *) die "用法：etxr domain enable|disable|show|configure" ;;
+  esac
+}
+
 cmd_user() {
   local action="${1:-}"; shift || true
   case "$action" in
@@ -1519,6 +1733,8 @@ cmd_user() {
     limit) cmd_user_limit "$@" ;;
     usage) cmd_user_usage "$@" ;;
     reset-usage) cmd_user_reset_usage "$@" ;;
+    domains) cmd_user_domains "$@" ;;
+    reset-domains) cmd_user_reset_domains "$@" ;;
     nodes) cmd_user_nodes "$@" ;;
     enable|disable)
       local name="${1:-}"; [[ -n "$name" ]] || die "必须填写用户名"
@@ -1528,7 +1744,7 @@ cmd_user() {
       state_update '(.users[] | select(.name == $name) | .enabled) = $enabled' \
         --arg name "$name" --argjson enabled "$enabled"
       ;;
-    *) die "用法：etxr user add|remove|list|enable|disable|nodes|limit|usage|reset-usage" ;;
+    *) die "用法：etxr user add|remove|list|enable|disable|nodes|limit|usage|reset-usage|domains|reset-domains" ;;
   esac
 }
 
@@ -1974,7 +2190,7 @@ cmd_keys() {
 
 render_xray() {
   local out="$1" tmp_users tmp_routes tmp_exits tmp_reality tmp_relays
-  local tmp_output block loglevel
+  local tmp_output block loglevel domain_audit_enabled
   ensure_parent "$out"
   tmp_users="$(mktemp)"
   tmp_routes="$(mktemp)"
@@ -1994,6 +2210,7 @@ render_xray() {
   jq '.xray.relay_inbounds // []' "$STATE_FILE" >"$tmp_relays"
   block="$(jq -r '.xray.block_bittorrent' "$STATE_FILE")"
   loglevel="$(jq -r '.xray.loglevel' "$STATE_FILE")"
+  domain_audit_enabled="$(jq -r '.domain_audit.enabled // false' "$STATE_FILE")"
 
   jq -n \
     --slurpfile users "$tmp_users" \
@@ -2003,10 +2220,12 @@ render_xray() {
     --slurpfile relays "$tmp_relays" \
     --arg node_name "$(jq -r '.node.name' "$STATE_FILE")" \
     --arg loglevel "$loglevel" \
+    --arg domain_webhook "${DOMAIN_SOCKET}:/event" \
     --argjson limiter_port "$(jq -r '.data_plane.limiter_port // 18181' "$STATE_FILE")" \
     --argjson api_port "$(jq -r '.data_plane.xray_api_port // 18182' "$STATE_FILE")" \
     --argjson hy2_bridge_port "$(jq -r '.data_plane.hy2_bridge_port // 18183' "$STATE_FILE")" \
     --argjson hy2_enabled "$(jq -r '.hysteria2.enabled // false' "$STATE_FILE")" \
+    --argjson domain_audit_enabled "$domain_audit_enabled" \
     --argjson block "$block" '
     def node_allowed($user; $protocol; $entry_name):
       ($user.enabled_nodes // ["*"]) as $nodes |
@@ -2038,6 +2257,11 @@ render_xray() {
         scMaxBufferedPosts: 30,
         xPaddingBytes: "100-1000"
       };
+
+    def audit_webhook:
+      if $domain_audit_enabled then
+        {webhook: {url: $domain_webhook, deduplication: 0}}
+      else {} end;
 
     def limited_users:
       $users[0] | map(select(
@@ -2208,7 +2432,8 @@ render_xray() {
       + (if $r.target == "direct" then {outboundTag: "direct"}
         elif $e != null and (($e.backup_address // "") != "") then
           {balancerTag: ("failover-" + $r.target)}
-        else {outboundTag: ("exit-" + $r.target)} end);
+        else {outboundTag: ("exit-" + $r.target)} end)
+      + audit_webhook;
 
     def limited_route_rules:
       [
@@ -2228,6 +2453,7 @@ render_xray() {
           else
             {outboundTag: ("limit-exit-" + $u.name + "-" + $r.target)}
           end)
+        + audit_webhook
       ];
 
     def limited_reality_rules:
@@ -2240,7 +2466,7 @@ render_xray() {
           inboundTag: [("reality-" + $r.name)],
           user: [($u.name + "@" + $r.name)],
           outboundTag: ("limit-direct-" + $u.name)
-        }
+        } + audit_webhook
       ];
 
     def limited_hy2_rules:
@@ -2252,8 +2478,23 @@ render_xray() {
           inboundTag: ["hy2-bridge-in"],
           user: [($u.name + "@hy2")],
           outboundTag: ("limit-direct-" + $u.name)
-        }
+        } + audit_webhook
       ] else [] end;
+
+    def audit_direct_rules:
+      if $domain_audit_enabled then
+        ($realities[0] | map({
+          type: "field",
+          inboundTag: [("reality-" + .name)],
+          outboundTag: "direct"
+        } + audit_webhook))
+        +
+        (if $hy2_enabled then [{
+          type: "field",
+          inboundTag: ["hy2-bridge-in"],
+          outboundTag: "direct"
+        } + audit_webhook] else [] end)
+      else [] end;
 
     {
       log: {loglevel: $loglevel},
@@ -2432,6 +2673,8 @@ render_xray() {
               outboundTag: "direct"
             }] end
           ) | flatten)
+          +
+          audit_direct_rules
           +
           ($routes[0] | map(target_rule(.)))
         ),
@@ -3463,11 +3706,23 @@ validate_state_semantics() {
         type == "number" and floor == . and . >= 0 and . <= 100000) and
       ((.speed_limit.down_mbps // 0) |
         type == "number" and floor == . and . >= 0 and . <= 100000) and
-      ((.usage_epoch // "") | type == "string" and length <= 128)
+      ((.usage_epoch // "") | type == "string" and length <= 128) and
+      ((.domain_epoch // "") | type == "string" and length <= 128)
     ) and
-    ((.data_plane.limiter_listen // "127.0.0.1") == "127.0.0.1")
+    ((.data_plane.limiter_listen // "127.0.0.1") == "127.0.0.1") and
+    ((.domain_audit // {
+      enabled: false,
+      retention_days: 30,
+      max_domains_per_user: 500
+    }) as $audit |
+      ($audit | type == "object") and
+      ($audit.enabled | type == "boolean") and
+      ($audit.retention_days | type == "number" and floor == . and
+        . >= 1 and . <= 365) and
+      ($audit.max_domains_per_user | type == "number" and floor == . and
+        . >= 10 and . <= 5000))
   ' "$STATE_FILE" >/dev/null; then
-    warn "Invalid per-user speed limit or data-plane state"
+    warn "Invalid per-user speed limit, domain audit, or data-plane state"
     errors=1
   fi
   if ! jq -e '
@@ -3614,6 +3869,7 @@ cmd_backup() {
   backup_file "$EASYTIER_CONFIG" "$dest"
   backup_file "$LIMITER_CONFIG" "$dest"
   backup_file "$USAGE_FILE" "$dest"
+  backup_file "$DOMAIN_FILE" "$dest"
   log "Backup created: $dest"
 }
 
@@ -3726,6 +3982,7 @@ from aiohttp import web
 
 MAX_CONFIG_BYTES = 1024 * 1024
 MAX_CLOCK_SKEW_SECONDS = 300
+DOMAIN_REPORT_INTERVAL_SECONDS = 300
 
 
 def read_json(path):
@@ -3787,7 +4044,7 @@ class Hub:
     def save_report(self, node_id, report, request=None):
         if not isinstance(report, dict):
             raise ValueError("report must be an object")
-        if len(json.dumps(report, ensure_ascii=False)) > 128 * 1024:
+        if len(json.dumps(report, ensure_ascii=False)) > 1024 * 1024:
             raise ValueError("report is too large")
         report_path = self.control_dir / "reports" / f"{node_id}.json"
         try:
@@ -3796,7 +4053,7 @@ class Hub:
             previous = {}
         if not isinstance(previous, dict):
             previous = {}
-        for key in ("usage", "entry"):
+        for key in ("usage", "entry", "domains"):
             if key not in report and isinstance(previous.get(key), dict):
                 report[key] = previous[key]
         entry = report.get("entry")
@@ -3939,7 +4196,7 @@ class Hub:
         return ws
 
     def app(self):
-        app = web.Application(client_max_size=1024 * 1024)
+        app = web.Application(client_max_size=2 * 1024 * 1024)
         app.router.add_get("/health", self.health)
         app.router.add_get("/ws/{node_id}", self.websocket)
         app.router.add_get("/config/{node_id}", self.config)
@@ -3948,10 +4205,12 @@ class Hub:
 
 
 class Agent:
-    def __init__(self, state_path, etxr_bin, usage_file):
+    def __init__(self, state_path, etxr_bin, usage_file, domain_file):
         self.state_path = state_path
         self.etxr_bin = etxr_bin
         self.usage_file = usage_file
+        self.domain_file = domain_file
+        self.next_domain_report = 0.0
         self.version_path = str(Path(state_path).parent / "control-version")
         self.issued_at_path = str(Path(state_path).parent / "control-issued-at")
 
@@ -3982,6 +4241,71 @@ class Agent:
         return {
             "updated_at": int(value.get("updated_at", 0)),
             "users": users,
+        }
+
+    def domains(self):
+        try:
+            path = Path(self.domain_file)
+            if path.stat().st_size > 32 * 1024 * 1024:
+                raise ValueError("domain ledger is too large")
+            value = read_json(path)
+        except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
+            return {"schema": 1, "updated_at": 0, "node": "", "users": {}}
+        if (not isinstance(value, dict) or value.get("schema") != 1 or
+                not isinstance(value.get("users"), dict)):
+            return {"schema": 1, "updated_at": 0, "node": "", "users": {}}
+        result = {}
+        # Keep reports comfortably below the hub's 1 MiB request limit. The
+        # complete per-node ledger remains available on the node itself.
+        remaining = 1500
+        for name in sorted(value["users"]):
+            user = value["users"].get(name)
+            if not isinstance(name, str) or not isinstance(user, dict):
+                continue
+            records = user.get("domains", {})
+            if not isinstance(records, dict):
+                records = {}
+            selected = []
+            for domain, record in records.items():
+                if not isinstance(domain, str) or not isinstance(record, dict):
+                    continue
+                try:
+                    connections = max(0, int(record.get("connections", 0)))
+                    first_seen = max(0, int(record.get("first_seen", 0)))
+                    last_seen = max(0, int(record.get("last_seen", 0)))
+                except (TypeError, ValueError):
+                    continue
+                if not domain or len(domain) > 253 or connections == 0 or last_seen == 0:
+                    continue
+                selected.append((last_seen, domain, {
+                    "connections": connections,
+                    "first_seen": first_seen or last_seen,
+                    "last_seen": last_seen,
+                }))
+            selected.sort(key=lambda item: (-item[0], item[1]))
+            selected = selected[:remaining]
+            remaining -= len(selected)
+            try:
+                unresolved = max(0, int(user.get("unresolved", 0)))
+            except (TypeError, ValueError):
+                unresolved = 0
+            result[name] = {
+                "uuid": str(user.get("uuid", "")),
+                "domain_epoch": str(user.get("domain_epoch", "")),
+                "unresolved": unresolved,
+                "domains": {item[1]: item[2] for item in selected},
+            }
+            if remaining == 0:
+                break
+        try:
+            updated_at = max(0, int(value.get("updated_at", 0)))
+        except (TypeError, ValueError):
+            updated_at = 0
+        return {
+            "schema": 1,
+            "updated_at": updated_at,
+            "node": str(value.get("node", "")),
+            "users": result,
         }
 
     def entry_snapshot(self):
@@ -4048,12 +4372,20 @@ class Agent:
         payload = dict(payload)
         payload["hostname"] = os.uname().nodename
         payload["usage"] = self.usage()
+        domains = None
+        if time.monotonic() >= self.next_domain_report:
+            domains = self.domains()
+            payload["domains"] = domains
         payload["entry"] = self.entry_snapshot()
         try:
             async with session.post(
                 f"{base_url}/report/{node_id}", json=payload
             ) as response:
                 await response.read()
+                if response.status < 400 and domains is not None:
+                    self.next_domain_report = (
+                        time.monotonic() + DOMAIN_REPORT_INTERVAL_SECONDS
+                    )
         except aiohttp.ClientError:
             pass
 
@@ -4109,8 +4441,11 @@ class Agent:
             stderr=asyncio.subprocess.PIPE,
             env=env,
         )
+        apply_payload = {"users": bundle["users"]}
+        if isinstance(bundle.get("domain_audit"), dict):
+            apply_payload["domain_audit"] = bundle["domain_audit"]
         stdout, stderr = await process.communicate(
-            json.dumps(bundle["users"], separators=(",", ":")).encode()
+            json.dumps(apply_payload, separators=(",", ":")).encode()
         )
         if process.returncode != 0:
             message = (stderr or stdout).decode(errors="replace")[-2000:]
@@ -4226,6 +4561,9 @@ def main():
     agent_parser.add_argument(
         "--usage-file", default="/var/lib/etxr/usage.json"
     )
+    agent_parser.add_argument(
+        "--domain-file", default="/var/lib/etxr/domains.json"
+    )
     args = parser.parse_args()
     if args.mode == "hub":
         hub = Hub(
@@ -4236,7 +4574,9 @@ def main():
         )
         web.run_app(hub.app(), host=args.listen, port=args.port, access_log=None)
     else:
-        asyncio.run(Agent(args.state, args.etxr_bin, args.usage_file).run())
+        asyncio.run(Agent(
+            args.state, args.etxr_bin, args.usage_file, args.domain_file
+        ).run())
 
 
 if __name__ == "__main__":
@@ -4262,6 +4602,10 @@ ensure_control_runtime() {
 write_systemd_units() {
   local xray_after="network-online.target" xray_wants="network-online.target"
   local xray_prestart=""
+  if [[ "$(jq -r '.domain_audit.enabled // false' "$STATE_FILE")" == "true" ]]; then
+    xray_after+=" etxr-domain-audit.service"
+    xray_wants+=" etxr-domain-audit.service"
+  fi
   if [[ "$(jq -r '.easytier.enabled // false' "$STATE_FILE")" == "true" ]]; then
     local et_ip
     xray_after+=" etxr-easytier.service"
@@ -4389,6 +4733,36 @@ RestartSec=3s
 WantedBy=multi-user.target
 EOF
 
+  cat <<EOF | run tee "$SYSTEMD_UNIT_DIR/etxr-domain-audit.service" >/dev/null
+[Unit]
+Description=ETXR per-user destination domain auditor
+After=network-online.target
+Wants=network-online.target
+Before=etxr-xray.service
+
+[Service]
+Type=simple
+User=root
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX
+RuntimeDirectory=etxr
+RuntimeDirectoryMode=0700
+ReadWritePaths=-$(dirname "$DOMAIN_FILE") -$(dirname "$DOMAIN_SOCKET")
+ExecStart=${DATAPLANE_BIN} auditor --state ${STATE_FILE} --domain-file ${DOMAIN_FILE} --socket ${DOMAIN_SOCKET} --flush-interval 5
+Restart=always
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
   if [[ "$(jq -r '.easytier.enabled // false' "$STATE_FILE")" == "true" ]]; then
     local et_ip et_name et_secret et_peer et_port et_hostname et_config_tmp
     et_ip="$(jq -r '.easytier.ipv4' "$STATE_FILE")"
@@ -4491,7 +4865,7 @@ User=root
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
-ExecStart=/usr/bin/python3 ${CONTROL_HELPER} agent --state ${STATE_FILE} --etxr-bin /usr/local/sbin/etxr --usage-file ${USAGE_FILE}
+    ExecStart=/usr/bin/python3 ${CONTROL_HELPER} agent --state ${STATE_FILE} --etxr-bin /usr/local/sbin/etxr --usage-file ${USAGE_FILE} --domain-file ${DOMAIN_FILE}
 Restart=always
 RestartSec=3s
 
@@ -4600,7 +4974,8 @@ cmd_apply() {
   local nginx_stream_target="" nginx_previous="" nginx_paths_previous=""
   local nginx_stream_loader_target=""
   local rollback_dir="" rollback_service quic_manifest="" tcp443_manifest=""
-  local hy2_enabled hy2_port hy2_shared_udp443 nginx_was_running=0
+  local hy2_enabled hy2_port hy2_shared_udp443 domain_audit_enabled
+  local nginx_was_running=0
   local nginx_should_reload=0 nginx_quic_backup="" nginx_tcp443_backup=""
   local auto_rebind_https https_listen_port post_quic_manifest=""
   xray_config="$(jq -r '.xray.config_path' "$STATE_FILE")"
@@ -4609,6 +4984,7 @@ cmd_apply() {
   hy2_enabled="$(jq -r '.hysteria2.enabled // false' "$STATE_FILE")"
   hy2_port="$(jq -r '.hysteria2.port // 8443' "$STATE_FILE")"
   hy2_shared_udp443="$(jq -r '.hysteria2.shared_udp443 // false' "$STATE_FILE")"
+  domain_audit_enabled="$(jq -r '.domain_audit.enabled // false' "$STATE_FILE")"
   auto_rebind_https="$(jq -r '.nginx.auto_rebind_https // false' "$STATE_FILE")"
   https_listen_port="$(jq -r '.nginx.https_listen_port // 8443' "$STATE_FILE")"
   quic_manifest="$(mktemp)"
@@ -4665,7 +5041,7 @@ cmd_apply() {
       : >"$rollback_dir/subscriptions.existed"
       cp -a "$SUBSCRIPTION_DIR" "$rollback_dir/subscriptions"
     fi
-    for rollback_service in etxr-easytier etxr-limiter etxr-xray etxr-sing-box etxr-meter etxr-control etxr-agent; do
+    for rollback_service in etxr-easytier etxr-limiter etxr-domain-audit etxr-xray etxr-sing-box etxr-meter etxr-control etxr-agent; do
       if systemctl is-active --quiet "${rollback_service}.service" 2>/dev/null; then
         : >"$rollback_dir/${rollback_service}.active"
       fi
@@ -4745,7 +5121,7 @@ cmd_apply() {
       nginx_tcp443_restore_backup "$nginx_tcp443_backup" || true
     fi
     systemctl daemon-reload 2>/dev/null || true
-    for rollback_service in etxr-easytier etxr-limiter etxr-xray etxr-sing-box etxr-meter etxr-control etxr-agent; do
+    for rollback_service in etxr-easytier etxr-limiter etxr-domain-audit etxr-xray etxr-sing-box etxr-meter etxr-control etxr-agent; do
       if [[ -f "$rollback_dir/${rollback_service}.unit" ]]; then
         cp -a "$rollback_dir/${rollback_service}.unit" \
           "$SYSTEMD_UNIT_DIR/${rollback_service}.service"
@@ -4754,7 +5130,7 @@ cmd_apply() {
       fi
     done
     systemctl daemon-reload 2>/dev/null || true
-    for rollback_service in etxr-easytier etxr-limiter etxr-xray etxr-sing-box etxr-meter etxr-control etxr-agent; do
+    for rollback_service in etxr-easytier etxr-limiter etxr-domain-audit etxr-xray etxr-sing-box etxr-meter etxr-control etxr-agent; do
       if [[ -f "$rollback_dir/${rollback_service}.enabled" ]]; then
         systemctl enable "${rollback_service}.service" 2>/dev/null || true
       else
@@ -5016,6 +5392,16 @@ cmd_apply() {
         { rollback_apply; die "单用户限速服务重启失败"; }
     else
       systemctl disable --now etxr-limiter.service 2>/dev/null || true
+    fi
+    if [[ "$domain_audit_enabled" == "true" ]]; then
+      install -d -m 700 "$(dirname "$DOMAIN_FILE")" "$(dirname "$DOMAIN_SOCKET")" ||
+        { rollback_apply; die "创建用户域名统计目录失败"; }
+      systemctl enable --now etxr-domain-audit.service ||
+        { rollback_apply; die "用户域名统计服务启动失败"; }
+      systemctl restart etxr-domain-audit.service ||
+        { rollback_apply; die "用户域名统计服务重启失败"; }
+    else
+      systemctl disable --now etxr-domain-audit.service 2>/dev/null || true
     fi
     systemctl enable --now etxr-xray.service ||
       { rollback_apply; die "Xray 服务启动失败"; }
@@ -5627,7 +6013,7 @@ cmd_self_update() {
   : >"$manifest"
   if command -v systemctl >/dev/null 2>&1; then
     for service in etxr-control.service etxr-agent.service \
-      etxr-limiter.service etxr-meter.service; do
+      etxr-limiter.service etxr-meter.service etxr-domain-audit.service; do
       systemctl is-active --quiet "$service" 2>/dev/null && printf '%s\n' "$service" >>"$manifest"
     done
   fi
@@ -7295,7 +7681,7 @@ cmd_pair_remove() {
 }
 
 cmd_control_apply() {
-  local prepare_only=0 payload
+  local prepare_only=0 payload bundle
   if [[ "${1:-}" == "--prepare-only" ]]; then
     prepare_only=1
     shift
@@ -7305,38 +7691,62 @@ cmd_control_apply() {
   [[ "$(jq -r '.node.role' "$STATE_FILE")" == "exit" ]] ||
     die "control apply 只允许在从服务器执行"
   payload="$(cat)"
+  bundle="$(jq -c '
+    if type == "array" then {users: ., domain_audit: null}
+    elif type == "object" then .
+    else error("invalid control payload") end
+  ' <<<"$payload")" || die "Invalid WSS configuration payload"
   jq -e '
-    type == "array" and
-    (map(.name) | length == (unique | length)) and
-    (map(.uuid) | length == (unique | length)) and
-    (map(.subscription_token) | length == (unique | length)) and
-    all(.[];
-      (.name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")) and
-      (.uuid | type == "string" and test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$")) and
-      (.hy2_password | type == "string" and length <= 512 and (test("[\u0000-\u001f\u007f]") | not)) and
-      (.enabled | type == "boolean") and
-      (.expires_at == null or (.expires_at | type == "string")) and
-      (.routes | type == "array" and all(.[]; type == "string" and test("^[A-Za-z0-9._-]{1,64}$|^\\*$"))) and
-      ((.enabled_nodes // ["*"]) | type == "array" and
-        length == (unique | length) and
-        all(.[]; type == "string" and
-          test("^\\*$|^[A-Za-z0-9][A-Za-z0-9._-]{0,63}/((xhttp|reality)/[A-Za-z0-9][A-Za-z0-9._-]{0,63}|hy2)$"))) and
-      (.subscription_prefix | type == "string" and test("^[0-9a-fA-F]{8}$")) and
-      (.subscription_token | type == "string" and test("^[0-9a-fA-F]{40}$")) and
-      ((.speed_limit // {up_mbps: 0, down_mbps: 0}) |
-        type == "object" and
-        (.up_mbps | type == "number" and floor == . and . >= 0 and . <= 100000) and
-        (.down_mbps | type == "number" and floor == . and . >= 0 and . <= 100000)) and
-      ((.usage_epoch // "") | type == "string" and length <= 128)
+    type == "object" and
+    (.users | type == "array" and
+      (map(.name) | length == (unique | length)) and
+      (map(.uuid) | length == (unique | length)) and
+      (map(.subscription_token) | length == (unique | length)) and
+      all(.[];
+        (.name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")) and
+        (.uuid | type == "string" and test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$")) and
+        (.hy2_password | type == "string" and length <= 512 and (test("[\u0000-\u001f\u007f]") | not)) and
+        (.enabled | type == "boolean") and
+        (.expires_at == null or (.expires_at | type == "string")) and
+        (.routes | type == "array" and all(.[]; type == "string" and test("^[A-Za-z0-9._-]{1,64}$|^\\*$"))) and
+        ((.enabled_nodes // ["*"]) | type == "array" and
+          length == (unique | length) and
+          all(.[]; type == "string" and
+            test("^\\*$|^[A-Za-z0-9][A-Za-z0-9._-]{0,63}/((xhttp|reality)/[A-Za-z0-9][A-Za-z0-9._-]{0,63}|hy2)$"))) and
+        (.subscription_prefix | type == "string" and test("^[0-9a-fA-F]{8}$")) and
+        (.subscription_token | type == "string" and test("^[0-9a-fA-F]{40}$")) and
+        ((.speed_limit // {up_mbps: 0, down_mbps: 0}) |
+          type == "object" and
+          (.up_mbps | type == "number" and floor == . and . >= 0 and . <= 100000) and
+          (.down_mbps | type == "number" and floor == . and . >= 0 and . <= 100000)) and
+        ((.usage_epoch // "") | type == "string" and length <= 128) and
+        ((.domain_epoch // "") | type == "string" and length <= 128)
+      )) and
+    (.domain_audit == null or (
+      (.domain_audit | type == "object") and
+      (.domain_audit.enabled | type == "boolean") and
+      (.domain_audit.retention_days | type == "number" and floor == . and . >= 1 and . <= 365) and
+      (.domain_audit.max_domains_per_user | type == "number" and floor == . and . >= 10 and . <= 5000)
+    ))
+  ' <<<"$bundle" >/dev/null || die "Invalid WSS configuration payload"
+  state_update '
+    .users = $bundle.users |
+    .domain_audit = (
+      if $bundle.domain_audit == null then
+        ((.domain_audit // {}) + {
+          enabled: (.domain_audit.enabled // false),
+          retention_days: (.domain_audit.retention_days // 30),
+          max_domains_per_user: (.domain_audit.max_domains_per_user // 500)
+        })
+      else $bundle.domain_audit end
     )
-  ' <<<"$payload" >/dev/null || die "Invalid WSS configuration payload"
-  state_update '.users = $users' --argjson users "$payload"
+  ' --argjson bundle "$bundle"
   if (( prepare_only )); then
     cmd_render
   else
     cmd_apply
   fi
-  log "WSS configuration applied for $(jq 'length' <<<"$payload") users"
+  log "WSS configuration applied for $(jq '.users | length' <<<"$bundle") users"
 }
 
 cmd_control_status() {
@@ -7586,6 +7996,11 @@ cmd_status() {
       https_listen_port: (.nginx.https_listen_port // .nginx.tls_port)
     },
     users: (.users | length),
+    domain_audit: {
+      enabled: (.domain_audit.enabled // false),
+      retention_days: (.domain_audit.retention_days // 30),
+      max_domains_per_user: (.domain_audit.max_domains_per_user // 500)
+    },
     easytier: {
       enabled: (.easytier.enabled // false),
       ipv4: (.easytier.ipv4 // ""),
@@ -7611,6 +8026,7 @@ cmd_status() {
   systemctl --no-pager --full status etxr-xray.service 2>/dev/null | sed -n '1,8p' || true
   systemctl --no-pager --full status etxr-sing-box.service 2>/dev/null | sed -n '1,8p' || true
   systemctl --no-pager --full status etxr-meter.service 2>/dev/null | sed -n '1,8p' || true
+  systemctl --no-pager --full status etxr-domain-audit.service 2>/dev/null | sed -n '1,8p' || true
   systemctl --no-pager --full status etxr-control.service 2>/dev/null | sed -n '1,8p' || true
   systemctl --no-pager --full status etxr-agent.service 2>/dev/null | sed -n '1,8p' || true
 }
@@ -7685,7 +8101,10 @@ menu_header() {
     printf ' 配置下发：%s [%s]\n' \
       "$([[ "$role" == "exit" ]] && printf '接收端' || printf '主控端')" \
       "$(service_badge "$control_service")"
-    printf ' 用户统计：[%s]\n' "$(service_badge etxr-meter.service)"
+    printf ' 流量统计：[%s]  域名统计：%s\n' \
+      "$(service_badge etxr-meter.service)" \
+      "$([[ "$(jq -r '.domain_audit.enabled // false' "$STATE_FILE")" == "true" ]] && \
+        service_badge etxr-domain-audit.service || printf '未启用')"
     printf ' 已有配置：%s 个用户 / %s 条线路 / %s 台从服务器\n' \
       "$users" "$routes" "$peers"
   else
@@ -7728,6 +8147,7 @@ menu_quick_init() {
   local hy2_shared_udp443=false hy2_share_choice
   local et_ip et_endpoint et_port et_name et_secret
   local username user_uuid user_password user_up user_down user_nodes
+  local domain_audit_enabled
   local protocol_selection admin_selection admin_selection_normalized
   local value default_uuid default_password
   local -a admin_node_keys=() admin_node_labels=() selected_admin_nodes=()
@@ -7894,6 +8314,11 @@ menu_quick_init() {
   user_up="$(prompt_mbps '该用户上传限速 Mbps（0 表示不限速）' '0')"
   user_down="$(prompt_mbps '该用户下载限速 Mbps（0 表示不限速）' '0')"
 
+  printf '\n%s【访问域名统计】%s\n' "$C_BOLD" "$C_RESET"
+  printf '启用后按用户记录访问域名、连接次数和时间，不记录完整 URL、请求内容或客户端 IP。\n'
+  printf '从服务器会自动回报到主服务器；可随时停止或清空。\n'
+  domain_audit_enabled="$(prompt_bool '启用按用户访问域名统计' n)"
+
   printf '\n%s【EasyTier 主从私网】%s\n' "$C_BOLD" "$C_RESET"
   printf '以后添加从服务器时，它们会主动连接下面的主服务器公网 TCP 端口。\n'
   et_ip="$(prompt_ipv4_value '主服务器在 EasyTier 私网中的 IP' '10.100.0.1')"
@@ -7921,10 +8346,12 @@ menu_quick_init() {
     "$([[ "$hy2_shared_udp443" == "true" ]] && printf '（与网站 TCP 443 同时使用；自动关闭 nginx H3）')" \
     "$hy2_masquerade"
   printf '\n  • EasyTier 主从私网：主服务器公网 TCP %s，私网 IP %s\n' "$et_port" "$et_ip"
-  printf '  • 管理员：%s，上传 %s，下载 %s\n\n' \
+  printf '  • 管理员：%s，上传 %s，下载 %s\n' \
     "$username" \
     "$([[ "$user_up" == "0" ]] && printf '不限速' || printf '%s Mbps' "$user_up")" \
     "$([[ "$user_down" == "0" ]] && printf '不限速' || printf '%s Mbps' "$user_down")"
+  printf '  • 访问域名统计：%s\n\n' \
+    "$([[ "$domain_audit_enabled" == "y" ]] && printf '开启' || printf '关闭')"
   if ! menu_confirm "确认开始安装"; then
     FORCE=0
     return
@@ -7953,6 +8380,12 @@ menu_quick_init() {
     return
   }
   FORCE=0
+  if [[ "$domain_audit_enabled" == "y" ]]; then
+    menu_exec cmd_domain enable || {
+      menu_pause
+      return
+    }
+  fi
   local route_name reality_keys reality_private reality_public reality_short
   menu_exec cmd_cluster_master_init --ip "$et_ip" --endpoint "$et_endpoint" \
     --port "$et_port" --network-name "$et_name" --network-secret "$et_secret" || {
@@ -8053,7 +8486,10 @@ menu_users() {
     printf '8. 查看用户流量          （主从服务器自动汇总）\n'
     printf '9. 设置用户限速          （0 表示不限速）\n'
     printf '10. 清零用户流量\n'
-    printf '11. 导出单线路配置       （高级功能）\n'
+    printf '11. 查看用户访问域名     （主从服务器自动汇总）\n'
+    printf '12. 设置访问域名统计     （启用、停止、保留天数）\n'
+    printf '13. 清空访问域名历史\n'
+    printf '14. 导出单线路配置       （高级功能）\n'
     printf '0. 返回主菜单\n\n'
     read -r -p '请选择: ' choice
     case "$choice" in
@@ -8174,6 +8610,25 @@ menu_users() {
         menu_pause
         ;;
       11)
+        cmd_user_list || true
+        name="$(prompt_value '查看哪个用户（直接回车查看全部）')"
+        menu_exec cmd_user_domains "$name" 100 || true
+        menu_pause
+        ;;
+      12)
+        menu_domain_audit
+        ;;
+      13)
+        cmd_user_list || true
+        name="$(prompt_value '清空哪个用户的记录（全部用户填 all）')"
+        if menu_confirm "清空 ${name} 在主从所有服务器上的访问域名历史，确定继续"; then
+          if menu_exec cmd_user_reset_domains "$name"; then
+            menu_apply_prompt || true
+          fi
+        fi
+        menu_pause
+        ;;
+      14)
         name="$(prompt_value '用户名称')"
         cmd_route_list || true
         route="$(prompt_value '线路名称')"
@@ -8182,6 +8637,59 @@ menu_users() {
         menu_exec cmd_client "$name" --route "$route" --socks-port "$socks" --out "$out" || true
         menu_pause
         ;;
+      0) return ;;
+      *) warn "无效选项"; sleep 1 ;;
+    esac
+  done
+}
+
+menu_domain_audit() {
+  local choice retention maximum enabled
+  while true; do
+    menu_header
+    enabled="$(jq -r '.domain_audit.enabled // false' "$STATE_FILE")"
+    printf '%s【访问域名统计设置】%s\n' "$C_BOLD" "$C_RESET"
+    printf '当前状态：%s\n' \
+      "$([[ "$enabled" == "true" ]] && printf '正在记录' || printf '没有记录新连接')"
+    printf '只保存用户、域名、连接次数和时间；不保存完整 URL、请求内容或客户端 IP。\n'
+    printf '停止后不会新增记录，已有历史会保留，直到到期或手动清空。\n\n'
+    printf '1. 启用统计\n'
+    printf '2. 停止统计\n'
+    printf '3. 修改保留天数和每用户域名上限\n'
+    printf '4. 查看当前设置\n'
+    printf '0. 返回用户菜单\n\n'
+    read -r -p '请选择: ' choice
+    case "$choice" in
+      1)
+        if menu_exec cmd_domain enable; then menu_apply_prompt || true; fi
+        menu_pause
+        ;;
+      2)
+        if menu_exec cmd_domain disable; then menu_apply_prompt || true; fi
+        menu_pause
+        ;;
+      3)
+        retention="$(jq -r '.domain_audit.retention_days // 30' "$STATE_FILE")"
+        maximum="$(jq -r '.domain_audit.max_domains_per_user // 500' "$STATE_FILE")"
+        while true; do
+          retention="$(prompt_value '记录保留天数（1～365）' "$retention")"
+          [[ "$retention" =~ ^[0-9]+$ ]] &&
+            (( retention >= 1 && retention <= 365 )) && break
+          warn "保留天数必须是 1 到 365"
+        done
+        while true; do
+          maximum="$(prompt_value '每用户最多保留多少个域名（10～5000）' "$maximum")"
+          [[ "$maximum" =~ ^[0-9]+$ ]] &&
+            (( maximum >= 10 && maximum <= 5000 )) && break
+          warn "每用户域名上限必须是 10 到 5000"
+        done
+        if menu_exec cmd_domain configure --retention-days "$retention" \
+          --max-domains "$maximum"; then
+          menu_apply_prompt || true
+        fi
+        menu_pause
+        ;;
+      4) menu_exec cmd_domain show || true; menu_pause ;;
       0) return ;;
       *) warn "无效选项"; sleep 1 ;;
     esac
@@ -8845,6 +9353,18 @@ menu_health_check() {
     ((failures+=1))
   fi
 
+  if [[ "$(jq -r '.domain_audit.enabled // false' "$STATE_FILE")" == "true" ]]; then
+    if systemctl is-active --quiet etxr-domain-audit.service &&
+       [[ -S "$DOMAIN_SOCKET" ]]; then
+      health_result 1 "用户访问域名统计" "正在运行"
+    else
+      health_result 0 "用户访问域名统计" "服务未运行或本机 Socket 不存在"
+      ((failures+=1))
+    fi
+  else
+    health_result 1 "用户访问域名统计" "未启用（不是故障）"
+  fi
+
   if (( limited_count > 0 )); then
     if systemctl is-active --quiet etxr-limiter.service; then
       health_result 1 "单用户限速" "${limited_count} 个用户已启用"
@@ -9075,6 +9595,7 @@ main() {
     menu) cmd_menu ;;
     init) cmd_init "$@" ;;
     user) cmd_user "$@" ;;
+    domain) cmd_domain "$@" ;;
     route) cmd_route "$@" ;;
     exit) cmd_exit "$@" ;;
     reality) cmd_reality "$@" ;;

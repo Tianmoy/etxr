@@ -81,13 +81,20 @@ async def run() -> None:
             "routes": ["*"],
             "subscription_prefix": "522b276a",
             "subscription_token": "1" * 40,
+            "domain_epoch": "domain-epoch-1",
         }]
+        domain_audit = {
+            "enabled": True,
+            "retention_days": 30,
+            "max_domains_per_user": 500,
+        }
         issued_at = int(time.time())
         write_json(desired, {
             "node_id": NODE,
             "version": "v1",
             "issued_at": issued_at,
             "users": users,
+            "domain_audit": domain_audit,
         })
         fake_hub_etxr.write_text(
             "#!/usr/bin/env bash\n"
@@ -175,6 +182,7 @@ async def run() -> None:
                             "version": "v2",
                             "issued_at": issued_at + 1,
                             "users": users,
+                            "domain_audit": domain_audit,
                         },
                     )
                     await receive_update(ws, "v2")
@@ -183,6 +191,7 @@ async def run() -> None:
             worker_state = worker / "state.json"
             payload_file = worker / "applied-users.json"
             usage_file = worker / "usage.json"
+            domain_file = worker / "domains.json"
             fake_etxr = worker / "fake-etxr"
             write_json(worker_state, {
                 "node": {
@@ -216,6 +225,25 @@ async def run() -> None:
                     }
                 },
             })
+            write_json(domain_file, {
+                "schema": 1,
+                "updated_at": int(time.time()),
+                "node": NODE,
+                "users": {
+                    "alice": {
+                        "uuid": users[0]["uuid"],
+                        "domain_epoch": users[0]["domain_epoch"],
+                        "unresolved": 2,
+                        "domains": {
+                            "example.com": {
+                                "connections": 3,
+                                "first_seen": int(time.time()) - 60,
+                                "last_seen": int(time.time()),
+                            }
+                        },
+                    }
+                },
+            })
             write_json(
                 desired,
                 {
@@ -223,6 +251,7 @@ async def run() -> None:
                     "version": "v3",
                     "issued_at": issued_at + 2,
                     "users": users,
+                    "domain_audit": domain_audit,
                 },
             )
             agent_env = dict(os.environ)
@@ -237,6 +266,8 @@ async def run() -> None:
                 str(fake_etxr),
                 "--usage-file",
                 str(usage_file),
+                "--domain-file",
+                str(domain_file),
                 env=agent_env,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
@@ -256,11 +287,18 @@ async def run() -> None:
                     and json.loads(report_file.read_text(encoding="utf-8")).get("status")
                     == "applied"
                 )
-                assert json.loads(payload_file.read_text(encoding="utf-8")) == users
+                assert json.loads(payload_file.read_text(encoding="utf-8")) == {
+                    "users": users,
+                    "domain_audit": domain_audit,
+                }
                 report = json.loads(report_file.read_text(encoding="utf-8"))
                 assert report["usage"]["users"]["alice"]["uplink"] == 1234
                 assert report["usage"]["users"]["alice"]["downlink"] == 5678
                 assert report["entry"]["node"]["name"] == NODE
+                assert report["domains"]["node"] == NODE
+                assert report["domains"]["users"]["alice"]["unresolved"] == 2
+                domains = report["domains"]["users"]["alice"]["domains"]
+                assert domains["example.com"]["connections"] == 3
             finally:
                 agent.terminate()
                 await agent.wait()

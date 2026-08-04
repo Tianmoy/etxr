@@ -20,6 +20,7 @@ func usage() {
 Usage:
   etxr-dataplane limiter --config FILE
   etxr-dataplane meter --state FILE --usage-file FILE --xray-bin FILE [--interval 30] [--once]
+  etxr-dataplane auditor --state FILE --domain-file FILE --socket FILE [--flush-interval 5]
   etxr-dataplane version
 `, version)
 }
@@ -73,6 +74,27 @@ func main() {
 			XrayBin:   *xrayBin,
 			Interval:  time.Duration(*interval) * time.Second,
 			Once:      *once,
+		})
+	case "auditor":
+		flags := flag.NewFlagSet("auditor", flag.ContinueOnError)
+		flags.SetOutput(os.Stderr)
+		state := flags.String("state", "", "path to ETXR state JSON")
+		domainFile := flags.String("domain-file", "", "path to domain audit ledger JSON")
+		socket := flags.String("socket", "", "path to local Xray webhook Unix socket")
+		flushInterval := flags.Int("flush-interval", 5, "ledger flush interval in seconds")
+		if parseErr := flags.Parse(os.Args[2:]); parseErr != nil {
+			os.Exit(2)
+		}
+		if *state == "" || *domainFile == "" || *socket == "" ||
+			*flushInterval < 1 || flags.NArg() != 0 {
+			flags.Usage()
+			os.Exit(2)
+		}
+		err = dataplane.RunAuditor(ctx, dataplane.AuditorOptions{
+			StatePath:     *state,
+			DomainPath:    *domainFile,
+			SocketPath:    *socket,
+			FlushInterval: time.Duration(*flushInterval) * time.Second,
 		})
 	case "version", "--version", "-version":
 		fmt.Println(version)
