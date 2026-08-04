@@ -925,7 +925,7 @@ done
 # A signed control-plane payload can be applied atomically on the worker.
 CONTROL_USERS="$("$JQ" '.users + [{
   name: "bob",
-  uuid: "33333333-3333-4333-8333-333333333333",
+  uuid: "55555555-5555-4555-8555-555555555555",
   hy2_password: "BOBPASS",
   enabled: true,
   expires_at: null,
