@@ -163,10 +163,84 @@ fi
   --target www.microsoft.com:443 --server-names www.microsoft.com \
   --private-key "$reality_private" --public-key "$reality_public" \
   --short-ids 0123456789abcdef
+"$EDGE" user add --name xonly \
+  --uuid 33333333-3333-4333-8333-333333333333 \
+  --nodes hk/xhttp/hk >/dev/null
 "$EDGE" hy2 enable --port 8443 --up-mbps 30 --down-mbps 200 \
   --obfs salamander --obfs-password OBFSPASS >/dev/null
 
 "$EDGE" render
+
+# A user only receives the explicitly selected nodes. Creating an XHTTP-only
+# user while HY2 is disabled must not create or require an HY2 password.
+"$JQ" -e '.users[] | select(.name == "xonly") |
+  .hy2_password == "" and .enabled_nodes == ["hk/xhttp/hk"]
+' "$TMP/state.json" >/dev/null
+"$JQ" -e '
+  ([.inbounds[] | select(.tag == "path-hk") |
+    .settings.clients[].email] | index("xonly@hk")) != null and
+  ([.inbounds[] | select(.tag == "path-tw") |
+    .settings.clients[].email] | index("xonly@tw")) == null and
+  ([.inbounds[] | select(.tag == "reality-backup") |
+    .settings.clients[].email] | index("xonly@backup")) == null and
+  ([.inbounds[] | select(.tag == "hy2-bridge-in") |
+    .settings.clients[].email] | index("xonly@hy2")) == null
+' "$TMP/generated/xray.json" >/dev/null
+"$JQ" -e '
+  [.inbounds[] | select(.tag == "hy2-in") | .users[].name] |
+  index("xonly") == null
+' "$TMP/generated/sing-box.json" >/dev/null
+"$EDGE" subscription xonly >"$TMP/xonly-subscription.txt"
+grep -Fq '#hk-XHTTP' "$TMP/xonly-subscription.txt"
+if grep -Eq '#hk-(Reality-XHTTP|Hysteria2|tw-XHTTP)' \
+  "$TMP/xonly-subscription.txt"; then
+  echo "XHTTP-only user received an unauthorized node" >&2
+  exit 1
+fi
+
+# Existing users can switch individual nodes. Selecting HY2 lazily generates
+# the login password and updates both runtimes and the centralized subscription.
+"$EDGE" user nodes xonly --nodes hk/reality/backup,hk/hy2 >/dev/null
+"$EDGE" render
+"$JQ" -e '.users[] | select(.name == "xonly") |
+  (.hy2_password | length > 0) and
+  .enabled_nodes == ["hk/hy2", "hk/reality/backup"]
+' "$TMP/state.json" >/dev/null
+"$JQ" -e '
+  ([.inbounds[] | select(.tag == "path-hk") |
+    .settings.clients[].email] | index("xonly@hk")) == null and
+  ([.inbounds[] | select(.tag == "reality-backup") |
+    .settings.clients[].email] | index("xonly@backup")) != null and
+  ([.inbounds[] | select(.tag == "hy2-bridge-in") |
+    .settings.clients[].email] | index("xonly@hy2")) != null
+' "$TMP/generated/xray.json" >/dev/null
+"$JQ" -e '
+  [.inbounds[] | select(.tag == "hy2-in") | .users[].name] |
+  index("xonly") != null
+' "$TMP/generated/sing-box.json" >/dev/null
+"$EDGE" subscription xonly >"$TMP/xonly-switched-subscription.txt"
+grep -Fq '#hk-Reality-XHTTP' "$TMP/xonly-switched-subscription.txt"
+grep -Fq '#hk-Hysteria2' "$TMP/xonly-switched-subscription.txt"
+if grep -Fq '#hk-XHTTP' "$TMP/xonly-switched-subscription.txt"; then
+  echo "disabled XHTTP node remained in the subscription" >&2
+  exit 1
+fi
+"$EDGE" user nodes xonly --nodes hk/xhttp/hk >/dev/null
+
+# States created by older releases have no enabled_nodes field. They retain
+# all-node behavior after upgrade instead of losing access.
+"$JQ" '(.users[] | select(.name == "alice")) |= del(.enabled_nodes)' \
+  "$TMP/state.json" >"$TMP/state-legacy.json"
+mv "$TMP/state-legacy.json" "$TMP/state.json"
+"$EDGE" render
+"$JQ" -e '
+  ([.inbounds[] | select(.tag == "path-tw") |
+    .settings.clients[].email] | index("alice@tw")) != null and
+  ([.inbounds[] | select(.tag == "reality-backup") |
+    .settings.clients[].email] | index("alice@backup")) != null and
+  ([.inbounds[] | select(.tag == "hy2-bridge-in") |
+    .settings.clients[].email] | index("alice@hy2")) != null
+' "$TMP/generated/xray.json" >/dev/null
 
 "$XRAY" run -test -config "$TMP/generated/xray.json"
 "$SING_BOX" check -c "$TMP/generated/sing-box.json"
@@ -413,7 +487,7 @@ if grep -Eq 'proxy-user|proxy-pass|socks_username|socks_password' \
   echo "SOCKS5 credentials leaked into the subscription entry snapshot" >&2
   exit 1
 fi
-grep -Eq 'Subscription URL: https://hk\.example\.com/522b276a/[0-9a-f]{40}$' \
+grep -Eq '订阅链接：https://hk\.example\.com/522b276a/[0-9a-f]{40}$' \
   "$TMP/subscription.txt"
 if grep -q '/sub/' "$TMP/subscription.txt"; then
   echo "fixed /sub/ subscription URL exists" >&2
@@ -652,6 +726,38 @@ ETXR_STATE="$WORKER/state.json" ETXR_RUNTIME="$WORKER" \
 grep -Fq '#b1-XHTTP' "$TMP/master-central-subscription.txt"
 grep -Fq '#b1-Reality-XHTTP' "$TMP/master-central-subscription.txt"
 grep -Fq '#b1-Hysteria2' "$TMP/master-central-subscription.txt"
+
+# Node changes made on the master are included in the desired control payload
+# and become effective in the worker's Xray and sing-box configurations.
+"$EDGE" user nodes xonly \
+  --nodes b1/xhttp/b1-xhttp,b1/reality/direct,b1/hy2 >/dev/null
+"$EDGE" render >/dev/null
+"$JQ" -c '.users' "$TMP/control/nodes/b1.json" |
+  ETXR_STATE="$WORKER/state.json" ETXR_RUNTIME="$WORKER" \
+  ETXR_GENERATED="$WORKER/generated" \
+  ETXR_SUBSCRIPTIONS="$WORKER/subscriptions" \
+  XRAY_BIN="$XRAY" SING_BOX_BIN="$SING_BOX" \
+    "$EDGE" control apply --prepare-only >/dev/null
+"$JQ" -e '
+  ([.inbounds[] | select(.tag == "path-b1-xhttp") |
+    .settings.clients[].email] | index("xonly@b1-xhttp")) != null and
+  ([.inbounds[] | select(.tag == "reality-direct") |
+    .settings.clients[].email] | index("xonly@direct")) != null and
+  ([.inbounds[] | select(.tag == "hy2-bridge-in") |
+    .settings.clients[].email] | index("xonly@hy2")) != null
+' "$WORKER/generated/xray.json" >/dev/null
+"$JQ" -e '
+  [.inbounds[] | select(.tag == "hy2-in") | .users[].name] |
+  index("xonly") != null
+' "$WORKER/generated/sing-box.json" >/dev/null
+"$EDGE" subscription xonly >"$TMP/xonly-worker-subscription.txt"
+grep -Fq '#b1-XHTTP' "$TMP/xonly-worker-subscription.txt"
+grep -Fq '#b1-Reality-XHTTP' "$TMP/xonly-worker-subscription.txt"
+grep -Fq '#b1-Hysteria2' "$TMP/xonly-worker-subscription.txt"
+if grep -Fq '#hk-XHTTP' "$TMP/xonly-worker-subscription.txt"; then
+  echo "master node remained enabled after selecting worker nodes" >&2
+  exit 1
+fi
 ETXR_STATE="$WORKER/state.json" \
 ETXR_RUNTIME="$WORKER" \
 ETXR_GENERATED="$WORKER/generated" \

@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.14.0"
+VERSION="0.15.0"
 ETXR_REPOSITORY="${ETXR_REPOSITORY:-Tianmoy/etxr}"
 ETXR_RELEASE_API="${ETXR_RELEASE_API:-https://api.github.com/repos/${ETXR_REPOSITORY}/releases/latest}"
 
@@ -149,8 +149,49 @@ prompt_bool() {
   fi
 }
 
+normalize_index_selection() {
+  local raw="$1" count="$2" allow_empty="${3:-false}" token
+  local -a selected=()
+  local -A seen=()
+  raw="${raw//,/ }"
+  if [[ "$raw" == "0" && "$allow_empty" == "true" ]]; then
+    return 0
+  fi
+  for token in $raw; do
+    [[ "$token" =~ ^[0-9]+$ ]] || return 1
+    (( 10#$token >= 1 && 10#$token <= count )) || return 1
+    [[ -z "${seen[$token]:-}" ]] || continue
+    seen[$token]=1
+    selected+=("$((10#$token))")
+  done
+  (( ${#selected[@]} > 0 )) || return 1
+  printf '%s' "${selected[*]}"
+}
+
+prompt_protocol_selection() {
+  local default="${1:-1 3}" answer normalized
+  while true; do
+    printf '\n%s【选择要安装的客户端协议】%s\n' "$C_BOLD" "$C_RESET" >&2
+    printf '  1. XHTTP + HTTPS\n' >&2
+    printf '  2. Reality + XHTTP\n' >&2
+    printf '  3. Hysteria2\n' >&2
+    read -r -p "请输入编号，可多选（例如 1 3）[${default}]: " answer
+    answer="${answer:-$default}"
+    if normalized="$(normalize_index_selection "$answer" 3 false)"; then
+      printf '%s' "$normalized"
+      return
+    fi
+    warn "请输入 1 到 3 的编号；多个编号用空格或逗号分隔"
+  done
+}
+
 valid_mbps() { [[ "$1" =~ ^[0-9]+$ ]] && (( "$1" <= 100000 )); }
 valid_url() { [[ "$1" =~ ^https?://[^[:space:]]+$ ]]; }
+valid_node_key() {
+  [[ "$1" == "*" ||
+     "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}/(xhttp|reality)/[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ||
+     "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}/hy2$ ]]
+}
 
 port_is_listening() {
   local proto="$1" port="$2"
@@ -1122,8 +1163,32 @@ EOF
   log "Next: add at least one user and one route"
 }
 
+enabled_nodes_json() {
+  local value="$1" json node
+  if [[ "$value" == "*" ]]; then
+    printf '["*"]'
+    return
+  fi
+  json="$(printf '%s' "$value" | jq -R '
+    split(",") | map(gsub("^[[:space:]]+|[[:space:]]+$"; "")) |
+    map(select(length > 0)) | unique
+  ')"
+  while IFS= read -r node; do
+    valid_node_key "$node" || die "无效的节点标识：$node"
+  done < <(jq -r '.[]' <<<"$json")
+  printf '%s' "$json"
+}
+
+enabled_nodes_need_hy2() {
+  local nodes_json="$1"
+  jq -e 'any(.[]; endswith("/hy2"))' <<<"$nodes_json" >/dev/null && return 0
+  jq -e 'index("*") != null' <<<"$nodes_json" >/dev/null || return 1
+  available_nodes_json | jq -s -e 'any(.[]; .protocol == "hy2")' >/dev/null
+}
+
 cmd_user_add() {
-  local name="" uuid="" password="" expires="" routes="*" sub_token sub_prefix
+  local name="" uuid="" password="" expires="" routes="*" nodes=""
+  local routes_set=0 nodes_set=0 sub_token sub_prefix
   local up_mbps=0 down_mbps=0 usage_epoch
   while (($#)); do
     case "$1" in
@@ -1131,46 +1196,67 @@ cmd_user_add() {
       --uuid) uuid="$2"; shift 2 ;;
       --password) password="$2"; shift 2 ;;
       --expires) expires="$2"; shift 2 ;;
-      --routes) routes="$2"; shift 2 ;;
+      --routes) routes="$2"; routes_set=1; shift 2 ;;
+      --nodes) nodes="$2"; nodes_set=1; shift 2 ;;
       --up-mbps) up_mbps="$2"; shift 2 ;;
       --down-mbps) down_mbps="$2"; shift 2 ;;
       --help)
         cat <<'EOF'
 Usage: etxr user add --name alice [--uuid UUID] [--password PASS]
-       [--expires 2027-01-01T00:00:00Z] [--routes '*|hk,tw,us']
+       [--expires 2027-01-01T00:00:00Z]
+       [--nodes '*|hk/xhttp/hk,tw/reality/direct']
+       [--routes '*|hk,tw,us']
        [--up-mbps 0] [--down-mbps 0]
 EOF
         return ;;
-      *) die "Unknown user add option: $1" ;;
+      *) die "未知的新增用户参数：$1" ;;
     esac
   done
   require_state
-  [[ -n "$name" ]] || die "--name is required"
-  valid_name "$name" || die "Invalid user name"
+  [[ -n "$name" ]] || die "必须填写 --name"
+  valid_name "$name" || die "用户名格式不正确"
   jq -e --arg name "$name" '.users[]? | select(.name == $name)' "$STATE_FILE" >/dev/null &&
-    die "User already exists: $name"
+    die "用户已存在：$name"
   uuid="${uuid:-$(random_uuid)}"
-  password="${password:-$(random_password)}"
   usage_epoch="$(random_hex 8)"
-  valid_uuid "$uuid" || die "Invalid UUID"
-  valid_mbps "$up_mbps" || die "Invalid upload Mbps"
-  valid_mbps "$down_mbps" || die "Invalid download Mbps"
+  valid_uuid "$uuid" || die "UUID 格式不正确"
+  valid_mbps "$up_mbps" || die "上传限速格式不正确"
+  valid_mbps "$down_mbps" || die "下载限速格式不正确"
   if [[ -n "$expires" ]]; then
     [[ "$expires" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] ||
-      die "Expiry must use UTC ISO-8601 format, for example 2027-01-01T00:00:00Z"
+      die "到期时间必须使用 UTC ISO-8601 格式，例如 2027-01-01T00:00:00Z"
     date -u -d "$expires" +%s >/dev/null 2>&1 ||
-      die "Invalid expiry timestamp"
+      die "到期时间无效"
   fi
   sub_token="$(random_hex 20)"
   sub_prefix="$(sha1_prefix "$name")"
 
-  local routes_json
-  if [[ "$routes" == "*" ]]; then
+  local routes_json nodes_json node_name
+  node_name="$(jq -r '.node.name' "$STATE_FILE")"
+  if (( nodes_set )); then
+    nodes_json="$(enabled_nodes_json "$nodes")"
+  elif (( routes_set )) && [[ "$routes" != "*" ]]; then
+    nodes_json="$(printf '%s' "$routes" | jq -R --arg node "$node_name" '
+      split(",") | map(select(length > 0)) |
+      map($node + "/xhttp/" + .) | unique
+    ')"
+  else
+    nodes_json='["*"]'
+  fi
+  jq -e 'length > 0' <<<"$nodes_json" >/dev/null ||
+    die "新增用户至少要选择一个可用节点"
+  if enabled_nodes_need_hy2 "$nodes_json" && [[ -z "$password" ]]; then
+    password="$(random_password)"
+  fi
+  jq -e 'type == "string" and length <= 512 and
+    (test("[\u0000-\u001f\u007f]") | not)' <<<"$(jq -Rn --arg v "$password" '$v')" >/dev/null ||
+    die "Hysteria2 密码格式不正确"
+
+  if jq -e 'index("*") != null' <<<"$nodes_json" >/dev/null; then
     routes_json='["*"]'
   else
-    routes_json="$(printf '%s' "$routes" | jq -R 'split(",") | map(select(length > 0))')"
-    jq -e 'all(.[]; test("^[A-Za-z0-9._-]{1,64}$"))' <<<"$routes_json" >/dev/null ||
-      die "Invalid route name in --routes"
+    routes_json="$(jq '[.[] | select(contains("/xhttp/")) | split("/")[-1]] | unique' \
+      <<<"$nodes_json")"
   fi
   state_update \
     '.users += [{
@@ -1180,6 +1266,7 @@ EOF
       enabled: true,
       expires_at: (if $expires == "" then null else $expires end),
       routes: $routes,
+      enabled_nodes: $enabled_nodes,
       subscription_prefix: $prefix,
       subscription_token: $token,
       speed_limit: {
@@ -1192,53 +1279,118 @@ EOF
     --arg expires "$expires" --arg prefix "$sub_prefix" \
     --arg token "$sub_token" --arg usage_epoch "$usage_epoch" \
     --argjson routes "$routes_json" --argjson up_mbps "$up_mbps" \
-    --argjson down_mbps "$down_mbps"
-  log "Added user $name"
-  printf 'UUID: %s\nHysteria2 password: %s\nSubscription path: /%s/%s\n' \
-    "$uuid" "$password" "$sub_prefix" "$sub_token"
+    --argjson enabled_nodes "$nodes_json" --argjson down_mbps "$down_mbps"
+  log "已添加用户：$name"
+  printf 'UUID：%s\n' "$uuid"
+  [[ -z "$password" ]] || printf 'Hysteria2 密码：%s\n' "$password"
+  printf '订阅路径：/%s/%s\n' "$sub_prefix" "$sub_token"
 }
 
 cmd_user_remove() {
   local name="${1:-}"
-  [[ -n "$name" ]] || die "Usage: etxr user remove NAME"
+  [[ -n "$name" ]] || die "用法：etxr user remove 用户名"
   require_state
   jq -e --arg name "$name" '.users[]? | select(.name == $name)' "$STATE_FILE" >/dev/null ||
-    die "Unknown user: $name"
+    die "用户不存在：$name"
   state_update '.users |= map(select(.name != $name))' --arg name "$name"
-  log "Removed user $name"
+  log "已删除用户：$name"
 }
 
 cmd_user_list() {
   require_state
   jq -r '
-    ["NAME","ENABLED","UPLOAD","DOWNLOAD","EXPIRES","ROUTES"],
+    ["用户名","状态","上传限速","下载限速","到期时间","可用节点"],
     (.users[] | [
       .name,
-      (.enabled|tostring),
+      (if .enabled then "已启用" else "已暂停" end),
       (if (.speed_limit.up_mbps // 0) == 0 then "不限速" else "\(.speed_limit.up_mbps) Mbps" end),
       (if (.speed_limit.down_mbps // 0) == 0 then "不限速" else "\(.speed_limit.down_mbps) Mbps" end),
       (.expires_at // "-"),
-      (.routes|join(","))
+      (if ((.enabled_nodes // ["*"]) | index("*")) != null then "全部节点"
+       else "\((.enabled_nodes // []) | length) 个节点" end)
     ])
     | @tsv' "$STATE_FILE" | column -t -s $'\t' 2>/dev/null ||
     jq -r '.users[] |
-      "\(.name)\tenabled=\(.enabled)\tup=\(.speed_limit.up_mbps // 0)Mbps\tdown=\(.speed_limit.down_mbps // 0)Mbps\texpires=\(.expires_at // "-")\troutes=\(.routes|join(","))"' "$STATE_FILE"
+      "用户名=\(.name)\t状态=\(if .enabled then "已启用" else "已暂停" end)\t上传=\(.speed_limit.up_mbps // 0)Mbps\t下载=\(.speed_limit.down_mbps // 0)Mbps\t到期=\(.expires_at // "-")\t节点=\(if ((.enabled_nodes // ["*"]) | index("*")) != null then "全部" else ((.enabled_nodes // []) | length | tostring) end)"' "$STATE_FILE"
+}
+
+cmd_user_nodes() {
+  local name="${1:-}" nodes="" password="" nodes_json routes_json current_password
+  [[ -n "$name" ]] || die "用法：etxr user nodes 用户名 --nodes 节点列表"
+  shift || true
+  while (($#)); do
+    case "$1" in
+      --nodes) nodes="$2"; shift 2 ;;
+      --password) password="$2"; shift 2 ;;
+      *) die "未知的用户节点参数：$1" ;;
+    esac
+  done
+  require_state
+  jq -e --arg name "$name" '.users[]? | select(.name == $name)' \
+    "$STATE_FILE" >/dev/null || die "用户不存在：$name"
+  nodes_json="$(enabled_nodes_json "$nodes")"
+  current_password="$(jq -r --arg name "$name" \
+    '.users[] | select(.name == $name) | (.hy2_password // "")' "$STATE_FILE")"
+  if enabled_nodes_need_hy2 "$nodes_json" &&
+     [[ -z "$password" && -z "$current_password" ]]; then
+    password="$(random_password)"
+    printf '已为该用户生成 Hysteria2 密码：%s\n' "$password"
+  fi
+  [[ -n "$password" ]] || password="$current_password"
+  jq -e 'type == "string" and length <= 512 and
+    (test("[\u0000-\u001f\u007f]") | not)' <<<"$(jq -Rn --arg v "$password" '$v')" >/dev/null ||
+    die "Hysteria2 密码格式不正确"
+  if jq -e 'index("*") != null' <<<"$nodes_json" >/dev/null; then
+    routes_json='["*"]'
+  else
+    routes_json="$(jq '[.[] | select(contains("/xhttp/")) | split("/")[-1]] | unique' \
+      <<<"$nodes_json")"
+  fi
+  state_update '
+    (.users[] | select(.name == $name)) |= (
+      .enabled_nodes = $nodes |
+      .routes = $routes |
+      .hy2_password = $password
+    )
+  ' --arg name "$name" --arg password "$password" \
+    --argjson nodes "$nodes_json" --argjson routes "$routes_json"
+  log "已更新用户 ${name} 的可用节点"
+}
+
+ensure_hy2_passwords_for_node() {
+  local node_name="$1" node_key user_name password
+  node_key="${node_name}/hy2"
+  while IFS= read -r user_name; do
+    [[ -n "$user_name" ]] || continue
+    password="$(random_password)"
+    state_update '
+      (.users[] | select(.name == $name) | .hy2_password) = $password
+    ' --arg name "$user_name" --arg password "$password"
+  done < <(jq -r --arg key "$node_key" '
+    .users[] |
+    select(
+      (.hy2_password // "") == "" and
+      ((.enabled_nodes // ["*"]) as $nodes |
+       (($nodes | index("*")) != null or ($nodes | index($key)) != null))
+    ) |
+    .name
+  ' "$STATE_FILE")
 }
 
 cmd_user_limit() {
   local name="${1:-}" up_mbps="" down_mbps=""
-  [[ -n "$name" ]] || die "Usage: etxr user limit NAME --up-mbps N --down-mbps N"
+  [[ -n "$name" ]] || die "用法：etxr user limit 用户名 --up-mbps N --down-mbps N"
   shift || true
   while (($#)); do
     case "$1" in
       --up-mbps) up_mbps="$2"; shift 2 ;;
       --down-mbps) down_mbps="$2"; shift 2 ;;
-      *) die "Unknown user limit option: $1" ;;
+      *) die "未知的用户限速参数：$1" ;;
     esac
   done
   require_state
   jq -e --arg name "$name" '.users[]? | select(.name == $name)' \
-    "$STATE_FILE" >/dev/null || die "Unknown user: $name"
+    "$STATE_FILE" >/dev/null || die "用户不存在：$name"
   [[ -n "$up_mbps" ]] ||
     up_mbps="$(jq -r --arg name "$name" \
       '.users[] | select(.name == $name) | (.speed_limit.up_mbps // 0)' "$STATE_FILE")"
@@ -1259,14 +1411,14 @@ cmd_user_limit() {
 
 cmd_user_reset_usage() {
   local name="${1:-}"
-  [[ -n "$name" ]] || die "Usage: etxr user reset-usage NAME|all"
+  [[ -n "$name" ]] || die "用法：etxr user reset-usage 用户名|all"
   require_state
   if [[ "$name" == "all" ]]; then
     state_update '.users |= map(.usage_epoch = $epoch)' \
       --arg epoch "$(random_hex 8)"
   else
     jq -e --arg name "$name" '.users[]? | select(.name == $name)' \
-      "$STATE_FILE" >/dev/null || die "Unknown user: $name"
+      "$STATE_FILE" >/dev/null || die "用户不存在：$name"
     state_update '(.users[] | select(.name == $name) | .usage_epoch) = $epoch' \
       --arg name "$name" --arg epoch "$(random_hex 8)"
   fi
@@ -1287,7 +1439,7 @@ cmd_user_usage() {
   require_state
   if [[ -n "$name" ]]; then
     jq -e --arg name "$name" '.users[]? | select(.name == $name)' \
-      "$STATE_FILE" >/dev/null || die "Unknown user: $name"
+      "$STATE_FILE" >/dev/null || die "用户不存在：$name"
   fi
   if [[ -x "$DATAPLANE_BIN" && -x "$XRAY_BIN" && ${EUID:-$(id -u)} -eq 0 ]]; then
     "$DATAPLANE_BIN" meter --state "$STATE_FILE" \
@@ -1367,15 +1519,16 @@ cmd_user() {
     limit) cmd_user_limit "$@" ;;
     usage) cmd_user_usage "$@" ;;
     reset-usage) cmd_user_reset_usage "$@" ;;
+    nodes) cmd_user_nodes "$@" ;;
     enable|disable)
-      local name="${1:-}"; [[ -n "$name" ]] || die "User name required"
+      local name="${1:-}"; [[ -n "$name" ]] || die "必须填写用户名"
       jq -e --arg name "$name" '.users[]? | select(.name == $name)' "$STATE_FILE" >/dev/null ||
-        die "Unknown user: $name"
+        die "用户不存在：$name"
       local enabled=true; [[ "$action" == "disable" ]] && enabled=false
       state_update '(.users[] | select(.name == $name) | .enabled) = $enabled' \
         --arg name "$name" --argjson enabled "$enabled"
       ;;
-    *) die "Usage: etxr user add|remove|list|enable|disable|limit|usage|reset-usage" ;;
+    *) die "用法：etxr user add|remove|list|enable|disable|nodes|limit|usage|reset-usage" ;;
   esac
 }
 
@@ -1783,6 +1936,7 @@ EOF
     --argjson up "$up" --argjson down "$down" \
     --arg obfs "$obfs" --arg password "$obfs_password" \
     --arg masquerade "$masquerade" --arg cert "$cert" --arg key "$key"
+  ensure_hy2_passwords_for_node "$(jq -r '.node.name' "$STATE_FILE")"
   log "Enabled Hysteria2 on UDP $port (shared UDP 443: $shared_udp443)"
   [[ -z "$obfs_password" ]] || printf 'Hysteria2 obfs password: %s\n' "$obfs_password"
 }
@@ -1847,19 +2001,26 @@ render_xray() {
     --slurpfile exits "$tmp_exits" \
     --slurpfile realities "$tmp_reality" \
     --slurpfile relays "$tmp_relays" \
+    --arg node_name "$(jq -r '.node.name' "$STATE_FILE")" \
     --arg loglevel "$loglevel" \
     --argjson limiter_port "$(jq -r '.data_plane.limiter_port // 18181' "$STATE_FILE")" \
     --argjson api_port "$(jq -r '.data_plane.xray_api_port // 18182' "$STATE_FILE")" \
     --argjson hy2_bridge_port "$(jq -r '.data_plane.hy2_bridge_port // 18183' "$STATE_FILE")" \
     --argjson hy2_enabled "$(jq -r '.hysteria2.enabled // false' "$STATE_FILE")" \
     --argjson block "$block" '
-    def allowed_users($route_name; $flow):
+    def node_allowed($user; $protocol; $entry_name):
+      ($user.enabled_nodes // ["*"]) as $nodes |
+      ($node_name + "/" + $protocol +
+        (if $protocol == "hy2" then "" else ("/" + $entry_name) end)) as $key |
+      (($nodes | index("*")) != null or ($nodes | index($key)) != null);
+
+    def allowed_users($protocol; $entry_name; $flow):
       $users[0]
-      | map(select((.routes | index("*")) != null or (.routes | index($route_name)) != null))
+      | map(select(node_allowed(.; $protocol; $entry_name)))
       | map({
           id: .uuid,
           level: 0,
-          email: (.name + "@" + $route_name)
+          email: (.name + "@" + $entry_name)
         } + (if $flow == "" then {} else {flow: $flow} end));
 
     def sniffing:
@@ -2053,10 +2214,7 @@ render_xray() {
       [
         $routes[0][] as $r |
         limited_users[] as $u |
-        select(
-          (($u.routes | index("*")) != null) or
-          (($u.routes | index($r.name)) != null)
-        ) |
+        select(node_allowed($u; "xhttp"; $r.name)) |
         ($exits[0] | map(select(.name == $r.target)) | first // null) as $e |
         {
           type: "field",
@@ -2076,6 +2234,7 @@ render_xray() {
       [
         $realities[0][] as $r |
         limited_users[] as $u |
+        select(node_allowed($u; "reality"; $r.name)) |
         {
           type: "field",
           inboundTag: [("reality-" + $r.name)],
@@ -2087,6 +2246,7 @@ render_xray() {
     def limited_hy2_rules:
       if $hy2_enabled then [
         limited_users[] as $u |
+        select(node_allowed($u; "hy2"; "")) |
         {
           type: "field",
           inboundTag: ["hy2-bridge-in"],
@@ -2104,7 +2264,7 @@ render_xray() {
           port: $r.port,
           protocol: "vless",
           settings: {
-            clients: allowed_users($r.name; ($r.flow // "")),
+            clients: allowed_users("xhttp"; $r.name; ($r.flow // "")),
             decryption: ($r.decryption // "none")
           },
           streamSettings:
@@ -2140,7 +2300,7 @@ render_xray() {
           port: ($r.listen_port // $r.port),
           protocol: "vless",
           settings: {
-            clients: allowed_users($r.name; ""),
+            clients: allowed_users("reality"; $r.name; ""),
             decryption: "none"
           },
           streamSettings: {
@@ -2199,7 +2359,7 @@ render_xray() {
           port: $hy2_bridge_port,
           protocol: "vless",
           settings: {
-            clients: ($users[0] | map({
+            clients: ($users[0] | map(select(node_allowed(.; "hy2"; ""))) | map({
               id: .uuid,
               level: 0,
               email: (.name + "@hy2")
@@ -2565,12 +2725,16 @@ render_sing_box() {
   tmp_output="$(mktemp "$(dirname "$out")/.sing-box.XXXXXX")"
   jq -n --slurpfile s "$STATE_FILE" '
     $s[0] as $c |
+    ($c.node.name + "/hy2") as $hy2_key |
     [
       $c.users[] |
       select(
         .enabled == true and
         (.expires_at == null or .expires_at == "" or
-         (((.expires_at | fromdateiso8601?) // 0) > now))
+         (((.expires_at | fromdateiso8601?) // 0) > now)) and
+        (((.enabled_nodes // ["*"]) | index("*")) != null or
+         (((.enabled_nodes // ["*"]) | index($hy2_key)) != null)) and
+        ((.hy2_password // "") != "")
       )
     ] as $active_users |
     ($active_users | map({name: .name, password: .hy2_password})) as $users |
@@ -2820,6 +2984,109 @@ subscription_worker_entries() {
   done < <(jq -c '(.paired_nodes // [])[]' "$STATE_FILE")
 }
 
+available_nodes_json() {
+  {
+    subscription_entry_from_state
+    subscription_worker_entries
+  } | jq -s -c '
+    [
+      .[] as $entry |
+      ($entry.xray.routes[]? | {
+        key: ($entry.node.name + "/xhttp/" + .name),
+        label: (
+          $entry.node.name + "-" +
+          (if .target == "direct" then ""
+           else (.target + "-") end) +
+          (if .profile == "vlessenc-vision" then
+             "VLESS-Encryption-XHTTP"
+           else "XHTTP" end)
+        ),
+        protocol: "xhttp"
+      }),
+      ($entry.xray.reality_inbounds[]? | {
+        key: ($entry.node.name + "/reality/" + .name),
+        label: ($entry.node.name + "-Reality-XHTTP"),
+        protocol: "reality"
+      }),
+      (if $entry.hysteria2.enabled then {
+        key: ($entry.node.name + "/hy2"),
+        label: ($entry.node.name + "-Hysteria2"),
+        protocol: "hy2"
+      } else empty end)
+    ] | unique_by(.key)[]
+  '
+}
+
+user_node_allowed() {
+  local user="$1" key="$2"
+  jq -e --arg key "$key" '
+    (.enabled_nodes // ["*"]) as $nodes |
+    ($nodes | index("*")) != null or ($nodes | index($key)) != null
+  ' <<<"$user" >/dev/null
+}
+
+prompt_user_node_selection() {
+  local current_json="${1:-[]}" allow_empty="${2:-false}"
+  local row key label answer normalized default_numbers=""
+  local i=0 current_all=false
+  local -a rows=() selected=()
+  local -A known=()
+  mapfile -t rows < <(available_nodes_json)
+  jq -e 'index("*") != null' <<<"$current_json" >/dev/null && current_all=true
+
+  for row in "${rows[@]}"; do
+    key="$(jq -r '.key' <<<"$row")"
+    known["$key"]=1
+  done
+  if [[ "$current_all" != "true" ]]; then
+    while IFS= read -r key; do
+      [[ -n "$key" && -z "${known[$key]:-}" ]] || continue
+      rows+=("$(jq -nc --arg key "$key" \
+        '{key: $key, label: ($key + "（当前入口未在线）"), protocol: "offline"}')")
+      known["$key"]=1
+    done < <(jq -r '.[]' <<<"$current_json")
+  fi
+  (( ${#rows[@]} > 0 )) || die "目前没有可分配的节点，请先配置至少一个客户端入口"
+
+  printf '\n%s【选择这个用户可以使用的节点】%s\n' "$C_BOLD" "$C_RESET" >&2
+  printf '输入多个编号可同时开启；未选择的节点会对这个用户关闭。\n' >&2
+  for row in "${rows[@]}"; do
+    ((i+=1))
+    key="$(jq -r '.key' <<<"$row")"
+    label="$(jq -r '.label' <<<"$row")"
+    if [[ "$current_all" == "true" ]] ||
+       jq -e --arg key "$key" 'index($key) != null' <<<"$current_json" >/dev/null; then
+      printf '  %d. %s  [已开启]\n' "$i" "$label" >&2
+      default_numbers+="${default_numbers:+ }${i}"
+    else
+      printf '  %d. %s  [已关闭]\n' "$i" "$label" >&2
+    fi
+  done
+  [[ "$allow_empty" != "true" ]] || printf '  0. 关闭该用户的全部节点\n' >&2
+
+  while true; do
+    if [[ -n "$default_numbers" ]]; then
+      read -r -p "请输入编号，可多选（直接回车保持当前选择）[${default_numbers}]: " answer
+      answer="${answer:-$default_numbers}"
+    else
+      read -r -p '请输入编号，可多选（例如 1 3）: ' answer
+    fi
+    if [[ "$answer" == "0" && "$allow_empty" == "true" ]]; then
+      printf ''
+      return
+    fi
+    if normalized="$(normalize_index_selection "$answer" "${#rows[@]}" false)"; then
+      selected=()
+      for i in $normalized; do
+        selected+=("$(jq -r '.key' <<<"${rows[$((i - 1))]}")")
+      done
+      (IFS=,; printf '%s' "${selected[*]}")
+      return
+    fi
+    warn "请输入列表中的编号；多个编号用空格或逗号分隔"
+  done
+}
+
 vless_link_for_route() {
   local route="$1" user="$2" entry="$3"
   local uuid domain address port path profile encryption flow host query security
@@ -2903,26 +3170,31 @@ hy2_link_for_user() {
 }
 
 subscription_links_for_entry() {
-  local user="$1" entry="$2" route reality route_name
+  local user="$1" entry="$2" route reality route_name entry_name node_key
+  entry_name="$(jq -r '.node.name' <<<"$entry")"
   while IFS= read -r route; do
     [[ -n "$route" ]] || continue
     route_name="$(jq -r '.name' <<<"$route")"
-    jq -e --arg r "$route_name" '(.routes | index("*")) != null or (.routes | index($r)) != null' <<<"$user" >/dev/null ||
-      continue
+    node_key="${entry_name}/xhttp/${route_name}"
+    user_node_allowed "$user" "$node_key" || continue
     vless_link_for_route "$route" "$user" "$entry"
   done < <(jq -c '.xray.routes[]?' <<<"$entry")
   while IFS= read -r reality; do
     [[ -n "$reality" ]] || continue
+    node_key="${entry_name}/reality/$(jq -r '.name' <<<"$reality")"
+    user_node_allowed "$user" "$node_key" || continue
     vless_link_for_reality "$reality" "$user" "$entry"
   done < <(jq -c '.xray.reality_inbounds[]?' <<<"$entry")
-  if [[ "$(jq -r '.hysteria2.enabled' <<<"$entry")" == "true" ]]; then
+  if [[ "$(jq -r '.hysteria2.enabled' <<<"$entry")" == "true" ]] &&
+     [[ "$(jq -r '.hy2_password // ""' <<<"$user")" != "" ]] &&
+     user_node_allowed "$user" "${entry_name}/hy2"; then
     hy2_link_for_user "$user" "$entry"
   fi
 }
 
 subscription_plain() {
   local name="$1" user entry
-  user="$(active_user_json "$name")" || die "Enabled user not found: $name"
+  user="$(active_user_json "$name")" || die "用户不存在、已暂停或已过期：$name"
   entry="$(subscription_entry_from_state)"
   subscription_links_for_entry "$user" "$entry"
   if [[ "$(jq -r '.node.role' "$STATE_FILE")" != "exit" ]]; then
@@ -3182,6 +3454,11 @@ validate_state_semantics() {
   fi
   if ! jq -e '
     all(.users[];
+      ((.enabled_nodes // ["*"]) |
+        type == "array" and
+        length == (unique | length) and
+        all(.[]; type == "string" and
+          test("^\\*$|^[A-Za-z0-9][A-Za-z0-9._-]{0,63}/((xhttp|reality)/[A-Za-z0-9][A-Za-z0-9._-]{0,63}|hy2)$"))) and
       ((.speed_limit.up_mbps // 0) |
         type == "number" and floor == . and . >= 0 and . <= 100000) and
       ((.speed_limit.down_mbps // 0) |
@@ -5757,6 +6034,10 @@ validate_pair_bundle() {
       (.enabled | type == "boolean") and
       (.expires_at == null or (.expires_at | type == "string")) and
       (.routes | type == "array" and all(.[]; type == "string" and test("^\\*?$|^[A-Za-z0-9._-]{1,64}$"))) and
+      ((.enabled_nodes // ["*"]) | type == "array" and
+        length == (unique | length) and
+        all(.[]; type == "string" and
+          test("^\\*$|^[A-Za-z0-9][A-Za-z0-9._-]{0,63}/((xhttp|reality)/[A-Za-z0-9][A-Za-z0-9._-]{0,63}|hy2)$"))) and
       (.subscription_prefix | type == "string" and test("^[0-9a-fA-F]{8}$")) and
       (.subscription_token | type == "string" and test("^[0-9a-fA-F]{40}$")) and
       ((.speed_limit // {up_mbps: 0, down_mbps: 0}) |
@@ -6013,6 +6294,9 @@ EOF
   hy2_password="${hy2_password:-$(random_password)}"
   hy2_obfs="${hy2_obfs:-$(random_password)}"
   reality_short="${reality_short:-$(random_hex 8)}"
+  if [[ "$hy2_enabled" == "true" ]]; then
+    ensure_hy2_passwords_for_node "$name"
+  fi
   valid_uuid "$relay_uuid" || die "Invalid relay UUID"
   valid_uuid "$user_uuid" || die "Invalid direct user UUID"
   generate_vlessenc_x25519_pair
@@ -6344,9 +6628,10 @@ validate_worker_direct_config() {
     (.hysteria2.shared_udp443 | type == "boolean") and
     (.hysteria2.shared_udp443 == false or
       (.hysteria2.enabled == true and .hysteria2.port == 443)) and
-    (.hysteria2.obfs_password | type == "string" and length >= 1 and length <= 512) and
+    (.hysteria2.obfs_password | type == "string" and length <= 512) and
     (.hysteria2.masquerade | type == "string" and
-      test("^https?://[^[:space:]]+$")) and
+      (if .hysteria2.enabled then test("^https?://[^[:space:]]+$")
+       else true end)) and
     (.hysteria2.up_mbps | type == "number" and . >= 0 and . <= 100000) and
     (.hysteria2.down_mbps | type == "number" and . >= 0 and . <= 100000)
   ' <<<"$1" >/dev/null
@@ -6361,6 +6646,7 @@ prompt_worker_direct_config() {
   local reality_port=443 reality_listen=18443 reality_path reality_target
   local reality_sni reality_short
   local hy2_port=443 hy2_shared=true hy2_obfs hy2_masquerade hy2_up hy2_down
+  local protocol_selection
 
   name="$(jq -r '.worker.name' <<<"$bundle")"
   default_address="$(jq -r '.worker.public_host // ""' <<<"$bundle")"
@@ -6385,11 +6671,13 @@ prompt_worker_direct_config() {
       "$C_GREEN" "$C_RESET" >&2
   fi
 
-  printf '\n%s【选择客户端可用的协议】%s\n' "$C_BOLD" "$C_RESET" >&2
-  printf '可以同时启用多个协议；不确定时直接使用括号中的默认选择。\n' >&2
-  xhttp_enabled="$(prompt_bool '启用 XHTTP + nginx TLS（TCP/HTTPS）' n)"
-  reality_enabled="$(prompt_bool '启用 Reality + XHTTP（TCP）' y)"
-  hy2_enabled="$(prompt_bool '启用 Hysteria2（UDP）' y)"
+  protocol_selection="$(prompt_protocol_selection '2 3')"
+  xhttp_enabled=n
+  reality_enabled=n
+  hy2_enabled=n
+  [[ " $protocol_selection " != *" 1 "* ]] || xhttp_enabled=y
+  [[ " $protocol_selection " != *" 2 "* ]] || reality_enabled=y
+  [[ " $protocol_selection " != *" 3 "* ]] || hy2_enabled=y
 
   if [[ "$xhttp_enabled" == "y" || "$reality_enabled" == "y" ]]; then
     printf '\n%s【TCP 443 使用方式】%s\n' "$C_BOLD" "$C_RESET" >&2
@@ -6464,11 +6752,12 @@ prompt_worker_direct_config() {
       die "Reality Short ID 必须是 2 到 32 位十六进制字符"
   fi
 
-  hy2_obfs="$(random_password)"
+  hy2_obfs=""
   hy2_masquerade="https://${domain}"
   hy2_up=0
   hy2_down=0
   if [[ "$hy2_enabled" == "y" ]]; then
+    hy2_obfs="$(random_password)"
     printf '\n%s【Hysteria2 公网 UDP 端口】%s\n' "$C_BOLD" "$C_RESET" >&2
     printf '网站 HTTPS 使用 TCP，Hysteria2 使用 UDP；两者都可使用数字 443。\n' >&2
     if [[ "$(prompt_bool '让 Hysteria2 使用公网 UDP 443' y)" == "y" ]] &&
@@ -6801,6 +7090,7 @@ EOF
       enabled: true,
       expires_at: null,
       routes: ["*"],
+      enabled_nodes: ["*"],
       subscription_prefix: $prefix,
       subscription_token: $token,
       speed_limit: {up_mbps: 0, down_mbps: 0},
@@ -7027,6 +7317,10 @@ cmd_control_apply() {
       (.enabled | type == "boolean") and
       (.expires_at == null or (.expires_at | type == "string")) and
       (.routes | type == "array" and all(.[]; type == "string" and test("^[A-Za-z0-9._-]{1,64}$|^\\*$"))) and
+      ((.enabled_nodes // ["*"]) | type == "array" and
+        length == (unique | length) and
+        all(.[]; type == "string" and
+          test("^\\*$|^[A-Za-z0-9][A-Za-z0-9._-]{0,63}/((xhttp|reality)/[A-Za-z0-9][A-Za-z0-9._-]{0,63}|hy2)$"))) and
       (.subscription_prefix | type == "string" and test("^[0-9a-fA-F]{8}$")) and
       (.subscription_token | type == "string" and test("^[0-9a-fA-F]{40}$")) and
       ((.speed_limit // {up_mbps: 0, down_mbps: 0}) |
@@ -7116,12 +7410,12 @@ cmd_pair() {
 }
 
 cmd_subscription() {
-  local name="${1:-}"; [[ -n "$name" ]] || die "Usage: etxr subscription USER"
+  local name="${1:-}"; [[ -n "$name" ]] || die "用法：etxr subscription 用户名"
   require_state
   [[ "$(jq -r '.node.role' "$STATE_FILE")" != "exit" ]] ||
     die "从服务器不生成订阅，请到主服务器查看"
   local user token prefix domain
-  user="$(active_user_json "$name")" || die "Enabled user not found: $name"
+  user="$(active_user_json "$name")" || die "用户不存在、已暂停或已过期：$name"
   subscription_plain "$name"
   token="$(jq -r '.subscription_token' <<<"$user")"
   prefix="$(jq -r '.subscription_prefix' <<<"$user")"
@@ -7130,7 +7424,7 @@ cmd_subscription() {
     local port suffix=""
     port="$(jq -r '.nginx.tls_port' "$STATE_FILE")"
     [[ "$port" == "443" ]] || suffix=":${port}"
-    printf '\nSubscription URL: https://%s%s/%s/%s\n' "$domain" "$suffix" "$prefix" "$token"
+    printf '\n订阅链接：https://%s%s/%s/%s\n' "$domain" "$suffix" "$prefix" "$token"
   fi
 }
 
@@ -7201,7 +7495,7 @@ cmd_client() {
   [[ -n "$route_name" ]] || die "--route is required"
   valid_port "$socks_port" || die "Invalid SOCKS port"
   local user route domain address tls_port result
-  user="$(active_user_json "$name")" || die "Enabled user not found: $name"
+  user="$(active_user_json "$name")" || die "用户不存在、已暂停或已过期：$name"
   route="$(jq -ce --arg name "$route_name" '.xray.routes[] | select(.name == $name)' "$STATE_FILE")" ||
     die "Route not found: $route_name"
   jq -e --arg route "$route_name" '
@@ -7433,8 +7727,10 @@ menu_quick_init() {
   local hy2_port hy2_obfs_password hy2_masquerade hy2_up hy2_down
   local hy2_shared_udp443=false hy2_share_choice
   local et_ip et_endpoint et_port et_name et_secret
-  local username user_uuid user_password user_up user_down
+  local username user_uuid user_password user_up user_down user_nodes
+  local protocol_selection admin_selection admin_selection_normalized
   local value default_uuid default_password
+  local -a admin_node_keys=() admin_node_labels=() selected_admin_nodes=()
   printf '\n'
   name="$(prompt_name_value '主服务器名称（仅用于菜单和订阅显示，例如 hk）' 'hk')"
   domain="$(prompt_hostname_value '主服务器入口域名（必须已解析到这台机器）' 'hk.example.com')"
@@ -7460,9 +7756,16 @@ menu_quick_init() {
     key="$(prompt_value 'TLS 证书私钥路径（privkey.pem）' "$key")"
   fi
 
+  protocol_selection="$(prompt_protocol_selection '1 3')"
+  xhttp_enabled=n
+  reality_enabled=n
+  hy2_enabled=n
+  [[ " $protocol_selection " != *" 1 "* ]] || xhttp_enabled=y
+  [[ " $protocol_selection " != *" 2 "* ]] || reality_enabled=y
+  [[ " $protocol_selection " != *" 3 "* ]] || hy2_enabled=y
+
   printf '\n%s【客户端连接主服务器：XHTTP + HTTPS】%s\n' "$C_BOLD" "$C_RESET"
   printf '公网端口供手机/电脑连接；Xray 本机端口只供 nginx 转发。\n'
-  xhttp_enabled="$(prompt_bool '启用 XHTTP + nginx TLS（TCP/HTTPS）' y)"
   if [[ "$xhttp_enabled" == "y" ]]; then
     while true; do
       tls_port="$(prompt_port_value '网站和 XHTTP 的公网 HTTPS TCP 端口' '443')"
@@ -7486,7 +7789,6 @@ menu_quick_init() {
   fi
 
   printf '\n%s【客户端连接主服务器：Reality + XHTTP】%s\n' "$C_BOLD" "$C_RESET"
-  reality_enabled="$(prompt_bool '启用 Reality + XHTTP（TCP）' n)"
   if [[ "$reality_enabled" == "y" ]]; then
     if (( is_baota )) && [[ "$xhttp_enabled" == "y" ]]; then
       printf '选择共用后，网站、XHTTP 和 Reality 都使用公网 TCP 443，由 SNI 自动分流。\n'
@@ -7522,7 +7824,6 @@ menu_quick_init() {
 
   printf '\n%s【客户端连接主服务器：Hysteria2】%s\n' "$C_BOLD" "$C_RESET"
   printf 'Hysteria2 使用 UDP；网站 HTTPS 使用 TCP，两者可以同时使用数字 443。\n'
-  hy2_enabled="$(prompt_bool '启用 Hysteria2（UDP）' y)"
   if [[ "$hy2_enabled" == "y" ]]; then
     hy2_share_choice="$(prompt_bool '让 Hysteria2 使用公网 UDP 443' y)"
     if [[ "$hy2_share_choice" == "y" ]] && confirm_hy2_udp443_share; then
@@ -7546,24 +7847,52 @@ menu_quick_init() {
     hy2_shared_udp443=false
     hy2_up=0
     hy2_down=0
-    hy2_obfs_password="$(random_password)"
+    hy2_obfs_password=""
     hy2_masquerade="https://${domain}"
   fi
 
   printf '\n%s【管理员账号】%s\n' "$C_BOLD" "$C_RESET"
-  printf '安装后会为这个用户生成 UUID、Hysteria2 密码和订阅链接。\n'
+  printf '安装后会为这个用户生成 UUID 和订阅链接。\n'
   username="$(prompt_name_value '管理员用户名（仅用于 ETXR 用户管理）' 'admin')"
   default_uuid="$(random_uuid)"
-  default_password="$(random_password)"
   user_uuid="$(prompt_uuid_value '管理员 VLESS UUID（直接回车使用随机值）' "$default_uuid")"
-  user_password="$(prompt_secret_default '管理员 Hysteria2 登录密码（直接回车使用随机值）' "$default_password")"
+
+  [[ "$xhttp_enabled" != "y" ]] || {
+    admin_node_keys+=("${name}/xhttp/${name}")
+    admin_node_labels+=("${name}-XHTTP")
+  }
+  [[ "$reality_enabled" != "y" ]] || {
+    admin_node_keys+=("${name}/reality/reality")
+    admin_node_labels+=("${name}-Reality-XHTTP")
+  }
+  [[ "$hy2_enabled" != "y" ]] || {
+    admin_node_keys+=("${name}/hy2")
+    admin_node_labels+=("${name}-Hysteria2")
+  }
+  printf '\n%s【选择管理员可以使用的节点】%s\n' "$C_BOLD" "$C_RESET"
+  for value in "${!admin_node_keys[@]}"; do
+    printf '  %d. %s\n' "$((value + 1))" "${admin_node_labels[$value]}"
+  done
+  while true; do
+    read -r -p '请输入编号，可多选（例如 1 3）: ' admin_selection
+    if admin_selection_normalized="$(normalize_index_selection \
+      "$admin_selection" "${#admin_node_keys[@]}" false)"; then
+      selected_admin_nodes=()
+      for value in $admin_selection_normalized; do
+        selected_admin_nodes+=("${admin_node_keys[$((value - 1))]}")
+      done
+      user_nodes="$(IFS=,; printf '%s' "${selected_admin_nodes[*]}")"
+      break
+    fi
+    warn "请输入列表中的编号；多个编号用空格或逗号分隔"
+  done
+  user_password=""
+  if [[ ",$user_nodes," == *",${name}/hy2,"* ]]; then
+    default_password="$(random_password)"
+    user_password="$(prompt_secret_default '管理员 Hysteria2 登录密码（直接回车使用随机值）' "$default_password")"
+  fi
   user_up="$(prompt_mbps '该用户上传限速 Mbps（0 表示不限速）' '0')"
   user_down="$(prompt_mbps '该用户下载限速 Mbps（0 表示不限速）' '0')"
-  [[ -n "$user_password" ]] || {
-    warn "密码不能为空"
-    FORCE=0
-    return
-  }
 
   printf '\n%s【EasyTier 主从私网】%s\n' "$C_BOLD" "$C_RESET"
   printf '以后添加从服务器时，它们会主动连接下面的主服务器公网 TCP 端口。\n'
@@ -7632,7 +7961,7 @@ menu_quick_init() {
   }
 
   menu_exec cmd_user_add --name "$username" --uuid "$user_uuid" \
-    --password "$user_password" --up-mbps "$user_up" \
+    --password "$user_password" --nodes "$user_nodes" --up-mbps "$user_up" \
     --down-mbps "$user_down" || {
     menu_pause
     return
@@ -7700,6 +8029,7 @@ menu_quick_init() {
 
 menu_users() {
   local choice name route socks out uuid password default_name up_mbps down_mbps
+  local nodes current_nodes current_password
   if [[ ! -f "$STATE_FILE" ]]; then
     warn "请先执行一键安装与初始化"
     menu_pause
@@ -7713,28 +8043,42 @@ menu_users() {
   while true; do
     menu_header
     printf '%s【用户和订阅】%s\n' "$C_BOLD" "$C_RESET"
-    printf '1. 新增一个用户          （逐项确认名称、UUID、密码）\n'
+    printf '1. 新增一个用户          （选择该用户能使用哪些节点）\n'
     printf '2. 复制用户订阅          （手机/电脑直接导入）\n'
     printf '3. 查看所有用户\n'
-    printf '4. 暂停一个用户          （以后可以恢复）\n'
-    printf '5. 恢复一个用户\n'
-    printf '6. 永久删除用户\n'
-    printf '7. 查看用户流量          （主从服务器自动汇总）\n'
-    printf '8. 设置用户限速          （0 表示不限速）\n'
-    printf '9. 清零用户流量\n'
-    printf '10. 导出单线路配置       （高级功能）\n'
+    printf '4. 设置用户可用节点      （逐个开启或关闭节点）\n'
+    printf '5. 暂停一个用户          （以后可以恢复）\n'
+    printf '6. 恢复一个用户\n'
+    printf '7. 永久删除用户\n'
+    printf '8. 查看用户流量          （主从服务器自动汇总）\n'
+    printf '9. 设置用户限速          （0 表示不限速）\n'
+    printf '10. 清零用户流量\n'
+    printf '11. 导出单线路配置       （高级功能）\n'
     printf '0. 返回主菜单\n\n'
     read -r -p '请选择: ' choice
     case "$choice" in
       1)
         default_name="user$(( $(jq '.users | length' "$STATE_FILE") + 1 ))"
         name="$(prompt_name_value '用户名（仅用于 ETXR 用户管理和订阅名称）' "$default_name")"
+        if jq -e --arg name "$name" '.users[]? | select(.name == $name)' \
+          "$STATE_FILE" >/dev/null; then
+          warn "用户已存在：$name"
+          menu_pause
+          continue
+        fi
         uuid="$(prompt_uuid_value 'VLESS UUID（直接回车使用随机值）' "$(random_uuid)")"
-        password="$(prompt_secret_default 'Hysteria2 登录密码（直接回车使用随机值）' "$(random_password)")"
+        nodes="$(prompt_user_node_selection '[]' false)" || {
+          menu_pause
+          continue
+        }
+        password=""
+        if [[ ",$nodes," == *"/hy2,"* ]]; then
+          password="$(prompt_secret_default 'Hysteria2 登录密码（直接回车使用随机值）' "$(random_password)")"
+        fi
         up_mbps="$(prompt_mbps '该用户上传限速 Mbps（0 表示不限速）' '0')"
         down_mbps="$(prompt_mbps '该用户下载限速 Mbps（0 表示不限速）' '0')"
         if menu_exec cmd_user_add --name "$name" --uuid "$uuid" \
-          --password "$password" --up-mbps "$up_mbps" \
+          --password "$password" --nodes "$nodes" --up-mbps "$up_mbps" \
           --down-mbps "$down_mbps"; then
           if menu_apply_prompt; then
             printf '\n%s下面就是该用户的订阅：%s\n' "$C_BOLD" "$C_RESET"
@@ -7752,17 +8096,45 @@ menu_users() {
       3) menu_exec cmd_user_list || true; menu_pause ;;
       4)
         cmd_user_list || true
+        name="$(prompt_value '要设置哪个用户')"
+        current_nodes="$(jq -c --arg name "$name" \
+          '.users[] | select(.name == $name) | (.enabled_nodes // ["*"])' \
+          "$STATE_FILE" 2>/dev/null || true)"
+        if [[ -z "$current_nodes" ]]; then
+          warn "用户不存在：$name"
+          menu_pause
+          continue
+        fi
+        nodes="$(prompt_user_node_selection "$current_nodes" true)" || {
+          menu_pause
+          continue
+        }
+        password=""
+        current_password="$(jq -r --arg name "$name" \
+          '.users[] | select(.name == $name) | (.hy2_password // "")' \
+          "$STATE_FILE")"
+        if [[ ",$nodes," == *"/hy2,"* && -z "$current_password" ]]; then
+          password="$(prompt_secret_default 'Hysteria2 登录密码（直接回车使用随机值）' "$(random_password)")"
+        fi
+        if menu_exec cmd_user_nodes "$name" --nodes "$nodes" \
+          --password "$password"; then
+          menu_apply_prompt || true
+        fi
+        menu_pause
+        ;;
+      5)
+        cmd_user_list || true
         name="$(prompt_value '要暂停的用户名')"
         if menu_exec cmd_user disable "$name"; then menu_apply_prompt || true; fi
         menu_pause
         ;;
-      5)
+      6)
         cmd_user_list || true
         name="$(prompt_value '要恢复的用户名')"
         if menu_exec cmd_user enable "$name"; then menu_apply_prompt || true; fi
         menu_pause
         ;;
-      6)
+      7)
         cmd_user_list || true
         name="$(prompt_value '要删除的用户名')"
         if menu_confirm "永久删除 ${name}，确定继续"; then
@@ -7770,11 +8142,11 @@ menu_users() {
         fi
         menu_pause
         ;;
-      7)
+      8)
         menu_exec cmd_user_usage || true
         menu_pause
         ;;
-      8)
+      9)
         cmd_user_list || true
         name="$(prompt_value '要设置哪个用户')"
         up_mbps="$(jq -r --arg name "$name" \
@@ -7791,7 +8163,7 @@ menu_users() {
         fi
         menu_pause
         ;;
-      9)
+      10)
         cmd_user_usage || true
         name="$(prompt_value '要清零哪个用户（全部用户填 all）')"
         if menu_confirm "清零 ${name} 在主从所有服务器上的累计流量，确定继续"; then
@@ -7801,7 +8173,7 @@ menu_users() {
         fi
         menu_pause
         ;;
-      10)
+      11)
         name="$(prompt_value '用户名称')"
         cmd_route_list || true
         route="$(prompt_value '线路名称')"

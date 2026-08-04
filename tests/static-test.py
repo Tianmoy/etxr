@@ -15,7 +15,7 @@ def main() -> int:
     text = SCRIPT.read_text(encoding="utf-8")
     assert text.startswith("#!/usr/bin/env bash\n")
     assert "set -Eeuo pipefail" in text
-    assert 'VERSION="0.14.0"' in text
+    assert 'VERSION="0.15.0"' in text
     assert "local expires_minutes=30 expires_at" in text
     assert "--expires-minutes" in text
 
@@ -82,6 +82,18 @@ def main() -> int:
     assert "sing-box release 没有可用的 SHA256 摘要" in text
     assert "prompt_port_checked()" in text
     assert "prompt_worker_direct_config()" in text
+    assert "prompt_protocol_selection()" in text
+    assert "prompt_user_node_selection()" in text
+    assert "设置用户可用节点" in text
+    assert "enabled_nodes" in text
+    assert 'def node_allowed($user; $protocol; $entry_name):' in text
+    assert '($c.node.name + "/hy2") as $hy2_key' in text
+    assert "用户已存在" in text
+    assert '["用户名","状态","上传限速","下载限速","到期时间","可用节点"]' in text
+    assert "管理员 Hysteria2 登录密码" in text
+    assert text.index('if [[ ",$user_nodes," == *",${name}/hy2,"* ]]') < text.index(
+        "管理员 Hysteria2 登录密码"
+    )
     assert "--configure-direct" in text
     assert "--direct-config-file" in text
     assert "tls_certificate_is_usable()" in text

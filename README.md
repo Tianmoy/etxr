@@ -1,4 +1,4 @@
-# ETXR v0.14.0
+# ETXR v0.15.0
 
 ETXR 是面向 Debian 12 空白系统的一站式中文菜单脚本，用一份脚本安装主服务器或任意数量的从服务器。它管理 Xray、sing-box、EasyTier、订阅和用户配置，并可复用宝塔 nginx 的 TCP 443。
 
@@ -11,6 +11,7 @@ ETXR 是面向 Debian 12 空白系统的一站式中文菜单脚本，用一份�
 - 没有公网端口的从服务器只使用 EasyTier。
 - 从服务器开机时先等待 EasyTier 私网地址建立，再启动绑定私网地址的 Xray 中继。
 - 用户新增、暂停、恢复和删除后，通过 WSS 通知从服务器，再由从服务器通过 HTTPS 拉取签名配置。
+- 每个用户按编号选择可用节点，可单独开启或关闭任意主服务器、转发出口或从服务器入口。
 - 主服务器统一生成订阅并自动合并所有从服务器入口；从服务器不暴露订阅 URL。
 - 主服务器和从服务器都可添加仅出站 SOCKS5，并使用现有 XHTTP + TLS Path 分流到该出口。
 - 按用户统计上传、下载和总流量，主服务器自动汇总所有从服务器。
@@ -95,12 +96,14 @@ chmod +x etxr.sh
 主服务器入口域名（必须已解析到本机）
 TLS 完整证书链和私钥路径
 
-是否启用 XHTTP + nginx TLS（TCP/HTTPS）[Y/n]
+选择要安装的协议（1=XHTTP，2=Reality，3=Hysteria2，可多选）[1 3]
+
+选择 1 时：
 网站和 XHTTP 的公网 HTTPS TCP 端口 [443]
 Xray XHTTP 本机接收 TCP 端口 [18001]
 XHTTP 连接 Path [随机]
 
-是否启用 Reality + XHTTP [y/N]
+选择 2 时：
 Reality、XHTTP 和宝塔网站是否共用公网 TCP 443 [Y/n]
 宝塔网站迁移后的本机 HTTPS TCP 端口 [8443]
 Xray Reality 本机接收 TCP 端口 [18443]
@@ -108,7 +111,7 @@ Reality 的 XHTTP 连接 Path [随机]
 Reality 握手转发目标 [aod.itunes.apple.com:443]
 Reality 客户端 SNI [aod.itunes.apple.com]
 
-是否启用 Hysteria2 [Y/n]
+选择 3 时：
 Hysteria2 是否使用公网 UDP 443 [Y/n]
 检测到 nginx H3/QUIC 时，确认自动关闭并回滚保护 [y/N]
 不使用 UDP 443 时：Hysteria2 公网 UDP 端口 [8443]
@@ -118,7 +121,8 @@ Hysteria2 是否使用公网 UDP 443 [Y/n]
 
 管理员用户名 [admin]
 管理员 VLESS UUID [随机]
-管理员 Hysteria2 登录密码 [随机]
+选择管理员可以使用的节点（编号多选）
+选中 Hysteria2 节点时：管理员 Hysteria2 登录密码 [随机]
 该用户上传/下载限速 Mbps [0]
 
 主服务器的 EasyTier 私网 IP [10.100.0.1]
@@ -214,9 +218,7 @@ Pair ID 可使用多少分钟 [30]
 ```text
 从服务器入口域名（用于 TLS 证书和 SNI）
 客户端实际连接地址（通常填写上面的域名）
-是否启用 XHTTP + nginx TLS（TCP/HTTPS）[y/N]
-是否启用 Reality + XHTTP（TCP）[Y/n]
-是否启用 Hysteria2（UDP）[Y/n]
+选择要安装的协议（1=XHTTP，2=Reality，3=Hysteria2，可多选）[2 3]
 网站、XHTTP 和 Reality 是否共用公网 TCP 443 [Y/n]
 Hysteria2 是否使用公网 UDP 443 [Y/n]
 各协议的公网端口、仅本机使用的转发端口和随机 Path
@@ -274,13 +276,14 @@ etxr control status
 1. 新增一个用户
 2. 复制用户订阅
 3. 查看所有用户
-4. 暂停一个用户
-5. 恢复一个用户
-6. 永久删除一个用户
-7. 查看用户流量
-8. 设置用户限速
-9. 清零用户流量
-10. 导出单线路配置
+4. 设置用户可用节点
+5. 暂停一个用户
+6. 恢复一个用户
+7. 永久删除一个用户
+8. 查看用户流量
+9. 设置用户限速
+10. 清零用户流量
+11. 导出单线路配置
 ```
 
 订阅 URL：
@@ -298,6 +301,10 @@ https://DOMAIN/SHA1_PREFIX/SUBSCRIPTION_TOKEN
 包含订阅令牌和控制 Path 的 nginx 扩展配置使用 `0600`；订阅正文使用 `root:nginx-worker-group 0640`，只允许 Nginx worker 读取。
 
 用户共用各协议监听端口，不创建单用户公网端口。新增用户时可以直接填写单用户上传和下载 Mbps，之后也可在菜单中修改。限速值按客户端视角计算，`0` 表示该方向不限速。
+
+新增用户时，菜单会列出主服务器入口、经主服务器转发的出口以及在线从服务器的独立入口，并要求按编号选择该用户可用的节点。未选中的 XHTTP、Reality 和 Hysteria2 节点都不会把该用户写入运行配置或订阅。已有用户可随时在菜单 `4` 中开启、关闭或清空节点，修改会通过控制通道自动下发到从服务器。只有选中至少一个 Hysteria2 节点时才会询问 Hysteria2 登录密码。
+
+从旧版本升级且尚未包含 `enabled_nodes` 字段的用户按“全部节点”兼容；新建用户不会因为以后增加从服务器或协议入口而自动获得新节点权限。
 
 限速桶按入口节点分别执行：同一用户同时连接主服务器和从服务器时，两台机器各自应用该上限；用量显示则会汇总整个主从集群。
 
@@ -426,7 +433,7 @@ checksums.txt
 
 脚本先校验 SHA-256 和二进制内置版本，再通过同目录临时文件原子替换；旧二进制保存在 `/etc/etxr/backups/dataplane-binary/`，失败时自动恢复。镜像站可将 `ETXR_DOWNLOAD_BASE` 设置为包含两个数据面二进制和 `checksums.txt` 的 HTTPS 目录。
 
-推送 `v0.14.0` 形式的 Git 标签后，GitHub Actions 会运行完整测试、交叉编译两个 Linux 架构并创建 Release。构建使用 `CGO_ENABLED=0`，目标机不需要额外运行库。
+推送 `v0.15.0` 形式的 Git 标签后，GitHub Actions 会运行完整测试、交叉编译两个 Linux 架构并创建 Release。构建使用 `CGO_ENABLED=0`，目标机不需要额外运行库。
 
 ## 许可证
 
