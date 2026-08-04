@@ -6629,9 +6629,9 @@ validate_worker_direct_config() {
     (.hysteria2.shared_udp443 == false or
       (.hysteria2.enabled == true and .hysteria2.port == 443)) and
     (.hysteria2.obfs_password | type == "string" and length <= 512) and
-    (.hysteria2.masquerade | type == "string" and
-      (if .hysteria2.enabled then test("^https?://[^[:space:]]+$")
-       else true end)) and
+    (.hysteria2.masquerade | type == "string") and
+    (.hysteria2.enabled == false or
+      (.hysteria2.masquerade | test("^https?://[^[:space:]]+$"))) and
     (.hysteria2.up_mbps | type == "number" and . >= 0 and . <= 100000) and
     (.hysteria2.down_mbps | type == "number" and . >= 0 and . <= 100000)
   ' <<<"$1" >/dev/null
