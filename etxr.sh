@@ -3699,7 +3699,7 @@ validate_state_semantics() {
     errors=1
   elif [[ -n "$exit_errors" ]]; then
     while IFS=$'\t' read -r exit_name exit_field exit_reason; do
-      warn "出口“${exit_name}”的 ${exit_field} 无效：${exit_reason}"
+      warn "出口 ${exit_name} 的 ${exit_field} 无效：${exit_reason}"
     done <<<"$exit_errors"
     errors=1
   fi

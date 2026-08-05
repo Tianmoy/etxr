@@ -733,7 +733,7 @@ if "$EDGE" validate >"$TMP/invalid-exit-validate.txt" 2>&1; then
   echo "XHTTP exit without a Path unexpectedly passed validation" >&2
   exit 1
 fi
-grep -Fq '出口“b2”的 Path 无效：XHTTP 出口必须填写以 / 开头的 Path' \
+grep -Fq '出口 b2 的 Path 无效：XHTTP 出口必须填写以 / 开头的 Path' \
   "$TMP/invalid-exit-validate.txt"
 mv "$TMP/state-before-invalid-exit.json" "$TMP/state.json"
 
