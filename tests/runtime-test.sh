@@ -719,6 +719,24 @@ B2_PAIR_ID="$(tr -d '\r\n' <"$TMP/pairs/b2.id")"
   .name == "b2" and (.path | test("^/[0-9a-f]{24}$"))
 )' "$TMP/state.json" >/dev/null
 
+# Paired relays use Xray raw transport and intentionally have no HTTP Path.
+# Both public-primary and EasyTier-only relay exits must pass full validation.
+"$EDGE" validate >"$TMP/paired-exits-validate.txt"
+
+# Invalid XHTTP exits must identify the exact exit and field in the diagnostic.
+cp "$TMP/state.json" "$TMP/state-before-invalid-exit.json"
+"$JQ" '
+  (.xray.exits[] | select(.name == "b2") | .network) = "xhttp"
+' "$TMP/state.json" >"$TMP/state-invalid-exit.json"
+mv "$TMP/state-invalid-exit.json" "$TMP/state.json"
+if "$EDGE" validate >"$TMP/invalid-exit-validate.txt" 2>&1; then
+  echo "XHTTP exit without a Path unexpectedly passed validation" >&2
+  exit 1
+fi
+grep -Fq '出口“b2”的 Path 无效：XHTTP 出口必须填写以 / 开头的 Path' \
+  "$TMP/invalid-exit-validate.txt"
+mv "$TMP/state-before-invalid-exit.json" "$TMP/state.json"
+
 WORKER="$TMP/worker"
 ETXR_STATE="$WORKER/state.json" \
 ETXR_RUNTIME="$WORKER" \

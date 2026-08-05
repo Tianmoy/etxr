@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.16.0"
+VERSION="0.16.1"
 ETXR_REPOSITORY="${ETXR_REPOSITORY:-Tianmoy/etxr}"
 ETXR_RELEASE_API="${ETXR_RELEASE_API:-https://api.github.com/repos/${ETXR_REPOSITORY}/releases/latest}"
 
@@ -3644,27 +3644,63 @@ validate_state_semantics() {
     warn "One or more routes reference a missing exit"
     errors=1
   fi
-  if ! jq -e '
-    all(.xray.exits[];
-      (.transport == "tls" or .transport == "reality" or
-       .transport == "none" or .transport == "socks5") and
-      (.address | type == "string" and test("^[A-Za-z0-9.-]+$")) and
-      (.port | type == "number" and floor == . and . >= 1 and . <= 65535) and
-      (if .transport == "socks5" then
-        ((.socks_username // "") | type == "string" and length <= 255 and
-          (test("[\u0000-\u001f\u007f]") | not)) and
-        ((.socks_password // "") | type == "string" and length <= 255 and
-          (test("[\u0000-\u001f\u007f]") | not)) and
-        ((((.socks_username // "") == "") and ((.socks_password // "") == "")) or
-         (((.socks_username // "") != "") and ((.socks_password // "") != "")))
-      else
-        (.uuid | type == "string" and
-          test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$")) and
-        (.path | type == "string" and test("^/[A-Za-z0-9._~/-]+$"))
-      end)
-    )
-  ' "$STATE_FILE" >/dev/null; then
-    warn "One or more exit definitions are invalid"
+  local exit_errors="" exit_name="" exit_field="" exit_reason=""
+  if ! exit_errors="$(jq -r '
+    def valid_address:
+      if type == "string" then test("^[A-Za-z0-9.-]+$") else false end;
+    def valid_port:
+      if type == "number" then floor == . and . >= 1 and . <= 65535
+      else false end;
+    def valid_uuid:
+      if type == "string" then
+        test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$")
+      else false end;
+    def valid_path:
+      if type == "string" then test("^/[A-Za-z0-9._~/-]+$") else false end;
+    def valid_socks_credential:
+      if type == "string" then
+        length <= 255 and (test("[\u0000-\u001f\u007f]") | not)
+      else false end;
+
+    .xray.exits[]? as $exit |
+    ($exit.name // "<未命名出口>") as $name |
+    ($exit.transport // "") as $transport |
+    ($exit.socks_username // "") as $socks_username |
+    ($exit.socks_password // "") as $socks_password |
+    [
+      if ($transport == "tls" or $transport == "reality" or
+          $transport == "none" or $transport == "socks5") then empty
+      else [$name, "transport", "仅支持 tls、reality、none 或 socks5"] end,
+      if ($exit.address | valid_address) then empty
+      else [$name, "address", "必须填写 IPv4 地址或域名，不能包含协议、端口或路径"] end,
+      if ($exit.port | valid_port) then empty
+      else [$name, "port", "必须是 1 到 65535 之间的整数"] end,
+      if $transport == "socks5" and ($socks_username | valid_socks_credential | not) then
+        [$name, "SOCKS5 用户名", "不能超过 255 个字符，也不能包含控制字符"]
+      else empty end,
+      if $transport == "socks5" and ($socks_password | valid_socks_credential | not) then
+        [$name, "SOCKS5 密码", "不能超过 255 个字符，也不能包含控制字符"]
+      else empty end,
+      if $transport == "socks5" and
+          ((($socks_username == "") and ($socks_password != "")) or
+           (($socks_username != "") and ($socks_password == ""))) then
+        [$name, "SOCKS5 认证", "用户名和密码必须同时填写或同时留空"]
+      else empty end,
+      if $transport != "socks5" and ($exit.uuid | valid_uuid | not) then
+        [$name, "UUID", "格式不正确，请重新生成标准 UUID"]
+      else empty end,
+      if $transport != "socks5" and ($exit.network // "xhttp") == "xhttp" and
+          ($exit.path | valid_path | not) then
+        [$name, "Path", "XHTTP 出口必须填写以 / 开头的 Path"]
+      else empty end
+    ][] | @tsv
+  ' "$STATE_FILE")"; then
+    warn "读取出口配置失败：state.json 结构不完整或内容格式错误"
+    errors=1
+  elif [[ -n "$exit_errors" ]]; then
+    while IFS=$'\t' read -r exit_name exit_field exit_reason; do
+      warn "出口“${exit_name}”的 ${exit_field} 无效：${exit_reason}"
+    done <<<"$exit_errors"
     errors=1
   fi
   if jq -e '
