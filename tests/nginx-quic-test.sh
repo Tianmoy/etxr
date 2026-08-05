@@ -43,6 +43,8 @@ export ETXR_CONTROL_DIR="$TMP/runtime/control"
 export ETXR_CONTROL_HELPER="$TMP/runtime/control.py"
 export ETXR_LIMITER_CONFIG="$TMP/runtime/live/limits.json"
 export ETXR_USAGE_FILE="$TMP/runtime/usage.json"
+export ETXR_DOMAIN_FILE="$TMP/runtime/domains.json"
+export ETXR_DOMAIN_SOCKET="$TMP/run/etxr/domain-audit.sock"
 export ETXR_SYSTEMD_UNIT_DIR="$TMP/runtime/systemd"
 export ETXR_WAIT_IP_HELPER="$TMP/runtime/wait-ip"
 export ETXR_DATAPLANE_BIN="$TMP/runtime/etxr-dataplane"
@@ -186,6 +188,7 @@ cmd_init --name rollback --role gateway --domain rollback.example.com \
   --sing-box-config "$TMP/runtime/live/sing-box.json"
 state_update '
   .control.enabled = false |
+  .domain_audit.enabled = true |
   .hysteria2.enabled = true |
   .hysteria2.port = 443 |
   .hysteria2.shared_udp443 = true |
@@ -207,6 +210,11 @@ EOF
 chmod 755 "$TMP/tools/nginx"
 verify_hy2_udp_listener() { return 0; }
 cmd_apply >/dev/null
+[[ "$(stat -c '%a' "$(dirname "$SUBSCRIPTION_DIR")")" == "751" ]]
+[[ "$(stat -c '%a' "$SUBSCRIPTION_DIR")" == "750" ]]
+chmod 700 "$(dirname "$SUBSCRIPTION_DIR")"
+cmd_subscriptions_refresh >/dev/null
+[[ "$(stat -c '%a' "$(dirname "$SUBSCRIPTION_DIR")")" == "751" ]]
 if nginx_quic_file_has_active "$TMP/nginx/sites-enabled/site.conf"; then
   echo "successful apply left nginx H3/QUIC enabled" >&2
   exit 1

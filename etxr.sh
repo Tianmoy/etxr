@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.16.1"
+VERSION="0.16.2"
 ETXR_REPOSITORY="${ETXR_REPOSITORY:-Tianmoy/etxr}"
 ETXR_RELEASE_API="${ETXR_RELEASE_API:-https://api.github.com/repos/${ETXR_REPOSITORY}/releases/latest}"
 
@@ -5430,7 +5430,9 @@ cmd_apply() {
       systemctl disable --now etxr-limiter.service 2>/dev/null || true
     fi
     if [[ "$domain_audit_enabled" == "true" ]]; then
-      install -d -m 700 "$(dirname "$DOMAIN_FILE")" "$(dirname "$DOMAIN_SOCKET")" ||
+      mkdir -p "$(dirname "$DOMAIN_FILE")" ||
+        { rollback_apply; die "创建用户域名统计数据目录失败"; }
+      install -d -m 700 "$(dirname "$DOMAIN_SOCKET")" ||
         { rollback_apply; die "创建用户域名统计目录失败"; }
       systemctl enable --now etxr-domain-audit.service ||
         { rollback_apply; die "用户域名统计服务启动失败"; }
@@ -7894,7 +7896,8 @@ cmd_subscriptions_refresh() {
   previous="$parent/.etxr-subscriptions-previous.$$"
   render_subscriptions "$staging"
   getent passwd www >/dev/null 2>&1 && subscription_group=www
-  chown root:"$subscription_group" "$staging"
+  chown root:"$subscription_group" "$parent" "$staging"
+  chmod 751 "$parent"
   chmod 750 "$staging"
   find "$staging" -mindepth 1 -maxdepth 1 -type f \
     -exec chown root:"$subscription_group" {} + \
