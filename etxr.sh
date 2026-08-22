@@ -9349,6 +9349,7 @@ menu_health_check() {
 
   local failures=0 xray_config sing_config cert key mode nb role limited_count
   local health_hy2_port health_hy2_shared listener_ok
+  local health_quic_manifest health_quic_count health_quic_file
   xray_config="$(jq -r '.xray.config_path' "$STATE_FILE")"
   sing_config="$(jq -r '.hysteria2.config_path' "$STATE_FILE")"
   cert="$(jq -r '.nginx.certificate' "$STATE_FILE")"
@@ -9480,6 +9481,24 @@ menu_health_check() {
     else
       health_result 0 "nginx 配置" "检查失败"
       ((failures+=1))
+    fi
+
+    if [[ "$health_hy2_shared" == "true" ]]; then
+      health_quic_manifest="$(mktemp)"
+      nginx_quic_active_manifest "$health_quic_manifest"
+      if [[ -s "$health_quic_manifest" ]]; then
+        health_quic_count=0
+        health_result 0 "nginx H3/QUIC" "发现仍启用的配置；一键修复会自动关闭"
+        while IFS= read -r -d '' health_quic_file; do
+          health_quic_count=$((health_quic_count + 1))
+          printf '    - %s\n' "$health_quic_file"
+        done <"$health_quic_manifest"
+        printf '    共发现 %s 个配置文件。\n' "$health_quic_count"
+        ((failures+=1))
+      else
+        health_result 1 "nginx H3/QUIC" "已关闭（HY2 共用 UDP 443）"
+      fi
+      rm -f "$health_quic_manifest"
     fi
   fi
 

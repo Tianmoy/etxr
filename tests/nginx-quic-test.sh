@@ -127,6 +127,27 @@ effective_file="$(nginx_effective_config_files)"
 unset ETXR_NGINX_EFFECTIVE_BIN
 export ETXR_NGINX_SCAN_ROOTS="$TMP/nginx/nginx.conf:$TMP/nginx/sites-enabled"
 
+# A Baota site added after the first scan must be discovered by the next
+# repair/apply run instead of relying on a previous manifest.
+cat >"$TMP/nginx/sites-enabled/new-site.conf" <<'EOF'
+server {
+    listen 443 ssl;
+    listen 443 quic;
+    http3 on;
+    add_header Alt-Svc 'h3=":443"';
+}
+EOF
+new_manifest="$TMP/new-site.manifest"
+nginx_quic_active_manifest "$new_manifest"
+grep -Fzxq "$TMP/nginx/sites-enabled/new-site.conf" "$new_manifest"
+nginx_quic_disable_manifest "$new_manifest" "$TMP/new-site-backup"
+if nginx_quic_file_has_active "$TMP/nginx/sites-enabled/new-site.conf"; then
+  echo "newly added nginx site still has H3/QUIC enabled" >&2
+  exit 1
+fi
+nginx_quic_restore_backup "$TMP/new-site-backup"
+grep -Fq 'listen 443 quic;' "$TMP/nginx/sites-enabled/new-site.conf"
+
 # TCP 443 migration keeps QUIC lines untouched and is independently reversible.
 tcp_manifest="$TMP/tcp443.manifest"
 nginx_tcp443_active_manifest "$tcp_manifest"
