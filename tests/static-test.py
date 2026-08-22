@@ -15,7 +15,7 @@ def main() -> int:
     text = SCRIPT.read_text(encoding="utf-8")
     assert text.startswith("#!/usr/bin/env bash\n")
     assert "set -Eeuo pipefail" in text
-    assert 'VERSION="0.16.2"' in text
+    assert 'VERSION="0.16.3"' in text
     assert "local expires_minutes=30 expires_at" in text
     assert "--expires-minutes" in text
 
