@@ -4218,7 +4218,7 @@ migration_export_impl() {
   valid_migration_iterations "$MIGRATION_KDF_ITERATIONS" ||
     die "迁移加密迭代次数必须是 100000 到 2000000 之间的整数"
   temp="$(mktemp -d)"
-  trap "rm -rf -- $(printf '%q' "$temp")" EXIT
+  trap 'rm -rf -- "$temp"' EXIT
   stage="$temp/stage"
   package_dir="$temp/package"
   mkdir -p "$stage/keys" "$package_dir"
@@ -4294,6 +4294,8 @@ migration_export_impl() {
   stamp="$(sha256sum "$output" | awk '{print substr($1,1,16)}')"
   log "加密迁移包已生成：$output"
   log "迁移包校验标识：$stamp"
+  rm -rf "$temp"
+  trap - EXIT
 }
 
 cmd_migration_export() {
@@ -4404,7 +4406,7 @@ migration_import_impl() {
   local temp source prepared role old_domain components="xray,dataplane"
   local backup stamp suffix=0
   temp="$(mktemp -d)"
-  trap "rm -rf -- $(printf '%q' "$temp")" EXIT
+  trap 'rm -rf -- "$temp"' EXIT
   migration_unpack_package "$package" "$password" "$temp/unpacked"
   source="$temp/unpacked/state.json"
   old_domain="$(jq -r '.node.domain' "$source")"
@@ -4523,7 +4525,7 @@ EOF
   fi
 
   temp="$(mktemp -d)"
-  trap "rm -rf -- $(printf '%q' "$temp")" EXIT
+  trap 'rm -rf -- "$temp"' EXIT
   migration_unpack_package "$package" "$password" "$temp"
   source="$temp/state.json"
   old_domain="$(jq -r '.node.domain' "$source")"
