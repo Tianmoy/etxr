@@ -44,6 +44,7 @@ jobs:
           tests/xray-checksum-test.sh
           tests/self-update-test.sh
           tests/nginx-quic-test.sh
+          bash tests/migration-test.sh
           python3 tests/control-e2e-test.py
           python3 tests/data-plane-test.py
           timeout --signal=TERM --kill-after=10s 6m env JQ=jq tests/runtime-test.sh

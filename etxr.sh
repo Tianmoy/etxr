@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.16.3"
+VERSION="0.17.0"
 ETXR_REPOSITORY="${ETXR_REPOSITORY:-Tianmoy/etxr}"
 ETXR_RELEASE_API="${ETXR_RELEASE_API:-https://api.github.com/repos/${ETXR_REPOSITORY}/releases/latest}"
 
@@ -32,6 +32,8 @@ PAIR_PRIVATE_KEY="${ETXR_PAIR_PRIVATE_KEY:-${PAIR_KEY_DIR}/pair-signing.key}"
 PAIR_PUBLIC_KEY="${ETXR_PAIR_PUBLIC_KEY:-${PAIR_KEY_DIR}/pair-signing.pub}"
 PAIR_ID_MAX_BYTES="${ETXR_PAIR_ID_MAX_BYTES:-262144}"
 PAIR_BUNDLE_MAX_BYTES="${ETXR_PAIR_BUNDLE_MAX_BYTES:-1048576}"
+MIGRATION_PACKAGE_MAX_BYTES="${ETXR_MIGRATION_PACKAGE_MAX_BYTES:-134217728}"
+MIGRATION_KDF_ITERATIONS="${ETXR_MIGRATION_KDF_ITERATIONS:-250000}"
 XRAY_BIN="${XRAY_BIN:-/usr/local/bin/xray}"
 SING_BOX_BIN="${SING_BOX_BIN:-/usr/local/bin/sing-box}"
 EASYTIER_CORE_BIN="${EASYTIER_CORE_BIN:-/usr/local/bin/easytier-core}"
@@ -92,6 +94,7 @@ Commands:
   subscriptions refresh|snapshot
   client USER --route ROUTE [--socks-port 10808] [--out FILE]
   backup
+  migration export|import
   status
   xray status|start|stop|restart|logs|follow|monitor|check-update|update
   self status|check-update|update
@@ -3907,6 +3910,693 @@ cmd_backup() {
   backup_file "$USAGE_FILE" "$dest"
   backup_file "$DOMAIN_FILE" "$dest"
   log "Backup created: $dest"
+}
+
+valid_migration_password() {
+  (( ${#1} >= 12 && ${#1} <= 1024 ))
+}
+
+valid_migration_iterations() {
+  local iterations="$1"
+  [[ "$iterations" =~ ^[1-9][0-9]{5,6}$ ]] &&
+    (( iterations >= 100000 && iterations <= 2000000 ))
+}
+
+migration_password_from_file() {
+  local file="$1" password
+  [[ -f "$file" && -r "$file" && ! -L "$file" ]] ||
+    die "迁移密码文件不存在、不可读或是符号链接"
+  (( $(wc -c <"$file") <= 4096 )) || die "迁移密码文件过大"
+  IFS= read -r password <"$file" || true
+  valid_migration_password "$password" || die "迁移密码至少需要 12 个字符"
+  printf '%s' "$password"
+}
+
+migration_hmac_key() {
+  local password="$1" salt="$2" iterations="$3"
+  printf '%s' "$password" | python3 -c '
+import hashlib
+import sys
+
+password = sys.stdin.buffer.read()
+salt = bytes.fromhex(sys.argv[1])
+iterations = int(sys.argv[2])
+print(hashlib.pbkdf2_hmac("sha256", password, salt, iterations, 32).hex())
+' "$salt" "$iterations"
+}
+
+migration_hmac_tag() {
+  local key="$1" manifest="$2" ciphertext="$3"
+  printf '%s' "$key" | python3 -c '
+import hashlib
+import hmac
+import sys
+
+key = bytes.fromhex(sys.stdin.read().strip())
+digest = hmac.new(key, digestmod=hashlib.sha256)
+for path in sys.argv[1:]:
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+print(digest.hexdigest())
+' "$manifest" "$ciphertext"
+}
+
+migration_hmac_verify() {
+  local key="$1" manifest="$2" ciphertext="$3" expected="$4"
+  printf '%s' "$key" | python3 -c '
+import hashlib
+import hmac
+import sys
+
+key = bytes.fromhex(sys.stdin.read().strip())
+expected = sys.argv[1].strip().lower()
+if len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
+    raise SystemExit(1)
+digest = hmac.new(key, digestmod=hashlib.sha256)
+for path in sys.argv[2:]:
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+raise SystemExit(0 if hmac.compare_digest(digest.hexdigest(), expected) else 1)
+' "$expected" "$manifest" "$ciphertext"
+}
+
+migration_extract_container() {
+  local package="$1" destination="$2"
+  python3 - "$package" "$destination" <<'PY'
+import os
+import shutil
+import sys
+import tarfile
+
+package, destination = sys.argv[1:]
+allowed = {
+    "manifest.json": 64 * 1024,
+    "payload.enc": 128 * 1024 * 1024,
+    "payload.hmac": 128,
+}
+with tarfile.open(package, "r:") as archive:
+    members = archive.getmembers()
+    if [member.name for member in members] != list(allowed):
+        raise SystemExit("invalid migration container members")
+    os.makedirs(destination, mode=0o700, exist_ok=True)
+    for member in members:
+        if not member.isfile() or member.size > allowed[member.name]:
+            raise SystemExit("invalid migration container entry")
+        source = archive.extractfile(member)
+        if source is None:
+            raise SystemExit("unreadable migration container entry")
+        target = os.path.join(destination, member.name)
+        with source, open(target, "wb") as output:
+            shutil.copyfileobj(source, output)
+        os.chmod(target, 0o600)
+PY
+}
+
+migration_extract_payload() {
+  local payload="$1" destination="$2"
+  python3 - "$payload" "$destination" <<'PY'
+import os
+import shutil
+import sys
+import tarfile
+
+payload, destination = sys.argv[1:]
+allowed = {
+    "state.json": (16 * 1024 * 1024, 0o600),
+    "usage.json": (32 * 1024 * 1024, 0o600),
+    "domains.json": (64 * 1024 * 1024, 0o600),
+    "keys/pair-signing.key": (64 * 1024, 0o600),
+    "keys/pair-signing.pub": (64 * 1024, 0o644),
+}
+with tarfile.open(payload, "r:gz") as archive:
+    members = archive.getmembers()
+    names = [member.name for member in members]
+    if len(names) != len(set(names)) or "state.json" not in names:
+        raise SystemExit("invalid migration payload members")
+    if any(name not in allowed for name in names):
+        raise SystemExit("unsupported migration payload entry")
+    has_private = "keys/pair-signing.key" in names
+    has_public = "keys/pair-signing.pub" in names
+    if has_private != has_public:
+        raise SystemExit("incomplete pair signing key")
+    os.makedirs(destination, mode=0o700, exist_ok=True)
+    for member in members:
+        limit, mode = allowed[member.name]
+        if not member.isfile() or member.size > limit:
+            raise SystemExit("invalid migration payload entry")
+        source = archive.extractfile(member)
+        if source is None:
+            raise SystemExit("unreadable migration payload entry")
+        target = os.path.join(destination, member.name)
+        os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
+        with source, open(target, "wb") as output:
+            shutil.copyfileobj(source, output)
+        os.chmod(target, mode)
+PY
+}
+
+migration_unpack_package() {
+  local package="$1" password="$2" destination="$3"
+  local container manifest ciphertext tag salt iterations hmac_key payload
+  [[ -f "$package" && -r "$package" && ! -L "$package" ]] ||
+    die "迁移包不存在、不可读或是符号链接"
+  (( $(stat -c '%s' "$package") <= MIGRATION_PACKAGE_MAX_BYTES )) ||
+    die "迁移包超过 128 MiB 限制"
+  valid_migration_password "$password" || die "迁移密码至少需要 12 个字符"
+  need_cmd python3
+  need_cmd openssl
+  need_jq
+
+  container="$(mktemp -d)"
+  migration_extract_container "$package" "$container" || {
+    rm -rf "$container"
+    die "迁移包结构无效"
+  }
+  manifest="$container/manifest.json"
+  ciphertext="$container/payload.enc"
+  tag="$(tr -d '\r\n' <"$container/payload.hmac")"
+  jq -e '
+    .format == 1 and
+    .state_schema == 1 and
+    (.created_at | type == "string") and
+    (.source.version | type == "string" and
+      test("^[0-9]{1,6}\\.[0-9]{1,6}\\.[0-9]{1,6}$")) and
+    (.source.node | type == "string" and length >= 1 and length <= 64) and
+    (.source.role == "gateway" or .source.role == "exit" or
+      .source.role == "hybrid") and
+    .encryption.cipher == "aes-256-ctr" and
+    .encryption.kdf == "pbkdf2-hmac-sha256" and
+    (.encryption.iterations | type == "number" and
+      floor == . and . >= 100000 and . <= 2000000) and
+    .authentication.algorithm == "hmac-sha256" and
+    (.authentication.salt | type == "string" and
+      test("^[0-9a-f]{32}$")) and
+    .includes_certificates == false
+  ' "$manifest" >/dev/null || {
+    rm -rf "$container"
+    die "迁移包元数据无效或加密参数不受支持"
+  }
+  salt="$(jq -r '.authentication.salt' "$manifest")"
+  iterations="$(jq -r '.encryption.iterations' "$manifest")"
+  hmac_key="$(migration_hmac_key "$password" "$salt" "$iterations")"
+  migration_hmac_verify "$hmac_key" "$manifest" "$ciphertext" "$tag" || {
+    rm -rf "$container"
+    die "迁移密码错误或迁移包已被修改"
+  }
+  payload="$container/payload.tar.gz"
+  if ! printf '%s' "$password" | openssl enc -d -aes-256-ctr \
+      -pbkdf2 -iter "$iterations" -md sha256 -pass stdin \
+      -in "$ciphertext" -out "$payload" 2>/dev/null; then
+    rm -rf "$container"
+    die "迁移数据解密失败"
+  fi
+  rm -rf "$destination"
+  migration_extract_payload "$payload" "$destination" || {
+    rm -rf "$container" "$destination"
+    die "迁移数据结构无效"
+  }
+  cp -a "$manifest" "$destination/manifest.json"
+  rm -rf "$container"
+
+  jq -e '.schema_version == 1' "$destination/state.json" >/dev/null ||
+    die "迁移包中的 state.json 无效或版本不受支持"
+  for payload in "$destination/usage.json" "$destination/domains.json"; do
+    [[ ! -e "$payload" ]] || jq -e 'type == "object"' "$payload" >/dev/null ||
+      die "迁移包中的 $(basename "$payload") 不是有效 JSON 对象"
+  done
+  if [[ -f "$destination/keys/pair-signing.key" ]]; then
+    local private_digest public_digest
+    private_digest="$(openssl pkey -in "$destination/keys/pair-signing.key" \
+      -pubout -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"
+    public_digest="$(openssl pkey -pubin \
+      -in "$destination/keys/pair-signing.pub" -outform DER 2>/dev/null |
+      sha256sum | awk '{print $1}')"
+    [[ -n "$private_digest" && "$private_digest" == "$public_digest" ]] ||
+      die "迁移包中的 Pair 签名公私钥不匹配"
+  fi
+}
+
+migration_prepare_state() {
+  local source="$1" destination="$2" domain="$3" address="$4"
+  local mode="$5" cert="$6" key="$7"
+  local snippet="" stream_path="" stream_loader="" auto_rebind=false
+  local saved_state
+  need_jq
+  valid_hostname "$domain" || die "迁移后的入口域名无效"
+  valid_hostname "$address" || die "迁移后的客户端连接地址无效"
+  [[ "$mode" == "disabled" || "$mode" == "snippet" ||
+     "$mode" == "standalone" ]] || die "迁移后的 nginx 模式无效"
+  [[ -z "$cert" ]] || valid_absolute_path "$cert" || die "证书路径无效"
+  [[ -z "$key" ]] || valid_absolute_path "$key" || die "证书私钥路径无效"
+  if [[ "$mode" == "disabled" ]] &&
+     [[ "$(jq -r '.nginx.mode' "$source")" != "disabled" ]]; then
+    die "原配置需要 nginx，迁移后不能关闭 nginx"
+  fi
+  if [[ "$mode" == "snippet" ]]; then
+    snippet="/www/server/panel/vhost/nginx/extension/${domain}/etxr.conf"
+    if [[ "$(jq -r '.nginx.shared_tcp443 // false' "$source")" == "true" ]]; then
+      stream_path="/www/server/panel/vhost/nginx/tcp/etxr.conf"
+      auto_rebind=true
+    fi
+  elif [[ "$mode" == "standalone" ]] &&
+       [[ "$(jq -r '.nginx.shared_tcp443 // false' "$source")" == "true" ]]; then
+    stream_path="/etc/nginx/stream-conf.d/etxr.conf"
+    stream_loader="/etc/nginx/modules-enabled/99-etxr-stream.conf"
+  fi
+
+  jq --arg domain "$domain" --arg address "$address" \
+    --arg mode "$mode" --arg cert "$cert" --arg key "$key" \
+    --arg snippet "$snippet" --arg stream "$stream_path" \
+    --arg stream_loader "$stream_loader" \
+    --arg xray_config "${RUNTIME_DIR}/live/xray.json" \
+    --arg sing_config "${RUNTIME_DIR}/live/sing-box.json" \
+    --arg paths "${RUNTIME_DIR}/live/nginx-paths.conf" \
+    --argjson auto_rebind "$auto_rebind" '
+    .node.domain = $domain |
+    .node.address = $address |
+    .nginx.mode = $mode |
+    .nginx.certificate = $cert |
+    .nginx.certificate_key = $key |
+    .nginx.snippet_path = $snippet |
+    .nginx.standalone_path = "/etc/nginx/conf.d/etxr.conf" |
+    .nginx.paths_path = $paths |
+    .nginx.stream_path = $stream |
+    .nginx.stream_loader_path = $stream_loader |
+    .nginx.auto_rebind_https = $auto_rebind |
+    .nginx.web_root = "/var/www/etxr" |
+    del(.nginx.binary) |
+    .xray.config_path = $xray_config |
+    .xray.routes |= map(
+      if (.security // "none") == "tls" then
+        .certificate = $cert | .certificate_key = $key
+      else . end
+    ) |
+    .hysteria2.config_path = $sing_config |
+    .hysteria2.certificate = $cert |
+    .hysteria2.certificate_key = $key |
+    if (.easytier.enabled // false) and
+       ((.easytier.peer // "") == "") then
+      .easytier.public_endpoint = $address
+    else . end
+  ' "$source" >"$destination" || die "生成迁移后的状态失败"
+  chmod 600 "$destination"
+  saved_state="$STATE_FILE"
+  STATE_FILE="$destination"
+  validate_state_semantics || {
+    STATE_FILE="$saved_state"
+    die "迁移后的状态语义检查失败"
+  }
+  STATE_FILE="$saved_state"
+}
+
+migration_export_impl() {
+  local output="$1" password="$2" temp stage package_dir payload
+  local salt hmac_key tag stamp source_files_json output_tmp
+  local -a payload_files=(state.json)
+  valid_migration_iterations "$MIGRATION_KDF_ITERATIONS" ||
+    die "迁移加密迭代次数必须是 100000 到 2000000 之间的整数"
+  temp="$(mktemp -d)"
+  trap "rm -rf -- $(printf '%q' "$temp")" EXIT
+  stage="$temp/stage"
+  package_dir="$temp/package"
+  mkdir -p "$stage/keys" "$package_dir"
+  install -m 600 "$STATE_FILE" "$stage/state.json"
+  if [[ -f "$USAGE_FILE" ]]; then
+    jq -e 'type == "object"' "$USAGE_FILE" >/dev/null ||
+      die "当前 usage.json 无效，已停止导出"
+    install -m 600 "$USAGE_FILE" "$stage/usage.json"
+    payload_files+=(usage.json)
+  fi
+  if [[ -f "$DOMAIN_FILE" ]]; then
+    jq -e 'type == "object"' "$DOMAIN_FILE" >/dev/null ||
+      die "当前 domains.json 无效，已停止导出"
+    install -m 600 "$DOMAIN_FILE" "$stage/domains.json"
+    payload_files+=(domains.json)
+  fi
+  if [[ -f "$PAIR_PRIVATE_KEY" || -f "$PAIR_PUBLIC_KEY" ]]; then
+    [[ -f "$PAIR_PRIVATE_KEY" && -f "$PAIR_PUBLIC_KEY" ]] ||
+      die "当前 Pair 签名密钥不完整，已停止导出"
+    install -m 600 "$PAIR_PRIVATE_KEY" "$stage/keys/pair-signing.key"
+    install -m 644 "$PAIR_PUBLIC_KEY" "$stage/keys/pair-signing.pub"
+    payload_files+=(keys/pair-signing.key keys/pair-signing.pub)
+  fi
+  payload="$temp/payload.tar.gz"
+  tar -C "$stage" -czf "$payload" "${payload_files[@]}"
+  if ! printf '%s' "$password" | openssl enc -aes-256-ctr -pbkdf2 \
+      -iter "$MIGRATION_KDF_ITERATIONS" -md sha256 -salt -pass stdin \
+      -in "$payload" -out "$package_dir/payload.enc" 2>/dev/null; then
+    die "迁移数据加密失败"
+  fi
+  salt="$(openssl rand -hex 16)"
+  source_files_json="$(printf '%s\n' "${payload_files[@]}" |
+    jq -Rsc 'split("\n")[:-1]')"
+  jq -n --arg version "$VERSION" \
+    --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg node "$(jq -r '.node.name' "$STATE_FILE")" \
+    --arg role "$(jq -r '.node.role' "$STATE_FILE")" \
+    --arg salt "$salt" --argjson iterations "$MIGRATION_KDF_ITERATIONS" \
+    --argjson files "$source_files_json" '
+    {
+      format: 1,
+      state_schema: 1,
+      created_at: $created,
+      source: {version: $version, node: $node, role: $role},
+      encryption: {
+        cipher: "aes-256-ctr",
+        kdf: "pbkdf2-hmac-sha256",
+        iterations: $iterations
+      },
+      authentication: {algorithm: "hmac-sha256", salt: $salt},
+      payload_files: $files,
+      includes_certificates: false
+    }
+  ' >"$package_dir/manifest.json"
+  hmac_key="$(migration_hmac_key "$password" "$salt" \
+    "$MIGRATION_KDF_ITERATIONS")"
+  tag="$(migration_hmac_tag "$hmac_key" "$package_dir/manifest.json" \
+    "$package_dir/payload.enc")"
+  printf '%s\n' "$tag" >"$package_dir/payload.hmac"
+  chmod 600 "$package_dir"/*
+
+  ensure_parent "$output"
+  output_tmp="$(mktemp "$(dirname "$output")/.etxr-migration.XXXXXX")"
+  rm -f "$output_tmp"
+  tar -C "$package_dir" -cf "$output_tmp" \
+    manifest.json payload.enc payload.hmac
+  chmod 600 "$output_tmp"
+  if [[ -e "$output" && "$FORCE" -ne 1 ]]; then
+    rm -f "$output_tmp"
+    die "迁移包已存在：$output；如需覆盖请添加 --force"
+  fi
+  mv -f "$output_tmp" "$output"
+  stamp="$(sha256sum "$output" | awk '{print substr($1,1,16)}')"
+  log "加密迁移包已生成：$output"
+  log "迁移包校验标识：$stamp"
+}
+
+cmd_migration_export() {
+  local output="" password_file="" password confirm_password
+  while (($#)); do
+    case "$1" in
+      --out)
+        (($# >= 2)) || die "--out 后面缺少迁移包路径"
+        output="$2"; shift 2 ;;
+      --password-file)
+        (($# >= 2)) || die "--password-file 后面缺少文件路径"
+        password_file="$2"; shift 2 ;;
+      --help)
+        echo "Usage: etxr migration export --out /root/node.etxrm [--password-file FILE]"
+        return ;;
+      *) die "Unknown migration export option: $1" ;;
+    esac
+  done
+  require_state
+  [[ -n "$output" ]] || die "migration export requires --out FILE"
+  valid_absolute_path "$output" || die "迁移包输出路径必须是安全的绝对路径"
+  need_cmd python3
+  need_cmd openssl
+  need_cmd tar
+  need_cmd sha256sum
+  if [[ -n "$password_file" ]]; then
+    password="$(migration_password_from_file "$password_file")"
+  else
+    [[ -t 0 ]] || die "非交互导出必须使用 --password-file"
+    password="$(prompt_secret '设置迁移包密码（至少 12 个字符）')"
+    confirm_password="$(prompt_secret '再次输入迁移包密码')"
+    [[ "$password" == "$confirm_password" ]] || die "两次输入的迁移密码不一致"
+    valid_migration_password "$password" || die "迁移密码至少需要 12 个字符"
+  fi
+  (migration_export_impl "$output" "$password")
+}
+
+migration_state_needs_certificate() {
+  jq -e '
+    .nginx.mode != "disabled" or
+    (.hysteria2.enabled // false) or
+    any(.xray.routes[]?; (.security // "none") == "tls")
+  ' "$1" >/dev/null
+}
+
+migration_backup_target_file() {
+  local source="$1" backup="$2" name="$3"
+  [[ -e "$source" ]] || return 0
+  install -m 600 "$source" "$backup/$name"
+  : >"$backup/$name.present"
+}
+
+migration_restore_target_file() {
+  local target="$1" backup="$2" name="$3" mode="$4"
+  if [[ -f "$backup/$name.present" ]]; then
+    ensure_parent "$target"
+    install -m "$mode" "$backup/$name" "$target"
+  else
+    rm -f "$target"
+  fi
+}
+
+migration_install_target_files() {
+  local prepared="$1" unpacked="$2" data_name data_source data_target
+  install -m 600 "$prepared" "$STATE_FILE" || return 1
+  for data_name in usage.json domains.json; do
+    if [[ "$data_name" == "usage.json" ]]; then
+      data_source="$unpacked/usage.json"
+      data_target="$USAGE_FILE"
+    else
+      data_source="$unpacked/domains.json"
+      data_target="$DOMAIN_FILE"
+    fi
+    if [[ -f "$data_source" ]]; then
+      ensure_parent "$data_target" || return 1
+      install -m 600 "$data_source" "$data_target" || return 1
+    else
+      rm -f "$data_target" || return 1
+    fi
+  done
+  mkdir -p "$PAIR_KEY_DIR" || return 1
+  chmod 700 "$PAIR_KEY_DIR" || return 1
+  if [[ -f "$unpacked/keys/pair-signing.key" ]]; then
+    install -m 600 "$unpacked/keys/pair-signing.key" \
+      "$PAIR_PRIVATE_KEY" || return 1
+    install -m 644 "$unpacked/keys/pair-signing.pub" \
+      "$PAIR_PUBLIC_KEY" || return 1
+  else
+    rm -f "$PAIR_PRIVATE_KEY" "$PAIR_PUBLIC_KEY" || return 1
+  fi
+}
+
+migration_restore_target_files() {
+  local backup="$1" failed=0
+  migration_restore_target_file "$STATE_FILE" "$backup" state.json 600 || failed=1
+  migration_restore_target_file "$USAGE_FILE" "$backup" usage.json 600 || failed=1
+  migration_restore_target_file "$DOMAIN_FILE" "$backup" domains.json 600 || failed=1
+  migration_restore_target_file "$PAIR_PRIVATE_KEY" "$backup" \
+    pair-signing.key 600 || failed=1
+  migration_restore_target_file "$PAIR_PUBLIC_KEY" "$backup" \
+    pair-signing.pub 644 || failed=1
+  (( failed == 0 ))
+}
+
+migration_import_impl() {
+  local package="$1" password="$2" domain="$3" address="$4"
+  local mode="$5" cert="$6" certificate_key="$7"
+  local temp source prepared role old_domain components="xray,dataplane"
+  local backup stamp suffix=0
+  temp="$(mktemp -d)"
+  trap "rm -rf -- $(printf '%q' "$temp")" EXIT
+  migration_unpack_package "$package" "$password" "$temp/unpacked"
+  source="$temp/unpacked/state.json"
+  old_domain="$(jq -r '.node.domain' "$source")"
+  role="$(jq -r '.node.role' "$source")"
+  if [[ "$role" != "exit" && "$domain" != "$old_domain" ]] &&
+     (( $(jq '(.paired_nodes // []) | length' "$source") > 0 )); then
+    if (( ! FORCE )); then
+      die "主服务器已有从服务器，迁移时应继续使用原域名 $old_domain；如已安排重新配对可添加 --force"
+    fi
+    warn "主服务器域名已改变，现有从服务器仍保存旧控制地址，需要重新配对或更新"
+  fi
+  prepared="$temp/prepared-state.json"
+  migration_prepare_state "$source" "$prepared" "$domain" "$address" \
+    "$mode" "$cert" "$certificate_key"
+  if migration_state_needs_certificate "$prepared"; then
+    tls_certificate_is_usable "$cert" "$certificate_key" ||
+      die "新服务器证书不存在、已过期或与私钥不匹配"
+    tls_certificate_matches_name "$cert" "$domain" ||
+      die "新服务器证书不包含迁移后的域名 $domain"
+  fi
+  [[ "$(jq -r '.easytier.enabled // false' "$prepared")" != "true" ]] ||
+    components+=",easytier"
+  [[ "$(jq -r '.hysteria2.enabled // false' "$prepared")" != "true" ]] ||
+    components+=",sing-box"
+  [[ "$mode" != "standalone" ]] || components+=",nginx"
+  cmd_install --components "$components"
+
+  mkdir -p "$BACKUP_DIR"
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  backup="$BACKUP_DIR/migration-import-${stamp}"
+  while [[ -e "$backup" ]]; do
+    suffix="$((suffix + 1))"
+    backup="$BACKUP_DIR/migration-import-${stamp}-${suffix}"
+  done
+  mkdir -p "$backup"
+  migration_backup_target_file "$STATE_FILE" "$backup" state.json
+  migration_backup_target_file "$USAGE_FILE" "$backup" usage.json
+  migration_backup_target_file "$DOMAIN_FILE" "$backup" domains.json
+  migration_backup_target_file "$PAIR_PRIVATE_KEY" "$backup" pair-signing.key
+  migration_backup_target_file "$PAIR_PUBLIC_KEY" "$backup" pair-signing.pub
+  printf '%s\n' "$package" >"$backup/source-package.txt"
+
+  state_lock_acquire
+  if ! migration_install_target_files "$prepared" "$temp/unpacked"; then
+    migration_restore_target_files "$backup" ||
+      warn "恢复导入前状态时有文件失败，请检查：$backup"
+    state_lock_release
+    die "写入迁移状态失败，已尝试恢复新服务器原有 ETXR 状态"
+  fi
+
+  if ! (cmd_apply); then
+    migration_restore_target_files "$backup" ||
+      warn "恢复导入前状态时有文件失败，请检查：$backup"
+    if [[ -f "$STATE_FILE" ]] && ! (cmd_apply); then
+      warn "旧 ETXR 状态已经恢复，但旧配置重新应用失败，请运行一键检查"
+    fi
+    state_lock_release
+    die "迁移配置应用失败，已恢复新服务器原有 ETXR 状态"
+  fi
+  state_lock_release
+  log "迁移完成；导入前状态保存在：$backup"
+  rm -rf "$temp"
+  trap - EXIT
+}
+
+cmd_migration_import_inner() {
+  local package="" password_file="" password="" domain="" address=""
+  local mode="" cert="" certificate_key="" temp source old_domain
+  local old_address source_mode is_baota=0 default_cert default_key
+  while (($#)); do
+    case "$1" in
+      --password-file)
+        (($# >= 2)) || die "--password-file 后面缺少文件路径"
+        password_file="$2"; shift 2 ;;
+      --domain)
+        (($# >= 2)) || die "--domain 后面缺少域名"
+        domain="$2"; shift 2 ;;
+      --address)
+        (($# >= 2)) || die "--address 后面缺少连接地址"
+        address="$2"; shift 2 ;;
+      --nginx-mode)
+        (($# >= 2)) || die "--nginx-mode 后面缺少模式"
+        mode="$2"; shift 2 ;;
+      --cert)
+        (($# >= 2)) || die "--cert 后面缺少证书路径"
+        cert="$2"; shift 2 ;;
+      --key)
+        (($# >= 2)) || die "--key 后面缺少证书私钥路径"
+        certificate_key="$2"; shift 2 ;;
+      --help)
+        cat <<'EOF'
+Usage:
+  etxr migration import FILE [--password-file FILE] [--domain DOMAIN]
+    [--address HOST] [--nginx-mode snippet|standalone|disabled]
+    [--cert FILE --key FILE]
+EOF
+        return ;;
+      -*) die "不认识的迁移导入选项：$1" ;;
+      *)
+        [[ -z "$package" ]] || die "只能指定一个迁移包"
+        package="$1"
+        shift ;;
+    esac
+  done
+  [[ -n "$package" ]] || die "migration import requires FILE"
+  if [[ -f "$STATE_FILE" && "$FORCE" -ne 1 ]]; then
+    die "这台服务器已经存在 ETXR 配置；请在未初始化的新服务器导入，确需覆盖时使用全局 --force"
+  fi
+  need_root
+  install_base_packages
+  if [[ -n "$password_file" ]]; then
+    password="$(migration_password_from_file "$password_file")"
+  else
+    [[ -t 0 ]] || die "非交互导入必须使用 --password-file"
+    password="$(prompt_secret '输入迁移包密码')"
+  fi
+
+  temp="$(mktemp -d)"
+  trap "rm -rf -- $(printf '%q' "$temp")" EXIT
+  migration_unpack_package "$package" "$password" "$temp"
+  source="$temp/state.json"
+  old_domain="$(jq -r '.node.domain' "$source")"
+  old_address="$(jq -r '.node.address' "$source")"
+  source_mode="$(jq -r '.nginx.mode' "$source")"
+  if [[ -t 0 ]]; then
+    printf '\n%s【新服务器入口信息】%s\n' "$C_BOLD" "$C_RESET"
+    domain="$(prompt_hostname_value '迁移后使用的入口域名' "${domain:-$old_domain}")"
+    address="$(prompt_hostname_value '客户端连接地址（通常与入口域名相同）' \
+      "${address:-${domain:-$old_address}}")"
+  else
+    domain="${domain:-$old_domain}"
+    address="${address:-$domain}"
+  fi
+  if [[ -x /www/server/nginx/sbin/nginx ]]; then
+    is_baota=1
+    printf '%s✓ 检测到宝塔，将复用宝塔 nginx，不安装第二套 nginx。%s\n' \
+      "$C_GREEN" "$C_RESET"
+  fi
+  if [[ "$source_mode" == "disabled" ]]; then
+    mode="disabled"
+  elif (( is_baota )); then
+    if [[ -t 0 ]] && ! menu_confirm "确认迁移后继续使用宝塔 nginx"; then
+      rm -rf "$temp"
+      die "已取消迁移；检测到宝塔时不会安装第二套 nginx"
+    fi
+    mode="snippet"
+  else
+    mode="${mode:-standalone}"
+    [[ "$mode" == "standalone" ]] ||
+      die "未检测到宝塔，原配置需要 nginx 时必须使用 standalone 模式"
+    printf '%s未检测到宝塔，将使用标准 nginx。%s\n' "$C_YELLOW" "$C_RESET"
+  fi
+  if migration_state_needs_certificate "$source"; then
+    if (( is_baota )); then
+      default_cert="/www/server/panel/vhost/cert/${domain}/fullchain.pem"
+      default_key="/www/server/panel/vhost/cert/${domain}/privkey.pem"
+    else
+      default_cert="/etc/letsencrypt/live/${domain}/fullchain.pem"
+      default_key="/etc/letsencrypt/live/${domain}/privkey.pem"
+    fi
+    if [[ -t 0 ]]; then
+      printf '\n%s【新服务器证书】%s\n' "$C_BOLD" "$C_RESET"
+      printf '证书不会从旧服务器迁移，请填写新服务器已经存在的证书。\n'
+      cert="$(prompt_value '证书 fullchain.pem 的绝对路径' "${cert:-$default_cert}")"
+      certificate_key="$(prompt_value '证书 privkey.pem 的绝对路径' \
+        "${certificate_key:-$default_key}")"
+    else
+      cert="${cert:-$default_cert}"
+      certificate_key="${certificate_key:-$default_key}"
+    fi
+  else
+    cert=""
+    certificate_key=""
+  fi
+  rm -rf "$temp"
+  trap - EXIT
+  migration_import_impl "$package" "$password" "$domain" "$address" \
+    "$mode" "$cert" "$certificate_key"
+}
+
+cmd_migration_import() {
+  (cmd_migration_import_inner "$@")
+}
+
+cmd_migration() {
+  local action="${1:-}"
+  shift || true
+  case "$action" in
+    export) cmd_migration_export "$@" ;;
+    import) cmd_migration_import "$@" ;;
+    *) die "Usage: etxr migration export|import" ;;
+  esac
 }
 
 install_data_helper() {
@@ -9569,6 +10259,49 @@ menu_self_update() {
   menu_pause
 }
 
+menu_migration() {
+  local choice package default_package
+  while true; do
+    menu_header
+    printf '%s【配置迁移】%s\n\n' "$C_BOLD" "$C_RESET"
+    printf '迁移包会使用密码加密，可保存用户、线路、密钥和统计数据。\n'
+    printf '不会打包证书、宝塔网站配置或自动生成的运行配置。\n'
+    printf '导入新服务器时会重新询问域名和证书路径。\n\n'
+    printf '1. 导出这台服务器的配置\n'
+    printf '2. 在这台服务器导入迁移包\n'
+    printf '0. 返回主菜单\n\n'
+    read -r -p '请输入数字: ' choice
+    case "$choice" in
+      1)
+        if [[ ! -f "$STATE_FILE" ]]; then
+          warn "这台服务器还没有 ETXR 配置，无法导出"
+          menu_pause
+          continue
+        fi
+        default_package="/root/etxr-migration-$(date +%Y%m%d-%H%M%S).etxrm"
+        package="$(prompt_value '迁移包保存路径' "$default_package")"
+        printf '\n迁移密码至少 12 个字符，丢失后无法恢复迁移包。\n'
+        menu_exec cmd_migration_export --out "$package" || true
+        menu_pause
+        ;;
+      2)
+        package="$(prompt_value '迁移包的绝对路径')"
+        printf '\n%s导入前请确认：%s\n' "$C_YELLOW" "$C_RESET"
+        printf '  • 新域名已经解析到这台服务器\n'
+        printf '  • 这台新服务器还没有初始化 ETXR\n'
+        printf '  • 需要 HTTPS/Hysteria2 时，新证书已经部署\n'
+        printf '  • 导入失败会恢复这台服务器原有的 ETXR 状态\n\n'
+        if menu_confirm "确认开始检查并导入迁移包"; then
+          menu_exec cmd_migration_import "$package" || true
+        fi
+        menu_pause
+        ;;
+      0) return ;;
+      *) warn "请输入菜单中已有的数字"; sleep 1 ;;
+    esac
+  done
+}
+
 menu_advanced() {
   local choice
   while true; do
@@ -9615,6 +10348,7 @@ cmd_menu() {
     printf '7. ⚙  高级设置             （一般不用）\n'
     printf '8. ⬆  检查并更新 ETXR\n'
     printf '9. ↗  出口分流设置          （SOCKS5 / 远程出口）\n'
+    printf '10. 📦 配置迁移             （加密导出 / 新服务器导入）\n'
     printf '0. 退出\n\n'
     read -r -p '请输入数字: ' choice
     case "$choice" in
@@ -9627,11 +10361,12 @@ cmd_menu() {
       7) menu_advanced ;;
       8) menu_self_update ;;
       9) menu_exits ;;
+      10) menu_migration ;;
       0)
         printf '%s已退出。%s\n' "$C_GREEN" "$C_RESET"
         return
         ;;
-      *) warn "请输入 0～9 之间的数字"; sleep 1 ;;
+      *) warn "请输入 0～10 之间的数字"; sleep 1 ;;
     esac
   done
 }
@@ -9667,6 +10402,7 @@ main() {
     subscriptions) cmd_subscriptions "$@" ;;
     client) cmd_client "$@" ;;
     backup) cmd_backup "$@" ;;
+    migration) cmd_migration "$@" ;;
     status) cmd_status "$@" ;;
     xray) cmd_xray "$@" ;;
     self) cmd_self "$@" ;;

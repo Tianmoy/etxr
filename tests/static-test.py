@@ -15,7 +15,7 @@ def main() -> int:
     text = SCRIPT.read_text(encoding="utf-8")
     assert text.startswith("#!/usr/bin/env bash\n")
     assert "set -Eeuo pipefail" in text
-    assert 'VERSION="0.16.3"' in text
+    assert 'VERSION="0.17.0"' in text
     assert "local expires_minutes=30 expires_at" in text
     assert "--expires-minutes" in text
 
@@ -102,8 +102,21 @@ def main() -> int:
     assert "第一次安装：这台是主服务器" in text
     assert "第一次安装：这台是从服务器" in text
     assert "检查并更新 ETXR" in text
+    assert "配置迁移" in text
     assert "这台是 A" not in text
     assert "这台是 B" not in text
+
+    # Offline migration is encrypted, authenticated, and excludes TLS files.
+    assert "cmd_migration_export()" in text
+    assert "cmd_migration_import()" in text
+    assert "migration_unpack_package()" in text
+    assert "migration_prepare_state()" in text
+    assert "aes-256-ctr" in text
+    assert "pbkdf2-hmac-sha256" in text
+    assert "hmac-sha256" in text
+    assert "includes_certificates: false" in text
+    assert "证书不会从旧服务器迁移" in text
+    assert 'migration) cmd_migration "$@"' in text
 
     # Public relay is primary when configured; EasyTier is the fallback.
     assert "cmd_pair_create()" in text

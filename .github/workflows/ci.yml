@@ -37,6 +37,7 @@ jobs:
           tests/xray-checksum-test.sh
           tests/self-update-test.sh
           tests/nginx-quic-test.sh
+          bash tests/migration-test.sh
       - name: Check Go data plane
         run: |
           test -z "$(gofmt -l cmd internal)"

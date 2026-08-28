@@ -1,4 +1,4 @@
-# ETXR v0.16.3
+# ETXR v0.17.0
 
 ETXR 是面向 Debian 12 空白系统的一站式中文菜单脚本，用一份脚本安装主服务器或任意数量的从服务器。它管理 Xray、sing-box、EasyTier、订阅和用户配置，并可复用宝塔 nginx 的 TCP 443。
 
@@ -80,6 +80,7 @@ chmod +x etxr.sh
 7. 高级设置
 8. 检查并更新 ETXR
 9. 出口分流设置（SOCKS5 / 远程出口）
+10. 配置迁移（加密导出 / 新服务器导入）
 0. 退出
 ```
 
@@ -372,6 +373,31 @@ etxr route add --name ROUTE_NAME --path /RANDOM_PATH --port 18001 \
 etxr apply
 ```
 
+## 配置迁移
+
+主菜单 `10` 可以把当前 ETXR 配置导出为一个离线加密迁移包，再在新服务器导入。
+迁移包包含节点、用户、UUID、协议密码、Path、Reality 密钥、EasyTier 配置、主从配对
+状态、流量统计和访问域名统计。迁移包使用密码加密并校验完整性，文件权限为 `0600`。
+
+迁移包明确不包含 TLS 证书和私钥、宝塔网站配置、nginx 完整配置、运行时生成配置或
+程序二进制。导入时会重新询问新服务器入口域名、客户端连接地址和证书路径；检测到
+宝塔时继续复用宝塔 nginx，不会安装第二套 nginx。请先让新域名解析到新服务器，并在
+需要 HTTPS 或 Hysteria2 时部署好证书。正常导入要求目标机尚未初始化 ETXR，避免旧域名
+的 nginx 配置残留；确需覆盖已有 ETXR 时只能显式使用全局 `--force`。
+
+命令行等价操作：
+
+```bash
+etxr migration export --out /root/etxr-migration.etxrm
+etxr migration import /root/etxr-migration.etxrm
+```
+
+非交互运行可通过 `--password-file` 读取第一行密码，密码至少 12 个字符。导入会先检查
+容器成员、大小、HMAC、密码、JSON 结构和状态语义，再安装缺少的组件并应用配置。应用
+失败时会恢复新服务器导入前的 ETXR 状态；备份位于
+`/etc/etxr/backups/migration-import-*`。已有从服务器的主服务器迁移时应继续使用原域名，
+否则从服务器仍会连接旧控制地址，需要重新配对。
+
 ## 服务和文件
 
 ```text
@@ -431,6 +457,8 @@ etxr validate                # 生成并检查所有配置
 etxr apply                   # 备份、生成、检查并应用
 etxr exit list               # 查看 SOCKS5 和远程出口
 etxr subscriptions refresh  # 主服务器立即重建集中订阅
+etxr migration export --out /root/etxr-migration.etxrm
+etxr migration import /root/etxr-migration.etxrm
 ```
 
 ## 测试
@@ -465,7 +493,7 @@ checksums.txt
 
 脚本先校验 SHA-256 和二进制内置版本，再通过同目录临时文件原子替换；旧二进制保存在 `/etc/etxr/backups/dataplane-binary/`，失败时自动恢复。镜像站可将 `ETXR_DOWNLOAD_BASE` 设置为包含两个数据面二进制和 `checksums.txt` 的 HTTPS 目录。
 
-推送 `v0.16.3` 形式的 Git 标签后，GitHub Actions 会运行完整测试、交叉编译两个 Linux 架构并创建 Release。构建使用 `CGO_ENABLED=0`，目标机不需要额外运行库。
+推送 `v0.17.0` 形式的 Git 标签后，GitHub Actions 会运行完整测试、交叉编译两个 Linux 架构并创建 Release。构建使用 `CGO_ENABLED=0`，目标机不需要额外运行库。
 
 ## 许可证
 

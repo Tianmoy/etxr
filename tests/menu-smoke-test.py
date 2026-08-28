@@ -63,6 +63,7 @@ def main() -> int:
     assert "一键检查与修复" in text, text
     assert "检查并更新 ETXR" in text, text
     assert "出口分流设置" in text, text
+    assert "配置迁移" in text, text
     assert "高级设置" in text, text
     assert "Xray 启停、日志、监控和更新" in text, text
     assert sent, text
