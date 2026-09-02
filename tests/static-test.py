@@ -15,7 +15,7 @@ def main() -> int:
     text = SCRIPT.read_text(encoding="utf-8")
     assert text.startswith("#!/usr/bin/env bash\n")
     assert "set -Eeuo pipefail" in text
-    assert 'VERSION="0.17.0"' in text
+    assert 'VERSION="0.17.1"' in text
     assert "local expires_minutes=30 expires_at" in text
     assert "--expires-minutes" in text
 
@@ -29,6 +29,7 @@ def main() -> int:
     assert "observatory:" in text
     assert "proxy_request_buffering off" in text
     assert "render_nginx_stream()" in text
+    assert '(.listen // "0.0.0.0") != "127.0.0.1"' in text
     assert "stream_ssl_preread_module" in text
     assert "grep -Evq '(^|[[:space:]])quic([[:space:];]|$)'" in text
     assert "aod.itunes.apple.com:443" in text

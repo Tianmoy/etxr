@@ -38,6 +38,7 @@ jobs:
           tests/self-update-test.sh
           tests/nginx-quic-test.sh
           bash tests/migration-test.sh
+          bash tests/ufw-test.sh
       - name: Check Go data plane
         run: |
           test -z "$(gofmt -l cmd internal)"

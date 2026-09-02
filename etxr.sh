@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.17.0"
+VERSION="0.17.1"
 ETXR_REPOSITORY="${ETXR_REPOSITORY:-Tianmoy/etxr}"
 ETXR_RELEASE_API="${ETXR_RELEASE_API:-https://api.github.com/repos/${ETXR_REPOSITORY}/releases/latest}"
 
@@ -5664,7 +5664,13 @@ configure_ufw_from_state() {
   while IFS= read -r port; do
     [[ -n "$port" ]] || continue
     ufw_add_tcp "$port"
-  done < <(jq -r '.xray.routes[]? | select(.direct == true) | .port' "$STATE_FILE")
+  done < <(jq -r '
+    .xray.routes[]? |
+    select(
+      .direct == true and
+      (.listen // "0.0.0.0") != "127.0.0.1"
+    ) | .port
+  ' "$STATE_FILE")
   if [[ "$(jq -r '.hysteria2.enabled' "$STATE_FILE")" == "true" ]]; then
     port="$(jq -r '.hysteria2.port' "$STATE_FILE")"
     ufw_add_udp "$port"
