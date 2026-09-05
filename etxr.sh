@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.17.1"
+VERSION="0.17.2"
 ETXR_REPOSITORY="${ETXR_REPOSITORY:-Tianmoy/etxr}"
 ETXR_RELEASE_API="${ETXR_RELEASE_API:-https://api.github.com/repos/${ETXR_REPOSITORY}/releases/latest}"
 
@@ -3134,7 +3134,7 @@ subscription_entry_from_state() {
         host: (.host // ""),
         client_encryption: (.client_encryption // "none"),
         flow: (.flow // ""),
-        security: (.security // "tls"),
+        security: "tls",
         direct: (.direct // false),
         allow_insecure: (.allow_insecure // false)
       }],
@@ -3335,7 +3335,7 @@ prompt_user_node_selection() {
 
 vless_link_for_route() {
   local route="$1" user="$2" entry="$3"
-  local uuid domain address port path profile encryption flow host query security
+  local uuid domain address port path profile encryption flow host query
   local entry_name target protocol fragment
   uuid="$(jq -r '.uuid' <<<"$user")"
   domain="$(jq -r '.node.domain' <<<"$entry")"
@@ -3350,9 +3350,9 @@ vless_link_for_route() {
   encryption="$(jq -r '.client_encryption // "none"' <<<"$route")"
   flow="$(jq -r '.flow // ""' <<<"$route")"
   host="$(jq -r --arg d "$domain" 'if (.host // "") == "" then $d else .host end' <<<"$route")"
-  security="$(jq -r '.security // "tls"' <<<"$route")"
-  [[ "$(jq -r '.direct // false' <<<"$route")" != "true" ]] || security="$(jq -r '.security // "tls"' <<<"$route")"
-  query="encryption=$(urlencode "$encryption")&security=$(urlencode "$security")&sni=$(urlencode "$domain")&type=xhttp&host=$(urlencode "$host")&path=$(urlencode "$path")&mode=auto"
+  # nginx may forward plaintext to loopback, but every exported XHTTP endpoint
+  # is reached by clients through the public TLS listener.
+  query="encryption=$(urlencode "$encryption")&security=tls&sni=$(urlencode "$domain")&type=xhttp&host=$(urlencode "$host")&path=$(urlencode "$path")&mode=auto"
   if [[ "$(jq -r '.allow_insecure // false' <<<"$route")" == "true" ]]; then
     query+="&allowInsecure=1"
   fi

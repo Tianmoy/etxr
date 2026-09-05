@@ -535,6 +535,8 @@ stop_test_processes
 
 "$EDGE" subscription alice >"$TMP/subscription.txt"
 "$EDGE" subscriptions snapshot >"$TMP/master-entry.json"
+"$JQ" -e 'all(.xray.routes[]; .security == "tls")' \
+  "$TMP/master-entry.json" >/dev/null
 if grep -Eq 'proxy-user|proxy-pass|socks_username|socks_password' \
   "$TMP/master-entry.json"; then
   echo "SOCKS5 credentials leaked into the subscription entry snapshot" >&2
@@ -793,11 +795,24 @@ fi
 mkdir -p "$TMP/control/reports"
 ETXR_STATE="$WORKER/state.json" ETXR_RUNTIME="$WORKER" \
   "$EDGE" subscriptions snapshot >"$TMP/worker-entry.json"
-"$JQ" -n --slurpfile entry "$TMP/worker-entry.json" \
+"$JQ" -e 'all(.xray.routes[]; .security == "tls")' \
+  "$TMP/worker-entry.json" >/dev/null
+# A stale worker may still report its loopback-side plaintext setting. Public
+# subscriptions must never inherit that internal transport detail.
+"$JQ" '(.xray.routes[] | select(.name == "b1-xhttp") | .security) = "none"' \
+  "$TMP/worker-entry.json" >"$TMP/worker-entry-stale.json"
+"$JQ" -n --slurpfile entry "$TMP/worker-entry-stale.json" \
   '{status: "current", entry: $entry[0]}' >"$TMP/control/reports/b1.json"
 "$EDGE" render >/dev/null
 "$EDGE" subscription alice >"$TMP/master-central-subscription.txt"
 grep -Fq '#b1-XHTTP' "$TMP/master-central-subscription.txt"
+grep -F '#b1-XHTTP' "$TMP/master-central-subscription.txt" |
+  grep -Fq 'security=tls'
+if grep -F '#b1-XHTTP' "$TMP/master-central-subscription.txt" |
+   grep -Fq 'security=none'; then
+  echo "worker XHTTP subscription inherited loopback security=none" >&2
+  exit 1
+fi
 grep -Fq '#b1-Reality-XHTTP' "$TMP/master-central-subscription.txt"
 grep -Fq '#b1-Hysteria2' "$TMP/master-central-subscription.txt"
 
