@@ -124,7 +124,11 @@ if etxr_self_update_complete 9.8.7; then
   echo "self-update ignored an outdated data plane" >&2
   exit 1
 fi
-printf '%s\n' '9.8.7' >"$DATAPLANE_BIN"
+cat >"$DATAPLANE_BIN" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' 9.8.7
+EOF
+chmod 755 "$DATAPLANE_BIN"
 etxr_self_update_complete 9.8.7
 VERSION="$saved_version"
 
