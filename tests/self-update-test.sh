@@ -107,6 +107,27 @@ chmod 755 "$SELF_BIN"
 test "$(etxr_installed_version)" = 7.6.5
 test ! -e "$TMP/installed-script-was-executed"
 
+cat >"$SELF_BIN" <<EOF
+#!/usr/bin/env bash
+VERSION="9.8.7"
+EOF
+chmod 755 "$SELF_BIN"
+DATAPLANE_BIN="$TMP/etxr-dataplane"
+cat >"$DATAPLANE_BIN" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "9.8.6"
+EOF
+chmod 755 "$DATAPLANE_BIN"
+saved_version="$VERSION"
+VERSION="9.8.7"
+if etxr_self_update_complete 9.8.7; then
+  echo "self-update ignored an outdated data plane" >&2
+  exit 1
+fi
+printf '%s\n' '9.8.7' >"$DATAPLANE_BIN"
+etxr_self_update_complete 9.8.7
+VERSION="$saved_version"
+
 build_release_fixture 9.8.7 9.8.7
 download_etxr_release_script "$TMP/good"
 test "$(cat "$TMP/good/VERSION")" = 9.8.7

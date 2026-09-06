@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.17.4"
+VERSION="0.17.5"
 ETXR_REPOSITORY="${ETXR_REPOSITORY:-Tianmoy/etxr}"
 ETXR_RELEASE_API="${ETXR_RELEASE_API:-https://api.github.com/repos/${ETXR_REPOSITORY}/releases/latest}"
 
@@ -6844,6 +6844,13 @@ etxr_installed_version() {
   fi
 }
 
+etxr_self_update_complete() {
+  local latest="$1" dataplane
+  dataplane="$("$DATAPLANE_BIN" version 2>/dev/null || true)"
+  [[ "$VERSION" == "$latest" && "$(etxr_installed_version)" == "$latest" &&
+     "$dataplane" == "$latest" ]]
+}
+
 cmd_self_status() {
   printf '当前正在运行的 ETXR：%s\n' "$VERSION"
   printf '服务器已安装的 ETXR：%s\n' "$(etxr_installed_version)"
@@ -6915,7 +6922,7 @@ cmd_self_update() {
     rm -rf "$tmp"
     die "服务器已安装版本比 GitHub 最新正式版更新；如确需降级，请加 --force"
   fi
-  if [[ "$VERSION" == "$latest" && "$installed" == "$latest" && "$FORCE" -ne 1 ]]; then
+  if etxr_self_update_complete "$latest" && (( FORCE == 0 )); then
     rm -rf "$tmp"
     log "ETXR is already up to date"
     return
