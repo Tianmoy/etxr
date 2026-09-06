@@ -70,5 +70,9 @@ jq -n '{
 worker_link="$(grep -F '#worker-XHTTP' "$TMP/subscription.txt")"
 [[ "$worker_link" == *'security=tls'* ]]
 [[ "$worker_link" != *'security=none'* ]]
+"$EDGE" client alice --route master \
+  --out "$TMP/client.json" >/dev/null
+jq -e '.outbounds[0].streamSettings.tlsSettings |
+  has("pinnedPeerCertSha256") | not' "$TMP/client.json" >/dev/null
 
 echo "subscription-tls-test: PASS"

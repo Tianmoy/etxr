@@ -2430,13 +2430,14 @@ render_xray() {
                 }
               } else {} end)
             + (if ($e.transport // "none") == "tls" then {
-                tlsSettings: {
+                tlsSettings: ({
                   serverName: $e.server_name,
                   alpn: ["h2"],
                   fingerprint: ($e.fingerprint // "chrome")
                 }
-                + (if (($e.pinned_peer_cert_sha256 // "") == "") then {}
+                  + (if (($e.pinned_peer_cert_sha256 // "") == "") then {}
                   else {pinnedPeerCertSha256: $e.pinned_peer_cert_sha256} end)
+                )
               } elif ($e.transport // "none") == "reality" then {
                 realitySettings: {
                   show: false,
@@ -8926,13 +8927,14 @@ cmd_client() {
         streamSettings: {
           network: "xhttp",
           security: "tls",
-          tlsSettings: {
+          tlsSettings: ({
             serverName: $domain,
             alpn: ["h2"],
             fingerprint: "chrome"
           }
-          + (if $tls_pin == "" then {}
-            else {pinnedPeerCertSha256: $tls_pin} end),
+            + (if $tls_pin == "" then {}
+            else {pinnedPeerCertSha256: $tls_pin} end)
+          ),
           xhttpSettings: {
             host: (if ($route.host // "") == "" then $domain else $route.host end),
             path: $route.path,
