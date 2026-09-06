@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.17.2"
+VERSION="0.17.3"
 ETXR_REPOSITORY="${ETXR_REPOSITORY:-Tianmoy/etxr}"
 ETXR_RELEASE_API="${ETXR_RELEASE_API:-https://api.github.com/repos/${ETXR_REPOSITORY}/releases/latest}"
 
@@ -239,6 +239,74 @@ wait_for_nginx_udp_release() {
   done
   port_is_nginx_owned udp "$port" && return 1
   return 0
+}
+
+nginx_master_pids() {
+  command -v pgrep >/dev/null 2>&1 || return 1
+  pgrep -f '^nginx: master process ' 2>/dev/null
+}
+
+nginx_any_process_running() {
+  command -v pgrep >/dev/null 2>&1 || return 1
+  pgrep -x nginx >/dev/null 2>&1
+}
+
+nginx_signal_master() {
+  kill -TERM "$1"
+}
+
+nginx_systemd_master_pid() {
+  local pid
+  command -v systemctl >/dev/null 2>&1 || return 1
+  systemctl is-active --quiet nginx 2>/dev/null || return 1
+  pid="$(systemctl show -p MainPID --value nginx 2>/dev/null || true)"
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  printf '%s\n' "$pid"
+}
+
+nginx_wait_for_processes_exit() {
+  local timeout_seconds="${1:-15}" attempt attempts
+  [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || return 2
+  attempts="$((10#$timeout_seconds * 5))"
+  for ((attempt=0; attempt<attempts; attempt++)); do
+    nginx_any_process_running || return 0
+    sleep 0.2
+  done
+  nginx_any_process_running
+}
+
+nginx_full_restart() {
+  local binary="$1" systemd_pid pid
+  local -a pids=()
+  [[ -n "$binary" && -x "$binary" ]] || return 1
+
+  systemd_pid="$(nginx_systemd_master_pid 2>/dev/null || true)"
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    pids+=("$pid")
+  done < <(nginx_master_pids 2>/dev/null || true)
+
+  if [[ -n "$systemd_pid" ]]; then
+    if ((${#pids[@]} != 1)) || [[ "${pids[0]}" != "$systemd_pid" ]]; then
+      return 1
+    fi
+    systemctl restart nginx
+    return
+  fi
+
+  ((${#pids[@]} == 1)) || return 1
+  nginx_any_process_running >/dev/null || return 1
+  nginx_signal_master "${pids[0]}" || return 1
+  nginx_wait_for_processes_exit 15 || return 1
+  "$binary"
+}
+
+nginx_restart_for_udp_release() {
+  local binary="$1" port="$2"
+  warn "nginx 旧 worker 长时间未退出，准备完整重启 nginx 以释放 UDP $port"
+  nginx_full_restart "$binary" || return 1
+  wait_for_nginx_udp_release "$port" 10 || return 1
+  nginx_process_running
 }
 
 nginx_effective_config_files() {
@@ -959,6 +1027,9 @@ valid_socks_credential() { [[ ${#1} -le 255 && ! "$1" =~ [[:cntrl:]] ]]; }
 valid_bearer_token() { [[ "$1" =~ ^[0-9a-fA-F]{40}$ ]]; }
 valid_subscription_prefix() { [[ "$1" =~ ^[0-9a-fA-F]{8}$ ]]; }
 valid_control_token() { [[ "$1" =~ ^[0-9a-fA-F]{64}$ ]]; }
+valid_certificate_pins() {
+  [[ -z "$1" || "$1" =~ ^[0-9a-fA-F]{64}(,[0-9a-fA-F]{64})*$ ]]
+}
 
 parse_common_flags() {
   local -a rest=()
@@ -980,7 +1051,7 @@ cmd_init() {
   local sing_config="/etc/etxr/live/sing-box.json"
   local tls_port=443 https_listen_port=8443 stream_path=""
   local stream_loader_path="" shared_tcp443=false auto_rebind_https=false
-  local control_path
+  local control_path tls_pin=""
 
   if [[ "${1:-}" == "--help" ]]; then
     cat <<'EOF'
@@ -1079,6 +1150,12 @@ EOF
 
   address="${address:-$domain}"
   control_path="$(random_path 16)"
+  if [[ -n "$cert" && -n "$key" ]] &&
+     tls_certificate_is_usable "$cert" "$key" &&
+     ! tls_certificate_is_trusted_for_name "$cert" "$domain"; then
+    tls_pin="$(tls_certificate_sha256 "$cert")" ||
+      die "无法计算 TLS 证书 SHA256 指纹"
+  fi
   ensure_parent "$STATE_FILE"
 
   jq -n \
@@ -1093,6 +1170,7 @@ EOF
     --arg xray_config "$xray_config" \
     --arg sing_config "$sing_config" \
     --arg control_path "$control_path" \
+    --arg tls_pin "$tls_pin" \
     --arg stream_path "$stream_path" \
     --arg stream_loader_path "$stream_loader_path" \
     --argjson shared_tcp443 "$shared_tcp443" \
@@ -1120,6 +1198,7 @@ EOF
         stream_loader_path: $stream_loader_path,
         certificate: $cert,
         certificate_key: $key,
+        pinned_peer_cert_sha256: $tls_pin,
         snippet_path: $snippet,
         standalone_path: "/etc/nginx/conf.d/etxr.conf",
         paths_path: "/etc/etxr/live/nginx-paths.conf",
@@ -1854,7 +1933,7 @@ cmd_route() {
 cmd_exit_add() {
   local name="" address="" port=443 transport="tls" server_name="" host="" path=""
   local uuid="" encryption="none" flow="" public_key="" short_id="" fingerprint="chrome"
-  local socks_username="" socks_password=""
+  local socks_username="" socks_password="" pinned_peer_cert_sha256=""
   while (($#)); do
     case "$1" in
       --name) name="$2"; shift 2 ;;
@@ -1870,6 +1949,7 @@ cmd_exit_add() {
       --public-key) public_key="$2"; shift 2 ;;
       --short-id) short_id="$2"; shift 2 ;;
       --fingerprint) fingerprint="$2"; shift 2 ;;
+      --pinned-peer-cert-sha256) pinned_peer_cert_sha256="$2"; shift 2 ;;
       --username) socks_username="$2"; shift 2 ;;
       --password) socks_password="$2"; shift 2 ;;
       --help)
@@ -1878,6 +1958,9 @@ Usage:
   etxr exit add --name tw --address tw.example.com --port 443 \
     --transport tls --server-name tw.example.com --host tw.example.com \
     --path /RELAY_PATH --uuid UUID
+
+  For a self-signed or private-CA endpoint, add:
+  --pinned-peer-cert-sha256 LEAF_CERT_SHA256
 
   etxr exit add --name us --address US_IP --port 8444 \
     --transport reality --server-name REALITY_SNI --path /RELAY_PATH \
@@ -1920,6 +2003,7 @@ EOF
     flow=""
     public_key=""
     short_id=""
+    pinned_peer_cert_sha256=""
   else
     [[ -n "$path" && -n "$uuid" ]] ||
       die "VLESS exit requires --path and --uuid"
@@ -1935,6 +2019,12 @@ EOF
       [[ -n "$public_key" && -n "$short_id" ]] ||
         die "Reality exit needs --public-key and --short-id"
     fi
+    if [[ "$transport" == "tls" ]]; then
+      valid_certificate_pins "$pinned_peer_cert_sha256" ||
+        die "--pinned-peer-cert-sha256 must be one or more comma-separated SHA256 values"
+    else
+      pinned_peer_cert_sha256=""
+    fi
     if [[ "$transport" == "none" && "$encryption" == "none" ]]; then
       warn "Unencrypted VLESS is only suitable for a trusted private overlay"
     fi
@@ -1948,6 +2038,7 @@ EOF
       server_name: $server_name, host: $host, path: $path, uuid: $uuid,
       encryption: $encryption, flow: $flow, public_key: $public_key,
       short_id: $short_id, fingerprint: $fingerprint,
+      pinned_peer_cert_sha256: $pin,
       socks_username: $socks_username, socks_password: $socks_password,
       xmux: {
         maxConcurrency: "16-32", maxConnections: 0,
@@ -1959,6 +2050,7 @@ EOF
     --arg server_name "$server_name" --arg host "$host" --arg path "$path" \
     --arg uuid "$uuid" --arg encryption "$encryption" --arg flow "$flow" \
     --arg public_key "$public_key" --arg short_id "$short_id" \
+    --arg pin "$pinned_peer_cert_sha256" \
     --arg socks_username "$socks_username" --arg socks_password "$socks_password" \
     --arg fingerprint "$fingerprint" --argjson port "$port"
   log "Added exit $name"
@@ -2340,10 +2432,11 @@ render_xray() {
             + (if ($e.transport // "none") == "tls" then {
                 tlsSettings: {
                   serverName: $e.server_name,
-                  allowInsecure: false,
                   alpn: ["h2"],
                   fingerprint: ($e.fingerprint // "chrome")
                 }
+                + (if (($e.pinned_peer_cert_sha256 // "") == "") then {}
+                  else {pinnedPeerCertSha256: $e.pinned_peer_cert_sha256} end)
               } elif ($e.transport // "none") == "reality" then {
                 realitySettings: {
                   show: false,
@@ -3112,8 +3205,34 @@ active_user_json() {
     )' "$STATE_FILE"
 }
 
+public_tls_pin_from_state() {
+  local configured cert domain
+  [[ "$(jq -r '(.xray.routes // []) | length' "$STATE_FILE")" != "0" ]] ||
+    return 0
+  configured="$(jq -r '.nginx.pinned_peer_cert_sha256 // ""' "$STATE_FILE")"
+  valid_certificate_pins "$configured" ||
+    die "state.json 中的 TLS 证书指纹格式无效"
+  cert="$(jq -r '.nginx.certificate // ""' "$STATE_FILE")"
+  domain="$(jq -r '.node.domain' "$STATE_FILE")"
+  if [[ -n "$cert" && -r "$cert" ]] &&
+     openssl x509 -in "$cert" -noout >/dev/null 2>&1; then
+    if tls_certificate_is_trusted_for_name "$cert" "$domain"; then
+      return 0
+    fi
+    tls_certificate_sha256 "$cert" ||
+      die "无法计算公开 TLS 证书的 SHA256 指纹"
+    return 0
+  fi
+  if [[ -n "$configured" ]]; then
+    printf '%s' "$configured"
+    return 0
+  fi
+}
+
 subscription_entry_from_state() {
-  jq -c '{
+  local tls_pin
+  tls_pin="$(public_tls_pin_from_state)"
+  jq -c --arg tls_pin "$tls_pin" '{
     schema: 1,
     node: {
       name: .node.name,
@@ -3121,7 +3240,8 @@ subscription_entry_from_state() {
       address: .node.address
     },
     nginx: {
-      tls_port: .nginx.tls_port
+      tls_port: .nginx.tls_port,
+      pinned_peer_cert_sha256: $tls_pin
     },
     xray: {
       routes: [.xray.routes[]? | {
@@ -3135,8 +3255,7 @@ subscription_entry_from_state() {
         client_encryption: (.client_encryption // "none"),
         flow: (.flow // ""),
         security: "tls",
-        direct: (.direct // false),
-        allow_insecure: (.allow_insecure // false)
+        direct: (.direct // false)
       }],
       reality_inbounds: [.xray.reality_inbounds[]? | {
         name,
@@ -3170,12 +3289,16 @@ validate_worker_subscription_entry() {
     def valid_path:
       type == "string" and test("^/[A-Za-z0-9._~/-]+$") and
       (contains("//") | not) and (contains("..") | not);
+    def valid_pins:
+      type == "string" and
+      (. == "" or test("^[0-9a-fA-F]{64}(,[0-9a-fA-F]{64})*$"));
     .schema == 1 and
     .node.name == $expected and
     (.node.name | valid_name) and
     (.node.domain | valid_host) and
     (.node.address | valid_host) and
     (.nginx.tls_port | valid_port) and
+    ((.nginx.pinned_peer_cert_sha256 // "") | valid_pins) and
     (.xray.routes | type == "array") and
     all(.xray.routes[];
       (.name | valid_name) and
@@ -3189,8 +3312,7 @@ validate_worker_subscription_entry() {
         (test("[\u0000-\u001f\u007f]") | not)) and
       (.flow == "" or .flow == "xtls-rprx-vision") and
       (.security == "none" or .security == "tls") and
-      (.direct | type == "boolean") and
-      (.allow_insecure | type == "boolean")
+      (.direct | type == "boolean")
     ) and
     (.xray.reality_inbounds | type == "array") and
     all(.xray.reality_inbounds[];
@@ -3335,7 +3457,7 @@ prompt_user_node_selection() {
 
 vless_link_for_route() {
   local route="$1" user="$2" entry="$3"
-  local uuid domain address port path profile encryption flow host query
+  local uuid domain address port path profile encryption flow host query tls_pin
   local entry_name target protocol fragment
   uuid="$(jq -r '.uuid' <<<"$user")"
   domain="$(jq -r '.node.domain' <<<"$entry")"
@@ -3350,12 +3472,12 @@ vless_link_for_route() {
   encryption="$(jq -r '.client_encryption // "none"' <<<"$route")"
   flow="$(jq -r '.flow // ""' <<<"$route")"
   host="$(jq -r --arg d "$domain" 'if (.host // "") == "" then $d else .host end' <<<"$route")"
+  tls_pin="$(jq -r '.nginx.pinned_peer_cert_sha256 // ""' <<<"$entry")"
+  valid_certificate_pins "$tls_pin" || die "订阅中的 TLS 证书指纹格式无效"
   # nginx may forward plaintext to loopback, but every exported XHTTP endpoint
   # is reached by clients through the public TLS listener.
   query="encryption=$(urlencode "$encryption")&security=tls&sni=$(urlencode "$domain")&type=xhttp&host=$(urlencode "$host")&path=$(urlencode "$path")&mode=auto"
-  if [[ "$(jq -r '.allow_insecure // false' <<<"$route")" == "true" ]]; then
-    query+="&allowInsecure=1"
-  fi
+  [[ -z "$tls_pin" ]] || query+="&pcs=$(urlencode "$tls_pin")"
   [[ -z "$flow" ]] || query+="&flow=$(urlencode "$flow")"
   if [[ "$profile" == "vlessenc-vision" ]]; then
     local extra
@@ -3664,6 +3786,10 @@ validate_state_semantics() {
       if type == "string" then
         length <= 255 and (test("[\u0000-\u001f\u007f]") | not)
       else false end;
+    def valid_pins:
+      if type == "string" then
+        (. == "" or test("^[0-9a-fA-F]{64}(,[0-9a-fA-F]{64})*$"))
+      else false end;
 
     .xray.exits[]? as $exit |
     ($exit.name // "<未命名出口>") as $name |
@@ -3695,6 +3821,15 @@ validate_state_semantics() {
       if $transport != "socks5" and ($exit.network // "xhttp") == "xhttp" and
           ($exit.path | valid_path | not) then
         [$name, "Path", "XHTTP 出口必须填写以 / 开头的 Path"]
+      else empty end
+      ,
+      if $transport == "tls" and
+          (($exit.pinned_peer_cert_sha256 // "") | valid_pins | not) then
+        [$name, "TLS 证书指纹", "必须是一个或多个逗号分隔的 SHA256"]
+      else empty end,
+      if $transport != "tls" and
+          (($exit.pinned_peer_cert_sha256 // "") != "") then
+        [$name, "TLS 证书指纹", "只有 TLS 出口可以配置"]
       else empty end
     ][] | @tsv
   ' "$STATE_FILE")"; then
@@ -3732,6 +3867,14 @@ validate_state_semantics() {
     ($tcp | length) == ($tcp | unique | length)
   ' "$STATE_FILE" >/dev/null; then
     warn "Xray TCP ports conflict inside the state"
+    errors=1
+  fi
+  if ! jq -e '
+    ((.nginx.pinned_peer_cert_sha256 // "") |
+      type == "string" and
+      (. == "" or test("^[0-9a-fA-F]{64}(,[0-9a-fA-F]{64})*$")))
+  ' "$STATE_FILE" >/dev/null; then
+    warn "nginx TLS 证书指纹格式无效"
     errors=1
   fi
   if ! jq -e '
@@ -4142,7 +4285,7 @@ migration_prepare_state() {
   local source="$1" destination="$2" domain="$3" address="$4"
   local mode="$5" cert="$6" key="$7"
   local snippet="" stream_path="" stream_loader="" auto_rebind=false
-  local saved_state
+  local saved_state migration_pin=""
   need_jq
   valid_hostname "$domain" || die "迁移后的入口域名无效"
   valid_hostname "$address" || die "迁移后的客户端连接地址无效"
@@ -4165,11 +4308,18 @@ migration_prepare_state() {
     stream_path="/etc/nginx/stream-conf.d/etxr.conf"
     stream_loader="/etc/nginx/modules-enabled/99-etxr-stream.conf"
   fi
+  if [[ -n "$cert" && -n "$key" ]] &&
+     tls_certificate_is_usable "$cert" "$key" &&
+     ! tls_certificate_is_trusted_for_name "$cert" "$domain"; then
+    migration_pin="$(tls_certificate_sha256 "$cert")" ||
+      die "无法计算迁移后的 TLS 证书 SHA256 指纹"
+  fi
 
   jq --arg domain "$domain" --arg address "$address" \
     --arg mode "$mode" --arg cert "$cert" --arg key "$key" \
     --arg snippet "$snippet" --arg stream "$stream_path" \
     --arg stream_loader "$stream_loader" \
+    --arg migration_pin "$migration_pin" \
     --arg xray_config "${RUNTIME_DIR}/live/xray.json" \
     --arg sing_config "${RUNTIME_DIR}/live/sing-box.json" \
     --arg paths "${RUNTIME_DIR}/live/nginx-paths.conf" \
@@ -4185,6 +4335,7 @@ migration_prepare_state() {
     .nginx.stream_path = $stream |
     .nginx.stream_loader_path = $stream_loader |
     .nginx.auto_rebind_https = $auto_rebind |
+    .nginx.pinned_peer_cert_sha256 = $migration_pin |
     .nginx.web_root = "/var/www/etxr" |
     del(.nginx.binary) |
     .xray.config_path = $xray_config |
@@ -4694,6 +4845,8 @@ install_control_helper() {
 #!/usr/bin/env python3
 import argparse
 import asyncio
+import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -5056,7 +5209,6 @@ class Agent:
                 "flow": route.get("flow", ""),
                 "security": route.get("security", "tls"),
                 "direct": bool(route.get("direct", False)),
-                "allow_insecure": bool(route.get("allow_insecure", False)),
             })
         realities = []
         for reality in xray.get("reality_inbounds", []):
@@ -5075,7 +5227,12 @@ class Agent:
                 "domain": node.get("domain", ""),
                 "address": node.get("address", ""),
             },
-            "nginx": {"tls_port": nginx.get("tls_port", 443)},
+            "nginx": {
+                "tls_port": nginx.get("tls_port", 443),
+                "pinned_peer_cert_sha256": self.public_tls_pin(
+                    nginx, hysteria2
+                ),
+            },
             "xray": {
                 "routes": routes,
                 "reality_inbounds": realities,
@@ -5088,6 +5245,25 @@ class Agent:
                 "insecure": bool(hysteria2.get("insecure", False)),
             },
         }
+
+    @staticmethod
+    def public_tls_pin(nginx, hysteria2):
+        configured = str(nginx.get("pinned_peer_cert_sha256", ""))
+        if not configured and not hysteria2.get("insecure", False):
+            return ""
+        try:
+            content = Path(nginx.get("certificate", "")).read_bytes()
+            begin = content.index(b"-----BEGIN CERTIFICATE-----")
+            end = content.index(b"-----END CERTIFICATE-----", begin)
+            certificate_base64 = content[
+                begin + len(b"-----BEGIN CERTIFICATE-----"):end
+            ].split()
+            certificate = base64.b64decode(
+                b"".join(certificate_base64), validate=True
+            )
+            return hashlib.sha256(certificate).hexdigest()
+        except (OSError, ValueError, TypeError, binascii.Error):
+            return configured
 
     @staticmethod
     def validate_base_url(value):
@@ -5712,6 +5888,7 @@ cmd_apply() {
   local nginx_was_running=0
   local nginx_should_reload=0 nginx_quic_backup="" nginx_tcp443_backup=""
   local auto_rebind_https https_listen_port post_quic_manifest=""
+  local nginx_was_systemd=0
   xray_config="$(jq -r '.xray.config_path' "$STATE_FILE")"
   sing_config="$(jq -r '.hysteria2.config_path' "$STATE_FILE")"
   mode="$(jq -r '.nginx.mode' "$STATE_FILE")"
@@ -5754,6 +5931,9 @@ cmd_apply() {
     fi
   fi
   nginx_process_running && nginx_was_running=1
+  if [[ -n "$(nginx_systemd_master_pid 2>/dev/null || true)" ]]; then
+    nginx_was_systemd=1
+  fi
 
   if (( ! DRY_RUN )); then
     rollback_dir="$(mktemp -d "$RUNTIME_DIR/.apply.XXXXXX")"
@@ -5879,7 +6059,13 @@ cmd_apply() {
     if [[ -n "${nb:-}" ]] &&
        { (( nginx_was_running )) || [[ "$mode" != "disabled" ]]; }; then
       if "$nb" -t >/dev/null 2>&1; then
-        "$nb" -s reload >/dev/null 2>&1 || true
+        if nginx_process_running; then
+          "$nb" -s reload >/dev/null 2>&1 || true
+        elif (( nginx_was_systemd )); then
+          systemctl start nginx >/dev/null 2>&1 || true
+        else
+          "$nb" >/dev/null 2>&1 || true
+        fi
       fi
     fi
     rm -rf "$rollback_dir"
@@ -6088,8 +6274,10 @@ cmd_apply() {
           log "正在等待旧 nginx worker 释放 UDP $hy2_port（最多 30 秒）"
         fi
         if ! wait_for_nginx_udp_release "$hy2_port" 30; then
-          rollback_apply
-          die "等待 30 秒后 nginx 仍占用 UDP $hy2_port，已恢复原配置"
+          if ! nginx_restart_for_udp_release "$nb" "$hy2_port"; then
+            rollback_apply
+            die "完整重启 nginx 后仍未释放 UDP $hy2_port，已恢复原配置"
+          fi
         fi
       fi
     fi
@@ -7665,6 +7853,51 @@ tls_certificate_matches_name() {
   fi
 }
 
+tls_certificate_sha256() {
+  local cert="$1" digest
+  digest="$(
+    openssl x509 -in "$cert" -outform DER 2>/dev/null |
+      sha256sum | awk '{print $1}'
+  )" || return 1
+  [[ "$digest" =~ ^[0-9a-fA-F]{64}$ ]] || return 1
+  printf '%s' "${digest,,}"
+}
+
+tls_certificate_is_trusted_for_name() {
+  local cert="$1" name="$2" temp leaf chain rc=1
+  local -a verify_args
+  [[ -r "$cert" && -s /etc/ssl/certs/ca-certificates.crt ]] || return 1
+  temp="$(mktemp -d)"
+  leaf="$temp/leaf.pem"
+  chain="$temp/chain.pem"
+  : >"$leaf"
+  : >"$chain"
+  if ! awk -v leaf="$leaf" -v chain="$chain" '
+    /-----BEGIN CERTIFICATE-----/ { count++ }
+    count == 1 { print > leaf; next }
+    count > 1 { print >> chain }
+  ' "$cert"; then
+    rm -rf -- "$temp"
+    return 1
+  fi
+  [[ -s "$leaf" ]] || {
+    rm -rf -- "$temp"
+    return 1
+  }
+  verify_args=(-purpose sslserver -CAfile /etc/ssl/certs/ca-certificates.crt)
+  [[ ! -s "$chain" ]] || verify_args+=(-untrusted "$chain")
+  if valid_ipv4 "$name"; then
+    verify_args+=(-verify_ip "$name")
+  else
+    verify_args+=(-verify_hostname "$name")
+  fi
+  if openssl verify "${verify_args[@]}" "$leaf" >/dev/null 2>&1; then
+    rc=0
+  fi
+  rm -rf -- "$temp"
+  return "$rc"
+}
+
 detect_public_ipv4() {
   local ip=""
   ip="$(curl -4 --proto '=https' --tlsv1.2 -fsS --max-time 8 \
@@ -8034,7 +8267,7 @@ EOF
   need_cmd sha256sum
   local bundle now name domain address cert="" key="" cert_info
   local nginx_mode components="xray,easytier" local_direct=0
-  local certificate_insecure=false needs_certificate=false
+  local certificate_untrusted=false certificate_pin="" needs_certificate=false
   local reality_keys="" reality_private="" reality_public=""
   bundle="$(pair_decode "$pairing_id" "$trusted_fingerprint")"
   validate_pair_bundle "$bundle" ||
@@ -8102,10 +8335,17 @@ EOF
       cert_info="$(generate_self_signed_cert "$name" "$domain")"
       cert="$(sed -n '1p' <<<"$cert_info")"
       key="$(sed -n '2p' <<<"$cert_info")"
-      certificate_insecure=true
+      certificate_untrusted=true
     elif ! tls_certificate_matches_name "$cert" "$domain"; then
-      warn "证书不包含域名 $domain，订阅将自动启用跳过证书名称校验"
-      certificate_insecure=true
+      warn "证书不包含域名 $domain，XHTTP 订阅将固定当前证书 SHA256 指纹"
+      certificate_untrusted=true
+    elif ! tls_certificate_is_trusted_for_name "$cert" "$domain"; then
+      warn "证书不是系统信任链签发，XHTTP 订阅将固定当前证书 SHA256 指纹"
+      certificate_untrusted=true
+    fi
+    if [[ "$certificate_untrusted" == "true" ]]; then
+      certificate_pin="$(tls_certificate_sha256 "$cert")" ||
+        die "无法计算从服务器 TLS 证书 SHA256 指纹"
     fi
     direct_config="$(jq -c --arg cert "$cert" --arg key "$key" \
       '.nginx.certificate = $cert | .nginx.certificate_key = $key' \
@@ -8161,8 +8401,7 @@ EOF
   if [[ "$(jq -r '.xhttp.enabled' <<<"$direct_config")" == "true" ]]; then
     xhttp_routes="$(jq -nc \
       --arg name "$name" --arg cert "$cert" --arg key "$key" \
-      --argjson config "$direct_config" \
-      --argjson insecure "$certificate_insecure" '
+      --argjson config "$direct_config" '
       $config.xhttp as $x |
       [{
       name: ($name + "-xhttp"),
@@ -8179,8 +8418,7 @@ EOF
       direct: true,
       security: (if $x.behind_nginx then "none" else "tls" end),
       certificate: (if $x.behind_nginx then "" else $cert end),
-      certificate_key: (if $x.behind_nginx then "" else $key end),
-      allow_insecure: $insecure
+      certificate_key: (if $x.behind_nginx then "" else $key end)
     }]')"
   fi
   if [[ "$(jq -r '.reality.enabled' <<<"$direct_config")" == "true" ]]; then
@@ -8232,6 +8470,7 @@ EOF
     .xray.relay_inbounds = ([$private] + $public) |
     .xray.routes = $xhttp_routes |
     .xray.reality_inbounds = $reality_inbounds |
+    .nginx.pinned_peer_cert_sha256 = $certificate_pin |
     .hysteria2.enabled = $hy2_enabled |
     .hysteria2.port = $hy2_port |
     .hysteria2.shared_udp443 = $hy2_shared_udp443 |
@@ -8242,7 +8481,7 @@ EOF
     .hysteria2.masquerade = $hy2_masquerade |
     .hysteria2.certificate = $cert |
     .hysteria2.certificate_key = $key |
-    .hysteria2.insecure = $certificate_insecure |
+    .hysteria2.insecure = $certificate_untrusted |
     .control = {
       enabled: false,
       base_path: "",
@@ -8275,7 +8514,8 @@ EOF
     --arg control_node "$(jq -r '.control.node_id' <<<"$bundle")" \
     --arg control_token "$(jq -r '.control.token' <<<"$bundle")" \
     --arg cert "$cert" --arg key "$key" \
-    --argjson certificate_insecure "$certificate_insecure" \
+    --arg certificate_pin "$certificate_pin" \
+    --argjson certificate_untrusted "$certificate_untrusted" \
     --argjson users "$worker_users"
 
   if (( prepare_only )); then
@@ -8641,7 +8881,7 @@ cmd_client() {
   require_state
   [[ -n "$route_name" ]] || die "--route is required"
   valid_port "$socks_port" || die "Invalid SOCKS port"
-  local user route domain address tls_port result
+  local user route domain address tls_port tls_pin result
   user="$(active_user_json "$name")" || die "用户不存在、已暂停或已过期：$name"
   route="$(jq -ce --arg name "$route_name" '.xray.routes[] | select(.name == $name)' "$STATE_FILE")" ||
     die "Route not found: $route_name"
@@ -8651,10 +8891,14 @@ cmd_client() {
   domain="$(jq -r '.node.domain' "$STATE_FILE")"
   address="$(jq -r '.node.address' "$STATE_FILE")"
   tls_port="$(jq -r '.nginx.tls_port' "$STATE_FILE")"
+  tls_pin="$(public_tls_pin_from_state)"
+  valid_certificate_pins "$tls_pin" ||
+    die "state.json 中的 TLS 证书指纹格式无效"
 
   result="$(jq -n \
     --argjson user "$user" --argjson route "$route" \
     --arg domain "$domain" --arg address "$address" \
+    --arg tls_pin "$tls_pin" \
     --argjson tls_port "$tls_port" --argjson socks_port "$socks_port" '
     {
       log: {loglevel: "warning"},
@@ -8684,10 +8928,11 @@ cmd_client() {
           security: "tls",
           tlsSettings: {
             serverName: $domain,
-            allowInsecure: false,
             alpn: ["h2"],
             fingerprint: "chrome"
-          },
+          }
+          + (if $tls_pin == "" then {}
+            else {pinnedPeerCertSha256: $tls_pin} end),
           xhttpSettings: {
             host: (if ($route.host // "") == "" then $domain else $route.host end),
             path: $route.path,
@@ -10046,7 +10291,7 @@ menu_health_check() {
   fi
 
   local failures=0 xray_config sing_config cert key mode nb role limited_count
-  local health_hy2_port health_hy2_shared listener_ok
+  local health_hy2_port="" health_hy2_shared=false listener_ok
   local health_quic_manifest health_quic_count health_quic_file
   xray_config="$(jq -r '.xray.config_path' "$STATE_FILE")"
   sing_config="$(jq -r '.hysteria2.config_path' "$STATE_FILE")"

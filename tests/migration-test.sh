@@ -53,7 +53,7 @@ state_update '
     security: "tls",
     certificate: $cert,
     certificate_key: $key,
-    allow_insecure: false
+    pinned_peer_cert_sha256: ""
   }] |
   .xray.reality_inbounds = [{
     name: "reality",
@@ -159,6 +159,7 @@ STATE_LOCK_DEPTH=0
 cmd_install() { return 0; }
 tls_certificate_is_usable() { return 0; }
 tls_certificate_matches_name() { return 0; }
+tls_certificate_is_trusted_for_name() { return 0; }
 cmd_apply() { return 0; }
 
 (migration_import_impl "$package" 'correct horse battery staple' \

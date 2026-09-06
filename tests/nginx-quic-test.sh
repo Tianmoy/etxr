@@ -108,6 +108,37 @@ if wait_for_nginx_udp_release 443 1; then
   exit 1
 fi
 
+# A bounded full restart is reserved for one unambiguous nginx master.
+nginx_systemd_master_pid() { return 1; }
+nginx_master_pids() {
+  printf '%s\n%s\n' 101 102
+}
+if nginx_full_restart /bin/true; then
+  echo "ambiguous nginx masters were restarted" >&2
+  exit 1
+fi
+
+nginx_signal_called=0
+nginx_master_pids() { printf '%s\n' 101; }
+nginx_any_process_running() { return 0; }
+nginx_signal_master() { nginx_signal_called=1; }
+nginx_wait_for_processes_exit() { return 0; }
+nginx_full_restart /bin/true
+[[ "$nginx_signal_called" -eq 1 ]]
+
+systemd_restart_log="$TMP/systemd-restart.log"
+systemctl() {
+  [[ "$1" == "restart" && "$2" == "nginx" ]] &&
+    printf '%s\n' restart >>"$systemd_restart_log"
+}
+nginx_systemd_master_pid() { printf '%s\n' 102; }
+nginx_master_pids() { printf '%s\n' 102; }
+nginx_full_restart /bin/true
+grep -Fq restart "$systemd_restart_log"
+unset -f nginx_systemd_master_pid nginx_master_pids \
+  nginx_any_process_running nginx_signal_master nginx_wait_for_processes_exit
+unset -f systemctl
+
 # Parse files from nginx -T so custom Baota include paths are also scanned.
 mkdir -p "$TMP/effective"
 cat >"$TMP/effective/custom-vhost.any-name" <<'EOF'
@@ -223,12 +254,23 @@ if (cmd_apply >/dev/null 2>&1); then
 fi
 cmp "$TMP/original.conf" "$TMP/nginx/sites-enabled/site.conf"
 
+# If stale workers never release UDP 443 and the bounded restart also fails,
+# apply must restore the original nginx configuration.
+wait_for_nginx_udp_release() { return 1; }
+nginx_restart_for_udp_release() { return 1; }
+if (cmd_apply >/dev/null 2>&1); then
+  echo "apply unexpectedly accepted a failed nginx full restart" >&2
+  exit 1
+fi
+cmp "$TMP/original.conf" "$TMP/nginx/sites-enabled/site.conf"
+
 # The same state succeeds once nginx validation and the HY2 listener pass.
 cat >"$TMP/tools/nginx" <<'EOF'
 #!/usr/bin/env bash
 exit 0
 EOF
 chmod 755 "$TMP/tools/nginx"
+wait_for_nginx_udp_release() { return 0; }
 verify_hy2_udp_listener() { return 0; }
 cmd_apply >/dev/null
 [[ "$(stat -c '%a' "$(dirname "$SUBSCRIPTION_DIR")")" == "751" ]]
@@ -278,8 +320,7 @@ state_update '
     direct: true,
     security: "none",
     certificate: "",
-    certificate_key: "",
-    allow_insecure: true
+    certificate_key: ""
   }] |
   .xray.reality_inbounds = [{
     name: "direct",

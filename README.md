@@ -1,4 +1,4 @@
-# ETXR v0.17.2
+# ETXR v0.17.3
 
 ETXR 是面向 Debian 12 空白系统的一站式中文菜单脚本，用一份脚本安装主服务器或任意数量的从服务器。它管理 Xray、sing-box、EasyTier、订阅和用户配置，并可复用宝塔 nginx 的 TCP 443。
 
@@ -166,11 +166,15 @@ nginx 的 QUIC/HTTP3 也使用 UDP 443，因此二者不能同时监听。选择
 4. 注释发布 H3 的 `Alt-Svc` 响应头。
 5. 保留 `listen 443 ssl`、`http2 on` 和普通网站 HTTPS。
 6. 使用实际 nginx 二进制执行 `nginx -t`，先 reload 释放 UDP 443，再启动 sing-box。
-7. nginx 检查、reload、sing-box 启动或 UDP 监听验证任一步失败，恢复所有文件和服务状态。
+7. reload 后等待最多 30 秒；若旧 worker 仍占用 UDP 443，则执行一次有边界的 nginx 完整重启。
+8. nginx 检查、reload、重启、sing-box 启动或 UDP 监听验证任一步失败，恢复所有文件和服务状态。
 
 宝塔 nginx reload 后，旧 worker 可能短时间继续持有原 QUIC socket。ETXR 会先用
 `nginx -T` 复查实际加载的全部配置，再等待最多 30 秒让旧 worker 释放 UDP 443；
-只有配置仍含 H3/QUIC，或等待结束后仍由 nginx 占用时才会回滚。
+等待结束后仍由 nginx 占用时，systemd 管理的 nginx 会执行 `systemctl restart nginx`；
+宝塔单 master nginx 会向该 master 发送 `TERM`，确认全部进程退出后再用检测到的二进制
+拉起。找不到唯一 master、存在多个 nginx master 或重启后仍未释放端口时不会继续冒险，
+而是恢复原配置。完整重启会让 TCP 443 出现短暂中断，因此只在这个兜底场景执行。
 
 宝塔优先使用 `/www/server/nginx/sbin/nginx`。自动扫描宝塔 vhost、宝塔主配置以及标准 `/etc/nginx` 配置目录。
 
@@ -245,7 +249,10 @@ Pair ID 只限制“从服务器第一次加入”的时间，不会让已经加
 
 没有宝塔时会安装 Debian nginx 与 stream 模块。仅 XHTTP 共用 443 时由 HTTPS Path 分流；同时启用 Reality 时，公网 TCP 443 由 stream 接收，Reality SNI 进入本机 Xray，其他 SNI 进入内部 nginx HTTPS。Hysteria2 使用独立的 UDP 443。
 
-证书与私钥存在、未过期、匹配且包含当前域名时直接使用。缺失或无效时生成自签证书，并在生成的 XHTTP/HY2 订阅中自动加入跳过证书校验参数。
+证书与私钥存在、未过期、匹配且包含当前域名时直接使用。系统信任 CA 签发的证书按正常
+Xray TLS/HTTPS 方式校验；自签或私有 CA 证书会在 XHTTP 订阅中固定当前叶证书的 SHA-256
+指纹。缺失或无效时生成新的自签证书并固定其指纹。Xray 26.x 已移除 `allowInsecure`，
+ETXR 不再生成跳过证书校验的 Xray TLS 配置。
 
 Pair ID 包含 EasyTier 网络密钥、控制令牌和当前用户配置，默认 30 分钟有效，不应公开。菜单流程不在 Pair ID 中携带从服务器 Reality 私钥。Pair 私钥只保存在主服务器，Pair ID 本身不能重新计算有效签名。
 
@@ -494,7 +501,7 @@ checksums.txt
 
 脚本先校验 SHA-256 和二进制内置版本，再通过同目录临时文件原子替换；旧二进制保存在 `/etc/etxr/backups/dataplane-binary/`，失败时自动恢复。镜像站可将 `ETXR_DOWNLOAD_BASE` 设置为包含两个数据面二进制和 `checksums.txt` 的 HTTPS 目录。
 
-推送 `v0.17.2` 形式的 Git 标签后，GitHub Actions 会运行完整测试、交叉编译两个 Linux 架构并创建 Release。构建使用 `CGO_ENABLED=0`，目标机不需要额外运行库。
+推送 `v0.17.3` 形式的 Git 标签后，GitHub Actions 会运行完整测试、交叉编译两个 Linux 架构并创建 Release。构建使用 `CGO_ENABLED=0`，目标机不需要额外运行库。
 
 ## 许可证
 

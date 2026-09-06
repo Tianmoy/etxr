@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
 import os
 import pathlib
 import socket
+import subprocess
 import sys
 import tempfile
 import time
@@ -62,7 +64,20 @@ async def run() -> None:
         desired = control / "nodes" / f"{NODE}.json"
         refresh_log = tmp / "subscription-refresh.log"
         fake_hub_etxr = tmp / "fake-hub-etxr"
+        certificate = tmp / "worker-cert.pem"
+        certificate_key = tmp / "worker-key.pem"
         port = free_port()
+
+        subprocess.run(
+            [
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-days", "1", "-subj", "/CN=worker.example.com",
+                "-keyout", str(certificate_key), "-out", str(certificate),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
         env = dict(os.environ)
         env["ETXR_CONTROL_HELPER"] = str(helper)
@@ -199,9 +214,13 @@ async def run() -> None:
                     "domain": "worker.example.com",
                     "address": "worker.example.com",
                 },
-                "nginx": {"tls_port": 443},
+                "nginx": {
+                    "tls_port": 443,
+                    "certificate": str(certificate),
+                    "pinned_peer_cert_sha256": "",
+                },
                 "xray": {"routes": [], "reality_inbounds": []},
-                "hysteria2": {"enabled": False},
+                "hysteria2": {"enabled": False, "insecure": True},
                 "control": {"agent": {
                     "enabled": True,
                     "base_url": base_url,
@@ -295,6 +314,16 @@ async def run() -> None:
                 assert report["usage"]["users"]["alice"]["uplink"] == 1234
                 assert report["usage"]["users"]["alice"]["downlink"] == 5678
                 assert report["entry"]["node"]["name"] == NODE
+                pem = certificate.read_bytes()
+                body = pem.split(b"-----BEGIN CERTIFICATE-----", 1)[1]
+                der = base64.b64decode(
+                    b"".join(
+                        body.split(b"-----END CERTIFICATE-----", 1)[0].split()
+                    ),
+                    validate=True,
+                )
+                expected_pin = hashlib.sha256(der).hexdigest()
+                assert report["entry"]["nginx"]["pinned_peer_cert_sha256"] == expected_pin
                 assert report["domains"]["node"] == NODE
                 assert report["domains"]["users"]["alice"]["unresolved"] == 2
                 domains = report["domains"]["users"]["alice"]["domains"]

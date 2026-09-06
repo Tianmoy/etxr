@@ -7,6 +7,7 @@ TOOLS="${TMP}/tools"
 JQ="${JQ:-jq}"
 XRAY="${XRAY:-${TOOLS}/xray}"
 SING_BOX="${SING_BOX:-${TOOLS}/sing-box}"
+SCRIPT_VERSION="$(sed -n 's/^VERSION="\([^"]*\)"$/\1/p' "$ROOT/etxr.sh")"
 
 TEST_PIDS=()
 stop_test_processes() {
@@ -129,10 +130,10 @@ if [[ -n "${ETXR_TEST_DATAPLANE_BIN:-}" ]]; then
 else
   need go
   (cd "$ROOT" && go build -buildvcs=false \
-    -ldflags '-s -w -X main.version=0.12.0' \
+    -ldflags "-s -w -X main.version=${SCRIPT_VERSION}" \
     -o "$DATAPLANE_BIN" ./cmd/etxr-dataplane)
 fi
-[[ "$("$DATAPLANE_BIN" version)" == "0.12.0" ]]
+[[ "$("$DATAPLANE_BIN" version)" == "$SCRIPT_VERSION" ]]
 export ETXR_DATAPLANE_SOURCE="$DATAPLANE_BIN"
 export ETXR_DATAPLANE_BIN="$DATAPLANE_BIN"
 
@@ -145,7 +146,8 @@ EDGE="$ROOT/etxr.sh"
 "$EDGE" user limit alice --up-mbps 5 --down-mbps 20
 "$EDGE" exit add --name tw --address tw.example.com --port 443 \
   --transport tls --server-name tw.example.com --host tw.example.com \
-  --path /relay-tw --uuid 22222222-2222-4222-8222-222222222222
+  --path /relay-tw --uuid 22222222-2222-4222-8222-222222222222 \
+  --pinned-peer-cert-sha256 1111111111111111111111111111111111111111111111111111111111111111
 "$EDGE" exit add --name socks-tw --address 127.0.0.1 --port 1080 \
   --transport socks5 --username proxy-user --password proxy-pass
 if "$EDGE" exit add --name invalid-socks --address 127.0.0.1 --port 1081 \
@@ -172,6 +174,10 @@ fi
   --obfs salamander --obfs-password OBFSPASS >/dev/null
 
 "$EDGE" render
+"$JQ" -e '.outbounds[] | select(.tag == "exit-tw") |
+  .streamSettings.tlsSettings.pinnedPeerCertSha256 ==
+  "1111111111111111111111111111111111111111111111111111111111111111"
+' "$TMP/generated/xray.json" >/dev/null
 
 # A user only receives the explicitly selected nodes. Creating an XHTTP-only
 # user while HY2 is disabled must not create or require an HY2 password.
@@ -499,7 +505,8 @@ TEST_PIDS+=("$!")
 wait_tcp "$HTTP_PORT"
 wait_tcp "$SOCKS_PORT"
 sleep 1
-curl -fsS --max-time 15 --socks5-hostname "127.0.0.1:${SOCKS_PORT}" \
+env -u no_proxy -u NO_PROXY curl -fsS --max-time 15 \
+  --socks5-hostname "127.0.0.1:${SOCKS_PORT}" \
   "http://localhost:${HTTP_PORT}/" | grep -Fq 'etxr protocol e2e'
 for _ in $(seq 1 30); do
   "$JQ" -e '.users.alice.domains.localhost.connections > 0' \
@@ -537,6 +544,16 @@ stop_test_processes
 "$EDGE" subscriptions snapshot >"$TMP/master-entry.json"
 "$JQ" -e 'all(.xray.routes[]; .security == "tls")' \
   "$TMP/master-entry.json" >/dev/null
+master_pin="$(openssl x509 -in "$TMP/cert.pem" -outform DER |
+  sha256sum | awk '{print $1}')"
+"$JQ" -e --arg pin "$master_pin" \
+  '.nginx.pinned_peer_cert_sha256 == $pin' \
+  "$TMP/master-entry.json" >/dev/null
+if "$JQ" -e '.. | objects | select(has("allowInsecure"))' \
+  "$TMP/generated/xray.json" >/dev/null; then
+  echo "generated Xray configuration still contains allowInsecure" >&2
+  exit 1
+fi
 if grep -Eq 'proxy-user|proxy-pass|socks_username|socks_password' \
   "$TMP/master-entry.json"; then
   echo "SOCKS5 credentials leaked into the subscription entry snapshot" >&2
@@ -549,6 +566,8 @@ if grep -q '/sub/' "$TMP/subscription.txt"; then
   exit 1
 fi
 grep -Fq '#hk-XHTTP' "$TMP/subscription.txt"
+grep -F '#hk-XHTTP' "$TMP/subscription.txt" |
+  grep -Fq "pcs=$master_pin"
 grep -Fq '#hk-tw-XHTTP' "$TMP/subscription.txt"
 grep -Fq '#hk-socks-tw-XHTTP' "$TMP/subscription.txt"
 grep -Fq '#hk-VLESS-Encryption-XHTTP' "$TMP/subscription.txt"
@@ -560,6 +579,9 @@ if grep -Eq '#[^[:space:]]*example\.com' "$TMP/subscription.txt"; then
 fi
 "$EDGE" client alice --route pq --out "$TMP/client-pq.json"
 "$XRAY" run -test -config "$TMP/client-pq.json"
+"$JQ" -e --arg pin "$master_pin" \
+  '.outbounds[0].streamSettings.tlsSettings.pinnedPeerCertSha256 == $pin' \
+  "$TMP/client-pq.json" >/dev/null
 grep -q 'flow=xtls-rprx-vision' "$TMP/subscription.txt"
 grep -q 'security=reality' "$TMP/subscription.txt"
 grep -q '^hysteria2://' "$TMP/subscription.txt"
@@ -763,12 +785,14 @@ XRAY_BIN="$XRAY" SING_BOX_BIN="$SING_BOX" \
   .streamSettings.security == "tls"
 )' "$WORKER/generated/xray.json" >/dev/null
 "$JQ" -e '.easytier.peer == "192.0.2.10:11010"' "$WORKER/state.json" >/dev/null
+worker_pin="$(openssl x509 -in "$WORKER/certs/b1/fullchain.pem" -outform DER |
+  sha256sum | awk '{print $1}')"
 "$JQ" -e '
-  (.xray.routes[] | select(.name == "b1-xhttp") | .allow_insecure) == true and
+  (.nginx.pinned_peer_cert_sha256 == $pin) and
   .hysteria2.insecure == true and
   .hysteria2.port == 443 and
   .hysteria2.shared_udp443 == true
-' "$WORKER/state.json" >/dev/null
+' --arg pin "$worker_pin" "$WORKER/state.json" >/dev/null
 openssl x509 -in "$WORKER/certs/b1/fullchain.pem" -noout -ext subjectAltName |
   grep -Fq 'DNS:b1.example.com'
 "$JQ" -e '
@@ -797,6 +821,9 @@ ETXR_STATE="$WORKER/state.json" ETXR_RUNTIME="$WORKER" \
   "$EDGE" subscriptions snapshot >"$TMP/worker-entry.json"
 "$JQ" -e 'all(.xray.routes[]; .security == "tls")' \
   "$TMP/worker-entry.json" >/dev/null
+"$JQ" -e --arg pin "$worker_pin" \
+  '.nginx.pinned_peer_cert_sha256 == $pin' \
+  "$TMP/worker-entry.json" >/dev/null
 # A stale worker may still report its loopback-side plaintext setting. Public
 # subscriptions must never inherit that internal transport detail.
 "$JQ" '(.xray.routes[] | select(.name == "b1-xhttp") | .security) = "none"' \
@@ -808,6 +835,8 @@ ETXR_STATE="$WORKER/state.json" ETXR_RUNTIME="$WORKER" \
 grep -Fq '#b1-XHTTP' "$TMP/master-central-subscription.txt"
 grep -F '#b1-XHTTP' "$TMP/master-central-subscription.txt" |
   grep -Fq 'security=tls'
+grep -F '#b1-XHTTP' "$TMP/master-central-subscription.txt" |
+  grep -Fq "pcs=$worker_pin"
 if grep -F '#b1-XHTTP' "$TMP/master-central-subscription.txt" |
    grep -Fq 'security=none'; then
   echo "worker XHTTP subscription inherited loopback security=none" >&2
@@ -914,18 +943,20 @@ XRAY_BIN="$XRAY" SING_BOX_BIN="$SING_BOX" \
     >"$TMP/local-worker-join.txt"
 "$XRAY" run -test -config "$LOCAL_WORKER/generated/xray.json"
 "$SING_BOX" check -c "$LOCAL_WORKER/generated/sing-box.json"
+local_pin="$(openssl x509 -in "$LOCAL_WORKER/certs/b1/fullchain.pem" -outform DER |
+  sha256sum | awk '{print $1}')"
 "$JQ" -e '
   .node.domain == "worker.example.com" and
   .nginx.mode == "standalone" and
   .nginx.shared_tcp443 == true and
   .nginx.https_listen_port == 8443 and
+  .nginx.pinned_peer_cert_sha256 == $pin and
   (.xray.routes[] | select(
     .name == "b1-xhttp" and
     .listen == "127.0.0.1" and
     .port == 18000 and
     .public_port == 443 and
-    .security == "none" and
-    .allow_insecure == true
+    .security == "none"
   )) and
   (.xray.reality_inbounds[] | select(
     .port == 443 and
@@ -936,7 +967,7 @@ XRAY_BIN="$XRAY" SING_BOX_BIN="$SING_BOX" \
   .hysteria2.port == 443 and
   .hysteria2.shared_udp443 == true and
   .hysteria2.insecure == true
-' "$LOCAL_WORKER/state.json" >/dev/null
+' --arg pin "$local_pin" "$LOCAL_WORKER/state.json" >/dev/null
 PAIR_REALITY_PUBLIC="$("$EDGE" pair decode "$PAIR_ID" |
   "$JQ" -r '.direct.reality.public_key')"
 LOCAL_REALITY_PUBLIC="$("$JQ" -r \

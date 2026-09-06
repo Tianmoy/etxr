@@ -15,7 +15,7 @@ def main() -> int:
     text = SCRIPT.read_text(encoding="utf-8")
     assert text.startswith("#!/usr/bin/env bash\n")
     assert "set -Eeuo pipefail" in text
-    assert 'VERSION="0.17.2"' in text
+    assert 'VERSION="0.17.3"' in text
     assert 'security=tls&sni=' in text
     assert "local expires_minutes=30 expires_at" in text
     assert "--expires-minutes" in text
@@ -42,6 +42,11 @@ def main() -> int:
     assert "nginx_quic_restore_backup()" in text
     assert "nginx_effective_config_files()" in text
     assert "wait_for_nginx_udp_release()" in text
+    assert "nginx_full_restart()" in text
+    assert "nginx_restart_for_udp_release()" in text
+    assert "systemctl restart nginx" in text
+    assert "nginx_signal_master" in text
+    assert "完整重启 nginx 后仍未释放 UDP" in text
     assert "正在等待旧 nginx worker 释放 UDP" in text
     assert "nginx_tcp443_active_manifest()" in text
     assert "nginx_tcp443_rebind_manifest()" in text
@@ -100,6 +105,11 @@ def main() -> int:
     assert "--direct-config-file" in text
     assert "tls_certificate_is_usable()" in text
     assert "tls_certificate_matches_name()" in text
+    assert "tls_certificate_sha256()" in text
+    assert "tls_certificate_is_trusted_for_name()" in text
+    assert "pinnedPeerCertSha256" in text
+    assert "valid_certificate_pins()" in text
+    assert "allowInsecure" not in text
     assert "协议、域名、证书、Path 和 443 共用全部在从服务器上选择" in text
     assert "第一次安装：这台是主服务器" in text
     assert "第一次安装：这台是从服务器" in text

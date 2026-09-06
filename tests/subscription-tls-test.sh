@@ -52,8 +52,7 @@ jq -n '{
         client_encryption: "none",
         flow: "",
         security: "none",
-        direct: true,
-        allow_insecure: false
+        direct: true
       }],
       reality_inbounds: []
     },
