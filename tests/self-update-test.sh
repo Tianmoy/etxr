@@ -73,18 +73,18 @@ curl() {
     esac
   done
   [[ -n "$output" ]] || return 2
-  case "$url" in
+    case "$url" in
     https://fixture.invalid/etxr.sh)
-      cp "$FIXTURE/etxr.sh" "$output"
+      cat "$FIXTURE/etxr.sh" >"$output"
       ;;
     https://fixture.invalid/checksums.txt)
-      cp "$FIXTURE/checksums.txt" "$output"
+      cat "$FIXTURE/checksums.txt" >"$output"
       ;;
     https://github.com/Tianmoy/etxr/releases/download/v*/etxr.sh)
-      cp "$FIXTURE/etxr.sh" "$output"
+      cat "$FIXTURE/etxr.sh" >"$output"
       ;;
     https://github.com/Tianmoy/etxr/releases/download/v*/checksums.txt)
-      cp "$FIXTURE/checksums.txt" "$output"
+      cat "$FIXTURE/checksums.txt" >"$output"
       ;;
     *)
       return 22
@@ -110,6 +110,7 @@ test ! -e "$TMP/installed-script-was-executed"
 build_release_fixture 9.8.7 9.8.7
 download_etxr_release_script "$TMP/good"
 test "$(cat "$TMP/good/VERSION")" = 9.8.7
+test -x "$TMP/good/etxr.sh"
 test "$("$TMP/good/etxr.sh")" = 9.8.7
 
 api_fixture="$(jq '(.assets[] | select(.name == "checksums.txt")).digest = null' \

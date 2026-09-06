@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.17.3"
+VERSION="0.17.4"
 ETXR_REPOSITORY="${ETXR_REPOSITORY:-Tianmoy/etxr}"
 ETXR_RELEASE_API="${ETXR_RELEASE_API:-https://api.github.com/repos/${ETXR_REPOSITORY}/releases/latest}"
 
@@ -6550,6 +6550,7 @@ download_etxr_release_script() {
   [[ "$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$destination/etxr.sh")" == "$version" ]] ||
     die "ETXR Release 标签与脚本版本不一致"
   printf '%s\n' "$version" >"$destination/VERSION"
+  chmod 755 "$destination/etxr.sh"
 }
 
 download_etxr_pinned_script() {
