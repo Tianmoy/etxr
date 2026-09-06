@@ -97,6 +97,9 @@ port_is_nginx_owned() {
   return 1
 }
 sleep() { :; }
+# The implementation is imported from etxr.sh above; later test overrides make
+# static analysis associate this first call with a later definition.
+# shellcheck disable=SC2218
 wait_for_nginx_udp_release 443 5
 [[ "$udp_owner_checks" -eq 4 ]]
 
