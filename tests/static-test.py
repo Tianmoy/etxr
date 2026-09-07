@@ -15,7 +15,7 @@ def main() -> int:
     text = SCRIPT.read_text(encoding="utf-8")
     assert text.startswith("#!/usr/bin/env bash\n")
     assert "set -Eeuo pipefail" in text
-    assert 'VERSION="0.17.6"' in text
+    assert 'VERSION="0.17.7"' in text
     assert "etxr_self_update_complete()" in text
     assert 'security=tls&sni=' in text
     assert "local expires_minutes=30 expires_at" in text
@@ -75,7 +75,14 @@ def main() -> int:
     assert "menu_self_update()" in text
     assert "查看配置下发状态" in text
     assert "配置接收 Agent" in text
-    assert "配置下发服务" in text
+    assert "主控连接" in text
+    assert "health_system()" in text
+    assert "listener_address_owned()" in text
+    assert "health_certificate()" in text
+    assert "health_run_proxy_probe()" in text
+    assert "EasyTier 线路" in text
+    assert "订阅服务" in text
+    assert "代理访问 204 正常" in text
     assert "cmd_xray_update()" in text
     assert "cmd_self_update()" in text
     assert "download_etxr_release_script()" in text

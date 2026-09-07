@@ -34,6 +34,7 @@ jobs:
           python3 -m compileall -q tests
           python3 tests/static-test.py
           python3 tests/menu-smoke-test.py
+          bash tests/health-check-test.sh
           tests/xray-checksum-test.sh
           tests/self-update-test.sh
           tests/nginx-quic-test.sh

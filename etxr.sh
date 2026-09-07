@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.17.6"
+VERSION="0.17.7"
 ETXR_REPOSITORY="${ETXR_REPOSITORY:-Tianmoy/etxr}"
 ETXR_RELEASE_API="${ETXR_RELEASE_API:-https://api.github.com/repos/${ETXR_REPOSITORY}/releases/latest}"
 
@@ -9320,7 +9320,7 @@ cmd_client() {
             }
           },
           sockopt: {
-            tcpFastOpen: true,
+            tcpFastOpen: false,
             tcpNoDelay: true
           }
         }
@@ -10659,16 +10659,232 @@ menu_pair_manage() {
 
 health_result() {
   local ok="$1" label="$2" detail="${3:-}"
-  if [[ "$ok" == "1" ]]; then
+  if [[ "$ok" != "1" && "$ok" != "2" ]]; then
+    failures=$(( ${failures:-0} + 1 ))
+  elif [[ "$ok" == "2" ]]; then
+    warnings=$(( ${warnings:-0} + 1 ))
+  fi
+  case "$ok" in
+    1)
     printf '  %s✓%s %-22s %s\n' "$C_GREEN" "$C_RESET" "$label" "$detail"
-  else
+      ;;
+    2)
+      printf '  %s!%s %-22s %s\n' "$C_YELLOW" "$C_RESET" "$label" "$detail"
+      ;;
+    *)
     printf '  %s✗%s %-22s %s\n' "$C_RED" "$C_RESET" "$label" "$detail"
+      ;;
+  esac
+}
+
+health_note() {
+  printf '    - %s\n' "$*"
+}
+
+health_service() {
+  local service="$1" label="$2" optional="${3:-false}"
+  if systemctl is-active --quiet "$service"; then
+    if systemctl is-enabled --quiet "$service"; then
+      health_result 1 "$label" "运行中，已设置自启动"
+    else
+      health_result 2 "$label" "运行中，但未设置自启动"
+    fi
+  elif [[ "$optional" == "true" ]]; then
+    health_result 1 "$label" "未启用（不是故障）"
+  else
+    health_result 0 "$label" "未运行"
   fi
 }
 
+listener_address_owned() {
+  local proto="$1" address="$2" port="$3" owner="$4" line
+  command -v ss >/dev/null 2>&1 || return 1
+  local -a lines=()
+  case "$proto" in
+    tcp) mapfile -t lines < <(ss -H -lntp "sport = :$port" 2>/dev/null) ;;
+    udp) mapfile -t lines < <(ss -H -lnup "sport = :$port" 2>/dev/null) ;;
+    *) return 1 ;;
+  esac
+  for line in "${lines[@]}"; do
+    grep -qF "users:((\"${owner}\"" <<<"$line" || continue
+    [[ "$line" == *"${address}:${port}"* ]] && return 0
+    [[ "$address" == "0.0.0.0" && "$line" == *"*:${port}"* ]] && return 0
+  done
+  return 1
+}
+
+resolved_ipv4_addresses() {
+  local host="$1"
+  if valid_ipv4 "$host"; then
+    printf '%s\n' "$host"
+    return 0
+  fi
+  command -v getent >/dev/null 2>&1 || return 1
+  getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u
+}
+
+local_ipv4_addresses() {
+  command -v ip >/dev/null 2>&1 || return 1
+  ip -4 -o address show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | sort -u
+}
+
+first_local_address_for_host() {
+  local host="$1" candidate local_ip
+  while IFS= read -r candidate; do
+    while IFS= read -r local_ip; do
+      if [[ "$candidate" == "$local_ip" ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    done < <(local_ipv4_addresses)
+  done < <(resolved_ipv4_addresses "$host")
+  return 1
+}
+
+address_is_local() {
+  local host="$1" candidate local_ip
+  while IFS= read -r candidate; do
+    while IFS= read -r local_ip; do
+      [[ "$candidate" == "$local_ip" ]] && return 0
+    done < <(local_ipv4_addresses)
+  done < <(resolved_ipv4_addresses "$host")
+  return 1
+}
+
+tcp_endpoint_reachable() {
+  local host="$1" port="$2" timeout_seconds="${3:-4}" ip
+  ip="$(resolved_ipv4_addresses "$host" | head -n 1)"
+  [[ -n "$ip" ]] || return 1
+  timeout "$timeout_seconds" bash -c 'exec 3<>/dev/tcp/$1/$2' \
+    _ "$ip" "$port" 2>/dev/null
+}
+
+health_certificate() {
+  local cert="$1" key="$2" domain="$3"
+  local cert_pub key_pub end seconds days
+  if [[ ! -f "$cert" || ! -f "$key" ]]; then
+    health_result 0 "TLS 证书" "证书或私钥不存在"
+    return
+  fi
+  if ! command -v openssl >/dev/null 2>&1; then
+    health_result 2 "TLS 证书" "文件存在；缺少 openssl，无法深度检查"
+    return
+  fi
+  cert_pub="$(openssl x509 -in "$cert" -pubkey -noout 2>/dev/null |
+    openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')" || cert_pub=""
+  key_pub="$(openssl pkey -in "$key" -pubout -outform DER 2>/dev/null |
+    sha256sum | awk '{print $1}')" || key_pub=""
+  if [[ -z "$cert_pub" || -z "$key_pub" || "$cert_pub" != "$key_pub" ]]; then
+    health_result 0 "TLS 证书" "证书无法解析，或证书和私钥不匹配"
+    return
+  fi
+  if ! openssl x509 -in "$cert" -noout -checkhost "$domain" >/dev/null 2>&1; then
+    health_result 0 "TLS 证书" "证书域名不包含 $domain"
+    return
+  fi
+  end="$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | cut -d= -f2)"
+  seconds="$(date -d "$end" +%s 2>/dev/null || printf '0')"
+  days=$(( (seconds - $(date +%s)) / 86400 ))
+  if (( days <= 0 )); then
+    health_result 0 "TLS 证书" "已过期"
+  elif (( days <= 14 )); then
+    health_result 2 "TLS 证书" "匹配，剩余 ${days} 天"
+  else
+    health_result 1 "TLS 证书" "匹配，剩余 ${days} 天"
+  fi
+}
+
+health_system() {
+  local disk available total percent load_value cores
+  disk="$(df -P / 2>/dev/null | awk 'NR==2 {gsub("%", "", $5); print $5}')"
+  if [[ "$disk" =~ ^[0-9]+$ ]]; then
+    if (( disk >= 95 )); then
+      health_result 0 "系统磁盘" "根分区已用 ${disk}%"
+    elif (( disk >= 80 )); then
+      health_result 2 "系统磁盘" "根分区已用 ${disk}%"
+    else
+      health_result 1 "系统磁盘" "根分区已用 ${disk}%"
+    fi
+  else
+    health_result 2 "系统磁盘" "无法读取使用率"
+  fi
+  read -r available total _ < <(free -b 2>/dev/null | awk 'NR==2 {print $7, $2}') || true
+  if [[ "$available" =~ ^[0-9]+$ && "$total" =~ ^[0-9]+$ && "$total" -gt 0 ]]; then
+    percent=$(( (available * 100) / total ))
+    if (( percent < 2 )); then
+      health_result 0 "系统内存" "可用 ${percent}%"
+    elif (( percent < 5 )); then
+      health_result 2 "系统内存" "可用 ${percent}%"
+    else
+      health_result 1 "系统内存" "可用 ${percent}%"
+    fi
+  else
+    health_result 2 "系统内存" "无法读取可用率"
+  fi
+  load_value="$(awk '{print $3}' /proc/loadavg 2>/dev/null || true)"
+  cores="$(nproc 2>/dev/null || printf '1')"
+  if [[ "$load_value" =~ ^[0-9.]+$ && "$cores" =~ ^[0-9]+$ ]]; then
+    if awk -v value="$load_value" -v limit="$((cores * 2))" 'BEGIN {exit !(value >= limit)}'; then
+      health_result 2 "系统负载" "15 分钟负载 ${load_value} / ${cores} 核"
+    else
+      health_result 1 "系统负载" "15 分钟负载 ${load_value} / ${cores} 核"
+    fi
+  fi
+}
+
+health_free_local_port() {
+  local port attempt
+  for ((attempt=0; attempt<50; attempt++)); do
+    port=$((20000 + RANDOM % 5000))
+    port_is_listening tcp "$port" || {
+      printf '%s\n' "$port"
+      return 0
+    }
+  done
+  return 1
+}
+
+health_wait_socks_port() {
+  local port="$1" attempt
+  for ((attempt=0; attempt<50; attempt++)); do
+    if timeout 1 bash -c 'exec 3<>/dev/tcp/127.0.0.1/$1' \
+      _ "$port" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+health_run_proxy_probe() {
+  local binary="$1" config="$2" port="$3" test_url="$4"
+  local pid code log
+  log="$(mktemp)"
+  "$binary" run -c "$config" >"$log" 2>&1 &
+  pid=$!
+  if ! health_wait_socks_port "$port"; then
+    HEALTH_LAST_PROXY_CODE=000
+    HEALTH_LAST_PROXY_LOG="$(grep -Ei 'failed|error' "$log" 2>/dev/null | tail -n 1)"
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    rm -f "$log"
+    return 1
+  fi
+  code="$(curl -sS --socks5-hostname "127.0.0.1:${port}" \
+    --connect-timeout 4 --max-time 12 -o /dev/null \
+    -w '%{http_code}' "$test_url" 2>/dev/null || true)"
+  HEALTH_LAST_PROXY_CODE="${code:-000}"
+  HEALTH_LAST_PROXY_LOG="$(grep -Ei 'failed|error' "$log" 2>/dev/null | tail -n 1)"
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  rm -f "$log"
+  [[ "$code" == 204 || "$code" == 200 ]]
+}
 menu_health_check() {
   clear_screen
   printf '%s%s【一键检查】%s\n\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+  printf '检查顺序：本机状态 -> 配置一致性 -> 入口监听 -> 主从线路 -> 订阅 -> 实际代理。\n'
+  printf '代理实测只访问一个 204 测试网址，不会测速、不会产生大流量。\n\n'
   if [[ ! -f "$STATE_FILE" ]]; then
     health_result 0 "基础配置" "尚未安装"
     printf '\n请返回主菜单，选择 1（主服务器）或 2（从服务器）开始安装。\n'
@@ -10676,184 +10892,431 @@ menu_health_check() {
     return
   fi
 
-  local failures=0 xray_config sing_config cert key mode nb role limited_count
-  local health_hy2_port="" health_hy2_shared=false health_hy2_listen="0.0.0.0" listener_ok
-  local health_quic_manifest health_quic_count health_quic_file
-  xray_config="$(jq -r '.xray.config_path' "$STATE_FILE")"
-  sing_config="$(jq -r '.hysteria2.config_path' "$STATE_FILE")"
-  cert="$(jq -r '.nginx.certificate' "$STATE_FILE")"
-  key="$(jq -r '.nginx.certificate_key' "$STATE_FILE")"
-  mode="$(jq -r '.nginx.mode' "$STATE_FILE")"
-  role="$(jq -r '.node.role' "$STATE_FILE")"
-  limited_count="$(jq '[
-    .users[] |
-    select(
-      .enabled == true and
-      (((.speed_limit.up_mbps // 0) > 0) or
-       ((.speed_limit.down_mbps // 0) > 0))
-    )
-  ] | length' "$STATE_FILE")"
+  local failures=0 warnings=0
+  local xray_config sing_config cert key mode role domain address tls_port
+  local limited_count easytier_enabled hy2_enabled
+  local generated_xray now test_url baseline_code
+  local listener_bad=0 listener_count=0 listener_tag listener_listen listener_port
+  local route_json et_bad=0 et_count et_latency
+  local control_bad=0 control_warn=0 desired_version report_version report_status received age
+  local pair_name pair_ip public_host public_port pair_status expires_at
+  local sub_bad=0 sub_name sub_prefix sub_token sub_file sub_code
+  local xhttp_bad=0 xhttp_tested=0 xhttp_route xhttp_user xhttp_user_name xhttp_config xhttp_port
+  local hy2_bad=0 hy2_tested=0 hy2_entry hy2_user hy2_node hy2_config hy2_port
+  local base_url metrics http_code tcp_time tls_time entry_ip
+  local node_name
+  local port_suffix
+  local -a et_rows xhttp_routes hy2_entries
+  local line
+
+  xray_config="$(jq -r '.xray.config_path // ""' "$STATE_FILE")"
+  sing_config="$(jq -r '.hysteria2.config_path // ""' "$STATE_FILE")"
+  cert="$(jq -r '.nginx.certificate // ""' "$STATE_FILE")"
+  key="$(jq -r '.nginx.certificate_key // ""' "$STATE_FILE")"
+  mode="$(jq -r '.nginx.mode // "disabled"' "$STATE_FILE")"
+  role="$(jq -r '.node.role // ""' "$STATE_FILE")"
+  domain="$(jq -r '.node.domain // ""' "$STATE_FILE")"
+  address="$(jq -r '.node.address // ""' "$STATE_FILE")"
+  tls_port="$(jq -r '.nginx.tls_port // 443' "$STATE_FILE")"
+  easytier_enabled="$(jq -r '.easytier.enabled // false' "$STATE_FILE")"
+  hy2_enabled="$(jq -r '.hysteria2.enabled // false' "$STATE_FILE")"
+  generated_xray="${RUNTIME_DIR}/generated/xray.json"
+  now="$(date +%s)"
+  test_url="${ETXR_HEALTH_URL:-http://www.gstatic.com/generate_204}"
 
   if jq -e '.schema_version == 1' "$STATE_FILE" >/dev/null 2>&1; then
-    health_result 1 "基础配置" "正常"
+    health_result 1 "基础配置" "state.json 可解析"
   else
     health_result 0 "基础配置" "state.json 损坏"
-    ((failures+=1))
+    menu_pause
+    return
   fi
-
-  if systemctl is-active --quiet etxr-easytier.service; then
-    health_result 1 "主从组网" "正在运行"
+  if validate_state_semantics >/dev/null 2>&1; then
+    health_result 1 "状态语义" "检查通过"
   else
-    health_result 0 "主从组网" "服务未运行"
-    ((failures+=1))
+    health_result 0 "状态语义" "检查失败；请运行 etxr validate 查看具体字段"
   fi
+  health_system
 
-  if systemctl is-active --quiet etxr-xray.service; then
-    health_result 1 "Xray 核心" "正在运行"
+  if [[ "$address" == "$domain" || -z "$address" ]]; then
+    address="$domain"
+  fi
+  if [[ -n "$address" ]] && address_is_local "$address"; then
+    entry_ip="$(first_local_address_for_host "$address")"
+    health_result 1 "域名解析" "$address -> ${entry_ip:-本机}"
   else
-    health_result 0 "Xray 核心" "服务未运行"
-    ((failures+=1))
+    health_result 0 "域名解析" "$address 没有解析到这台机器"
   fi
 
-  if systemctl is-active --quiet etxr-meter.service; then
-    health_result 1 "用户流量统计" "正在运行"
+  if [[ "$easytier_enabled" == "true" ]]; then
+    health_service etxr-easytier.service "主从组网" false
   else
-    health_result 0 "用户流量统计" "服务未运行"
-    ((failures+=1))
+    health_service etxr-easytier.service "主从组网" true
   fi
-
+  health_service etxr-xray.service "Xray 核心" false
+  health_service etxr-meter.service "用户流量统计" false
   if [[ "$(jq -r '.domain_audit.enabled // false' "$STATE_FILE")" == "true" ]]; then
-    if systemctl is-active --quiet etxr-domain-audit.service &&
-       [[ -S "$DOMAIN_SOCKET" ]]; then
-      health_result 1 "用户访问域名统计" "正在运行"
+    if systemctl is-active --quiet etxr-domain-audit.service && [[ -S "$DOMAIN_SOCKET" ]]; then
+      health_result 1 "域名访问统计" "运行中"
     else
-      health_result 0 "用户访问域名统计" "服务未运行或本机 Socket 不存在"
-      ((failures+=1))
+      health_result 0 "域名访问统计" "服务未运行或本机 Socket 不存在"
     fi
   else
-    health_result 1 "用户访问域名统计" "未启用（不是故障）"
+    health_result 1 "域名访问统计" "未启用（不是故障）"
   fi
 
+  limited_count="$(jq '[.users[] | select(.enabled == true and (((.speed_limit.up_mbps // 0) > 0) or ((.speed_limit.down_mbps // 0) > 0)))] | length' "$STATE_FILE")"
   if (( limited_count > 0 )); then
-    if systemctl is-active --quiet etxr-limiter.service; then
-      health_result 1 "单用户限速" "${limited_count} 个用户已启用"
-    else
-      health_result 0 "单用户限速" "有限速用户，但服务未运行"
-      ((failures+=1))
-    fi
+    health_service etxr-limiter.service "单用户限速" false
   else
-    health_result 1 "单用户限速" "未设置（不是故障）"
+    health_service etxr-limiter.service "单用户限速" true
+  fi
+  if [[ "$hy2_enabled" == "true" ]]; then
+    health_service etxr-sing-box.service "Hysteria2 核心" false
+  else
+    health_service etxr-sing-box.service "Hysteria2 核心" true
   fi
 
-  if [[ "$role" == "exit" ]]; then
-    if [[ "$(jq -r '.control.agent.enabled // false' "$STATE_FILE")" == "true" ]] &&
-       systemctl is-active --quiet etxr-agent.service; then
-      health_result 1 "配置接收 Agent" "WSS 已启动"
+  if [[ -s "$xray_config" ]] && "$XRAY_BIN" run -test -config "$xray_config" >/dev/null 2>&1; then
+    if [[ -f "$generated_xray" ]] && cmp -s "$xray_config" "$generated_xray"; then
+      health_result 1 "Xray 配置" "语法有效，live/generated 一致"
     else
-      health_result 0 "配置接收 Agent" "服务未运行或未配置"
-      ((failures+=1))
+      health_result 0 "Xray 配置" "语法有效，但 live 和 generated 不一致"
     fi
   else
-    if [[ "$(jq -r '.control.enabled // false' "$STATE_FILE")" == "true" ]] &&
-       systemctl is-active --quiet etxr-control.service; then
-      health_result 1 "配置下发服务" "本机 127.0.0.1:$(jq -r '.control.port' "$STATE_FILE")"
-    else
-      health_result 0 "配置下发服务" "服务未运行或未配置"
-      ((failures+=1))
-    fi
+    health_result 0 "Xray 配置" "配置为空或语法检查失败"
   fi
 
-  if [[ -s "$xray_config" ]] &&
-     "$XRAY_BIN" run -test -config "$xray_config" >/dev/null 2>&1; then
-    health_result 1 "Xray 配置" "检查通过"
+  while IFS=$'\t' read -r listener_tag listener_listen listener_port; do
+    [[ -n "$listener_tag" ]] || continue
+    listener_count=$((listener_count + 1))
+    if ! listener_address_owned tcp "$listener_listen" "$listener_port" xray; then
+      listener_bad=$((listener_bad + 1))
+      health_note "Xray 入口 $listener_tag 未监听 ${listener_listen}:${listener_port}"
+    fi
+  done < <(jq -r '
+    [
+      (.xray.routes[]? | {tag: ("path-" + .name), listen: (.listen // "0.0.0.0"), port: .port})
+    ] + [
+      (.xray.reality_inbounds[]? | {tag: ("reality-" + .name), listen: (.listen // "0.0.0.0"), port: (.listen_port // .port)}),
+      (.xray.relay_inbounds[]? | {tag: ("relay-" + .name), listen: (.listen // "0.0.0.0"), port: .port})
+    ] | .[] | [.tag, .listen, (.port | tostring)] | @tsv
+  ' "$STATE_FILE" 2>/dev/null)
+  if (( listener_count > 0 && listener_bad == 0 )); then
+    health_result 1 "Xray 监听" "${listener_count} 个入口全部匹配"
   else
-    health_result 0 "Xray 配置" "配置为空或检查失败"
-    ((failures+=1))
+    health_result 0 "Xray 监听" "${listener_bad}/${listener_count:-0} 个入口不匹配"
   fi
 
-  if [[ "$(jq -r '.hysteria2.enabled' "$STATE_FILE")" == "true" ]]; then
-    health_hy2_port="$(jq -r '.hysteria2.port' "$STATE_FILE")"
-    health_hy2_shared="$(jq -r '.hysteria2.shared_udp443 // false' "$STATE_FILE")"
-    health_hy2_listen="$(jq -r '.hysteria2.listen // "0.0.0.0"' "$STATE_FILE")"
-    listener_ok=1
-    if command -v ss >/dev/null 2>&1; then
-      if ! port_is_sing_box_owned udp "$health_hy2_port" ||
-         ! ss -H -lnup "sport = :$health_hy2_port" 2>/dev/null |
-           grep 'users:(("sing-box"' |
-           grep -Fq "${health_hy2_listen}:$health_hy2_port"; then
-        listener_ok=0
-      elif [[ "$health_hy2_shared" == "true" ]] &&
-           port_is_nginx_owned udp "$health_hy2_port"; then
-        listener_ok=0
-      fi
-    fi
-    if systemctl is-active --quiet etxr-sing-box.service &&
-       [[ -s "$sing_config" ]] &&
+  if [[ "$hy2_enabled" == "true" ]]; then
+    local hy2_listen hy2_port hy2_shared
+    hy2_listen="$(jq -r '.hysteria2.listen // "0.0.0.0"' "$STATE_FILE")"
+    hy2_port="$(jq -r '.hysteria2.port // 8443' "$STATE_FILE")"
+    hy2_shared="$(jq -r '.hysteria2.shared_udp443 // false' "$STATE_FILE")"
+    if [[ -s "$sing_config" ]] &&
        "$SING_BOX_BIN" check -c "$sing_config" >/dev/null 2>&1 &&
-       (( listener_ok )); then
-      health_result 1 "Hysteria2" "正在运行，UDP ${health_hy2_port}"
+       listener_address_owned udp "$hy2_listen" "$hy2_port" sing-box &&
+       ([[ "$hy2_shared" != "true" ]] || ! port_is_nginx_owned udp "$hy2_port"); then
+      health_result 1 "HY2 监听" "UDP ${hy2_listen}:${hy2_port}"
     else
-      health_result 0 "Hysteria2" "服务、配置或 UDP ${health_hy2_port} 监听异常"
-      ((failures+=1))
+      health_result 0 "HY2 监听" "配置或 UDP ${hy2_listen}:${hy2_port} 异常"
     fi
   else
-    health_result 1 "Hysteria2" "未启用（不是故障）"
+    health_result 1 "HY2 监听" "未启用（不是故障）"
   fi
 
   if [[ "$mode" == "disabled" ]]; then
     health_result 1 "nginx/证书" "从服务器无需 nginx"
   else
-    if [[ -f "$cert" && -f "$key" ]]; then
-      health_result 1 "TLS 证书" "文件存在"
+    health_certificate "$cert" "$key" "$domain"
+    local nginx_binary
+    if nginx_binary="$(nginx_bin 2>/dev/null)" && "$nginx_binary" -t >/dev/null 2>&1; then
+      health_result 1 "nginx 配置" "语法检查通过"
     else
-      health_result 0 "TLS 证书" "证书或私钥不存在"
-      ((failures+=1))
+      health_result 0 "nginx 配置" "语法检查失败"
     fi
-    if nb="$(nginx_bin 2>/dev/null)" && "$nb" -t >/dev/null 2>&1; then
-      health_result 1 "nginx 配置" "检查通过"
+    if port_is_nginx_owned tcp "$tls_port"; then
+      health_result 1 "nginx 入口" "TCP ${tls_port} 正在监听"
     else
-      health_result 0 "nginx 配置" "检查失败"
-      ((failures+=1))
+      health_result 0 "nginx 入口" "TCP ${tls_port} 不是 nginx 监听"
+    fi
+    if [[ "$hy2_enabled" == "true" && "$(jq -r '.hysteria2.shared_udp443 // false' "$STATE_FILE")" == "true" ]]; then
+      local quic_manifest
+      quic_manifest="$(mktemp)"
+      nginx_quic_active_manifest "$quic_manifest"
+      if [[ -s "$quic_manifest" ]]; then
+        health_result 0 "nginx H3/QUIC" "仍占用 UDP 443；一键修复会关闭"
+        while IFS= read -r -d '' line; do health_note "$line"; done <"$quic_manifest"
+      else
+        health_result 1 "nginx H3/QUIC" "已关闭，UDP 443 留给 HY2"
+      fi
+      rm -f "$quic_manifest"
+    fi
+  fi
+
+  if [[ "$easytier_enabled" == "true" ]]; then
+    if route_json="$(timeout 5 "$EASYTIER_CLI_BIN" -o json route 2>/dev/null)" &&
+       jq -e 'type == "array"' <<<"$route_json" >/dev/null; then
+      if [[ "$role" == "exit" ]]; then
+        et_count="$(jq '[.[] | select(.next_hop_hostname != "Local")] | length' <<<"$route_json")"
+        et_latency="$(jq '[.[] | select(.next_hop_hostname != "Local") | .path_latency | numbers] | if length > 0 then min else 0 end' <<<"$route_json")"
+        if (( et_count > 0 )); then
+          health_result 1 "EasyTier 线路" "非本机路由 ${et_count} 条，最低延迟 ${et_latency}ms"
+        else
+          health_result 0 "EasyTier 线路" "只有本机路由，未连到主服务器"
+        fi
+      else
+        while IFS=$'\t' read -r pair_name pair_ip; do
+          [[ -n "$pair_name" ]] || continue
+          mapfile -t et_rows < <(jq -r --arg ip "$pair_ip" '.[] | select((.ipv4 | startswith($ip + "/"))) | [.hostname, ((.path_latency // 0) | tostring), (.next_hop_hostname // "-")] | @tsv' <<<"$route_json")
+          if (( ${#et_rows[@]} > 0 )); then
+            IFS=$'\t' read -r _ et_latency _ <<<"${et_rows[0]}"
+            health_note "$pair_name：${pair_ip}，延迟 ${et_latency}ms"
+          else
+            et_bad=$((et_bad + 1))
+            health_note "$pair_name：路由表缺少 ${pair_ip}"
+          fi
+        done < <(jq -r '(.paired_nodes // [])[] | [.name, .easytier_ip] | @tsv' "$STATE_FILE")
+        if (( et_bad == 0 )); then
+          health_result 1 "EasyTier 线路" "所有从服务器路由可见"
+        else
+          health_result 0 "EasyTier 线路" "${et_bad} 台从服务器路由不可见"
+        fi
+      fi
+    else
+      health_result 0 "EasyTier 线路" "无法读取 EasyTier 路由表"
+    fi
+  else
+    health_result 1 "EasyTier 线路" "未启用（不是故障）"
+  fi
+
+  if [[ "$role" == "exit" ]]; then
+    if [[ "$(jq -r '.control.agent.enabled // false' "$STATE_FILE")" == "true" ]] &&
+       systemctl is-active --quiet etxr-agent.service; then
+      base_url="$(jq -r '.control.agent.base_url // ""' "$STATE_FILE")"
+      sub_code="$(curl -4 -sS --noproxy '*' --connect-timeout 4 --max-time 8 -o /dev/null -w '%{http_code}' "${base_url%/}/health" 2>/dev/null || true)"
+      if [[ "$sub_code" == "200" ]]; then
+        health_result 1 "主控连接" "HTTPS /health 正常"
+      else
+        health_result 0 "主控连接" "HTTPS /health 返回 ${sub_code:-无法连接}"
+      fi
+      if [[ -s "$RUNTIME_DIR/control-version" ]]; then
+        health_result 1 "配置下发" "已应用版本 $(cat "$RUNTIME_DIR/control-version" | cut -c1-12)"
+      else
+        health_result 0 "配置下发" "尚未记录已应用版本"
+      fi
+    else
+      health_result 0 "配置接收 Agent" "服务未运行或未配置"
+    fi
+  else
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      pair_name="$(jq -r '.name' <<<"$line")"
+      pair_ip="$(jq -r '.easytier_ip // ""' <<<"$line")"
+      public_host="$(jq -r '.public_host // ""' <<<"$line")"
+      public_port="$(jq -r '.public_port // 0' <<<"$line")"
+      expires_at="$(jq -r '.expires_at // 0' <<<"$line")"
+      if [[ "$public_host" != "" && "$public_port" =~ ^[0-9]+$ ]] &&
+         tcp_endpoint_reachable "$public_host" "$public_port" 4; then
+        health_note "$pair_name：公网中继 ${public_host}:${public_port} 可连接"
+      else
+        control_warn=1
+        health_note "$pair_name：公网中继不可直接连接，将依赖 EasyTier 备用线路"
+      fi
+      if [[ ! -f "$CONTROL_DIR/nodes/${pair_name}.json" ]]; then
+        control_bad=$((control_bad + 1))
+        health_note "$pair_name：缺少目标配置"
+        continue
+      fi
+      desired_version="$(jq -r '.version // ""' "$CONTROL_DIR/nodes/${pair_name}.json")"
+      if [[ ! -f "$CONTROL_DIR/reports/${pair_name}.json" ]]; then
+        pair_status="$(pair_node_status "$pair_name" "$expires_at")"
+        if [[ "$pair_status" == "Pair ID 已过期" ]]; then
+          control_bad=$((control_bad + 1))
+        else
+          control_warn=1
+        fi
+        health_note "$pair_name：$pair_status"
+        continue
+      fi
+      report_version="$(jq -r '.version // ""' "$CONTROL_DIR/reports/${pair_name}.json")"
+      report_status="$(jq -r '.status // ""' "$CONTROL_DIR/reports/${pair_name}.json")"
+      received="$(jq -r '.received_at // 0' "$CONTROL_DIR/reports/${pair_name}.json")"
+      age=$(( now - received ))
+      if [[ "$report_version" != "$desired_version" ]]; then
+        control_bad=$((control_bad + 1))
+        health_note "$pair_name：目标版本和已应用版本不一致"
+      elif [[ "$report_status" != "current" && "$report_status" != "applied" && "$report_status" != "connected" ]]; then
+        control_bad=$((control_bad + 1))
+        health_note "$pair_name：状态 $report_status"
+      elif (( age < 0 || age > 120 )); then
+        control_bad=$((control_bad + 1))
+        health_note "$pair_name：最后回报异常，距今 ${age}s"
+      else
+        health_note "$pair_name：版本一致，${age}s 前回报"
+      fi
+    done < <(jq -c '(.paired_nodes // [])[]' "$STATE_FILE")
+    if (( control_bad > 0 )); then
+      health_result 0 "从服务器状态" "${control_bad} 台异常"
+    elif (( control_warn > 0 )); then
+      health_result 2 "从服务器状态" "主控正常，部分公网备用线路不可直连"
+    else
+      health_result 1 "从服务器状态" "版本、回报和公网线路正常"
+    fi
+  fi
+
+  port_suffix=""
+  [[ "$tls_port" == 443 ]] || port_suffix=":${tls_port}"
+  if [[ "$mode" != "disabled" && -n "$domain" && -n "${entry_ip:-}" ]]; then
+    metrics="$(curl -4 -sS --noproxy '*' --resolve "${domain}:${tls_port}:${entry_ip}" --connect-timeout 4 --max-time 8 -o /dev/null -w '%{http_code} %{time_connect} %{time_appconnect}' "https://${domain}${port_suffix}/" 2>/dev/null || true)"
+    read -r http_code tcp_time tls_time <<<"$metrics"
+    if [[ "$http_code" =~ ^[1-4][0-9][0-9]$ ]]; then
+      health_result 1 "HTTPS 入口" "HTTP ${http_code}，TCP ${tcp_time}s，TLS ${tls_time}s"
+    else
+      health_result 0 "HTTPS 入口" "握手失败，HTTP ${http_code:-000}"
+    fi
+  fi
+
+  if [[ "$role" != "exit" && "$(jq -r '.subscription.enabled // false' "$STATE_FILE")" == "true" ]]; then
+    while IFS=$'\t' read -r sub_name sub_prefix sub_token; do
+      [[ -n "$sub_name" ]] || continue
+      sub_file="$SUBSCRIPTION_DIR/$sub_token"
+      if [[ ! -s "$sub_file" ]]; then
+        sub_bad=$((sub_bad + 1))
+        health_note "$sub_name：订阅文件不存在"
+      fi
+    done < <(jq -r '.users[] | select(.enabled == true and (.expires_at == null or .expires_at == "" or ((.expires_at | fromdateiso8601?) > now))) | [.name, .subscription_prefix, .subscription_token] | @tsv' "$STATE_FILE")
+    IFS=$'\t' read -r sub_name sub_prefix sub_token <<<"$(jq -r '[.users[] | select(.enabled == true and (.expires_at == null or .expires_at == "" or ((.expires_at | fromdateiso8601?) > now)))] | if length > 0 then .[0] | [.name, .subscription_prefix, .subscription_token] | @tsv else "" end' "$STATE_FILE")"
+    if [[ -n "$sub_name" && -n "${entry_ip:-}" ]]; then
+      sub_code="$(curl -4 -sS --noproxy '*' --resolve "${domain}:${tls_port}:${entry_ip}" --connect-timeout 4 --max-time 8 -o /dev/null -w '%{http_code}' "https://${domain}${port_suffix}/${sub_prefix}/${sub_token}" 2>/dev/null || true)"
+      [[ "$sub_code" == "200" ]] || {
+        sub_bad=$((sub_bad + 1))
+        health_note "nginx 读取订阅返回 ${sub_code:-无法连接}；请检查 /var/lib/etxr 目录权限"
+      }
+    fi
+    if (( sub_bad > 0 )); then
+      health_result 0 "订阅服务" "${sub_bad} 个问题"
+    else
+      health_result 1 "订阅服务" "文件和 nginx 读取正常"
+    fi
+  elif [[ "$role" != "exit" ]]; then
+    health_result 2 "订阅服务" "订阅未启用"
+  fi
+
+  baseline_code="$(curl -4 -sS --noproxy '*' --connect-timeout 4 --max-time 8 -o /dev/null -w '%{http_code}' "$test_url" 2>/dev/null || true)"
+  if [[ "$baseline_code" != "200" && "$baseline_code" != "204" ]]; then
+    health_result 2 "代理实测" "基准网址返回 ${baseline_code:-无法连接}，跳过代理测试"
+  else
+    node_name="$(jq -r '.node.name // ""' "$STATE_FILE")"
+    mapfile -t xhttp_routes < <(jq -r '.xray.routes[]?.name // empty' "$STATE_FILE")
+    if (( ${#xhttp_routes[@]} == 0 )); then
+      health_result 2 "XHTTP 实测" "没有可测线路"
+    else
+      for xhttp_route in "${xhttp_routes[@]:0:5}"; do
+        xhttp_user=""
+        while IFS= read -r line; do
+          if jq -e --arg route "$xhttp_route" --arg key "${node_name}/xhttp/${xhttp_route}" '(.routes // ["*"]) as $r | (.enabled_nodes // ["*"]) as $n | (($r | index("*")) != null or ($r | index($route)) != null) and (($n | index("*")) != null or ($n | index($key)) != null)' <<<"$line" >/dev/null; then
+            xhttp_user="$line"
+            break
+          fi
+        done < <(jq -c '.users[] | select(.enabled == true and (.expires_at == null or .expires_at == "" or ((.expires_at | fromdateiso8601?) > now)))' "$STATE_FILE")
+        [[ -n "$xhttp_user" ]] || continue
+        xhttp_user_name="$(jq -r '.name' <<<"$xhttp_user")"
+        xhttp_port="$(health_free_local_port)" || continue
+        xhttp_config="$(mktemp "${TMPDIR:-/tmp}/etxr-health-xhttp.XXXXXX.json")"
+        if cmd_client "$xhttp_user_name" --route "$xhttp_route" --socks-port "$xhttp_port" --out "$xhttp_config" >/dev/null 2>&1 &&
+           health_run_proxy_probe "$XRAY_BIN" "$xhttp_config" "$xhttp_port" "$test_url"; then
+          health_note "$xhttp_route：代理访问 204 正常"
+        else
+          xhttp_bad=$((xhttp_bad + 1))
+          health_note "$xhttp_route：代理访问失败（HTTP ${HEALTH_LAST_PROXY_CODE:-000}；${HEALTH_LAST_PROXY_LOG:-无日志}）"
+        fi
+        rm -f "$xhttp_config"
+        xhttp_tested=$((xhttp_tested + 1))
+      done
+      if (( xhttp_tested == 0 )); then
+        health_result 2 "XHTTP 实测" "没有未过期且被授权的用户"
+      elif (( xhttp_bad > 0 )); then
+        if [[ "$role" == "exit" ]]; then
+          health_result 2 "XHTTP 实测" "本机回环自测失败；主服务器实测正常时可忽略"
+        else
+          health_result 0 "XHTTP 实测" "${xhttp_bad}/${xhttp_tested} 条线路失败"
+        fi
+      else
+        health_result 1 "XHTTP 实测" "${xhttp_tested} 条线路全部可用"
+      fi
     fi
 
-    if [[ "$health_hy2_shared" == "true" ]]; then
-      health_quic_manifest="$(mktemp)"
-      nginx_quic_active_manifest "$health_quic_manifest"
-      if [[ -s "$health_quic_manifest" ]]; then
-        health_quic_count=0
-        health_result 0 "nginx H3/QUIC" "发现仍启用的配置；一键修复会自动关闭"
-        while IFS= read -r -d '' health_quic_file; do
-          health_quic_count=$((health_quic_count + 1))
-          printf '    - %s\n' "$health_quic_file"
-        done <"$health_quic_manifest"
-        printf '    共发现 %s 个配置文件。\n' "$health_quic_count"
-        ((failures+=1))
+    if [[ "$role" == "exit" ]]; then
+      hy2_entries=()
+      while IFS= read -r hy2_entry; do hy2_entries+=("$hy2_entry"); done < <(subscription_entry_from_state)
+    else
+      hy2_entries=()
+      while IFS= read -r hy2_entry; do hy2_entries+=("$hy2_entry"); done < <({ subscription_entry_from_state; subscription_worker_entries; })
+    fi
+    hy2_tested=0
+    hy2_bad=0
+    for hy2_entry in "${hy2_entries[@]}"; do
+      [[ "$(jq -r '.hysteria2.enabled // false' <<<"$hy2_entry")" == "true" ]] || continue
+      (( hy2_tested < 5 )) || break
+      hy2_node="$(jq -r '.node.name' <<<"$hy2_entry")"
+      hy2_user=""
+      while IFS= read -r line; do
+        if jq -e --arg key "${hy2_node}/hy2" '(.enabled_nodes // ["*"]) as $nodes | ($nodes | index("*")) != null or ($nodes | index($key)) != null' <<<"$line" >/dev/null; then
+          hy2_user="$line"
+          break
+        fi
+      done < <(jq -c '.users[] | select(.enabled == true and (.hy2_password // "") != "" and (.expires_at == null or .expires_at == "" or ((.expires_at | fromdateiso8601?) > now)))' "$STATE_FILE")
+      [[ -n "$hy2_user" ]] || continue
+      hy2_port="$(health_free_local_port)" || continue
+      hy2_config="$(mktemp)"
+      jq -n --argjson entry "$hy2_entry" --argjson user "$hy2_user" --argjson socks_port "$hy2_port" '
+        {
+          log: {level: "error"},
+          inbounds: [{type: "socks", tag: "test-in", listen: "127.0.0.1", listen_port: $socks_port}],
+          outbounds: [{
+            type: "hysteria2",
+            tag: "hy2-test",
+            server: $entry.node.address,
+            server_port: $entry.hysteria2.port,
+            password: $user.hy2_password,
+            tls: {enabled: true, server_name: $entry.node.domain, insecure: ($entry.hysteria2.insecure // false)},
+          } + (if ($entry.hysteria2.obfs // "none") == "none" then {} else {obfs: {type: $entry.hysteria2.obfs, password: $entry.hysteria2.obfs_password}} end)]
+        }' >"$hy2_config"
+      if health_run_proxy_probe "$SING_BOX_BIN" "$hy2_config" "$hy2_port" "$test_url"; then
+        health_note "$hy2_node HY2：代理访问 204 正常"
       else
-        health_result 1 "nginx H3/QUIC" "已关闭（HY2 共用 UDP 443）"
+        hy2_bad=$((hy2_bad + 1))
+        health_note "$hy2_node HY2：代理访问失败"
       fi
-      rm -f "$health_quic_manifest"
+      rm -f "$hy2_config"
+      hy2_tested=$((hy2_tested + 1))
+    done
+    if (( hy2_tested == 0 )); then
+      health_result 2 "HY2 实测" "没有已启用的 HY2 入口"
+    elif (( hy2_bad > 0 )); then
+      health_result 0 "HY2 实测" "${hy2_bad}/${hy2_tested} 个入口失败"
+    else
+      health_result 1 "HY2 实测" "${hy2_tested} 个入口全部可用"
     fi
   fi
 
   printf '\n'
-  if (( failures == 0 )); then
-    printf '%s✓ 所有关键项目都正常，可以直接使用。%s\n' "$C_GREEN" "$C_RESET"
+  if (( failures == 0 && warnings == 0 )); then
+    printf '%s✓ 全部检查通过。%s\n' "$C_GREEN" "$C_RESET"
+  elif (( failures == 0 )); then
+    printf '%s✓ 关键项目正常；发现 %s 个提醒。%s\n' "$C_GREEN" "$warnings" "$C_RESET"
   else
-    printf '%s发现 %s 个问题。%s\n' "$C_RED" "$failures" "$C_RESET"
+    printf '%s发现 %s 个故障、%s 个提醒。%s\n' "$C_RED" "$failures" "$warnings" "$C_RESET"
     if menu_confirm "是否立即尝试重新生成配置并启动服务"; then
       menu_apply_prompt || true
     else
-      printf '可进入“高级设置 → 查看日志”了解详细原因。\n'
+      printf '可进入“高级设置 → 查看日志”，或把上面的红字内容发给我继续排查。\n'
     fi
   fi
-
-  if [[ -x "$EASYTIER_CLI_BIN" ]]; then
-    printf '\n当前主从连接：\n'
-    "$EASYTIER_CLI_BIN" peer 2>/dev/null || true
-  fi
+  printf '\n说明：代理实测是从这台服务器发起的，能证明服务端线路可用；客户端本地网络问题仍需用客户端实测。\n'
   menu_pause
 }
-
 menu_quick_subscription() {
   if [[ ! -f "$STATE_FILE" ]]; then
     warn "这台机器还没有安装"
