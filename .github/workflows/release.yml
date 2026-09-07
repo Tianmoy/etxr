@@ -47,6 +47,7 @@ jobs:
           tests/self-update-test.sh
           tests/nginx-quic-test.sh
           bash tests/subscription-tls-test.sh
+          python3 tests/control-agent-tls-test.py
           bash tests/migration-test.sh
           bash tests/ufw-test.sh
           python3 tests/control-e2e-test.py

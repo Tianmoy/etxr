@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.17.7"
+VERSION="0.17.8"
 ETXR_REPOSITORY="${ETXR_REPOSITORY:-Tianmoy/etxr}"
 ETXR_RELEASE_API="${ETXR_RELEASE_API:-https://api.github.com/repos/${ETXR_REPOSITORY}/releases/latest}"
 
@@ -5259,7 +5259,7 @@ class Agent:
             "nginx": {
                 "tls_port": nginx.get("tls_port", 443),
                 "pinned_peer_cert_sha256": self.public_tls_pin(
-                    nginx, hysteria2
+                    nginx, node.get("domain", "")
                 ),
             },
             "xray": {
@@ -5276,12 +5276,15 @@ class Agent:
         }
 
     @staticmethod
-    def public_tls_pin(nginx, hysteria2):
+    def public_tls_pin(nginx, domain):
         configured = str(nginx.get("pinned_peer_cert_sha256", ""))
-        if not configured and not hysteria2.get("insecure", False):
+        certificate = nginx.get("certificate", "")
+        if certificate and Agent.certificate_is_trusted_for_name(
+            certificate, domain
+        ):
             return ""
         try:
-            content = Path(nginx.get("certificate", "")).read_bytes()
+            content = Path(certificate).read_bytes()
             begin = content.index(b"-----BEGIN CERTIFICATE-----")
             end = content.index(b"-----END CERTIFICATE-----", begin)
             certificate_base64 = content[
@@ -5293,6 +5296,47 @@ class Agent:
             return hashlib.sha256(certificate).hexdigest()
         except (OSError, ValueError, TypeError, binascii.Error):
             return configured
+
+    @staticmethod
+    def certificate_is_trusted_for_name(cert_path, name):
+        try:
+            content = Path(cert_path).read_text(encoding="ascii")
+        except (OSError, UnicodeError):
+            return False
+        blocks = content.split("-----BEGIN CERTIFICATE-----")
+        if len(blocks) < 2:
+            return False
+        leaf = "-----BEGIN CERTIFICATE-----" + blocks[1]
+        chain = "".join(
+            "-----BEGIN CERTIFICATE-----" + block
+            for block in blocks[2:]
+        )
+        with tempfile.TemporaryDirectory(prefix="etxr-verify-") as directory:
+            leaf_path = Path(directory) / "leaf.pem"
+            chain_path = Path(directory) / "chain.pem"
+            leaf_path.write_text(leaf, encoding="ascii")
+            chain_path.write_text(chain, encoding="ascii")
+            command = [
+                "openssl", "verify", "-purpose", "sslserver",
+                "-CAfile", os.environ.get(
+                    "SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt"
+                ),
+            ]
+            if chain:
+                command.extend(["-untrusted", str(chain_path)])
+            command.append("-verify_ip" if name.count(".") == 3 and
+                           name.replace(".", "").isdigit() else
+                           "-verify_hostname")
+            command.append(name)
+            command.append(str(leaf_path))
+            try:
+                result = subprocess.run(
+                    command, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, timeout=5, check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                return False
+            return result.returncode == 0
 
     @staticmethod
     def validate_base_url(value):

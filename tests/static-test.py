@@ -15,7 +15,7 @@ def main() -> int:
     text = SCRIPT.read_text(encoding="utf-8")
     assert text.startswith("#!/usr/bin/env bash\n")
     assert "set -Eeuo pipefail" in text
-    assert 'VERSION="0.17.7"' in text
+    assert 'VERSION="0.17.8"' in text
     assert "etxr_self_update_complete()" in text
     assert 'security=tls&sni=' in text
     assert "local expires_minutes=30 expires_at" in text
@@ -122,6 +122,7 @@ def main() -> int:
     assert "tls_certificate_matches_name()" in text
     assert "tls_certificate_sha256()" in text
     assert "tls_certificate_is_trusted_for_name()" in text
+    assert "Agent.certificate_is_trusted_for_name(" in text
     assert "pinnedPeerCertSha256" in text
     assert "valid_certificate_pins()" in text
     assert "allowInsecure" not in text
