@@ -11101,7 +11101,7 @@ menu_health_check() {
         health_result 0 "主控连接" "HTTPS /health 返回 ${sub_code:-无法连接}"
       fi
       if [[ -s "$RUNTIME_DIR/control-version" ]]; then
-        health_result 1 "配置下发" "已应用版本 $(cat "$RUNTIME_DIR/control-version" | cut -c1-12)"
+        health_result 1 "配置下发" "已应用版本 $(cut -c1-12 "$RUNTIME_DIR/control-version")"
       else
         health_result 0 "配置下发" "尚未记录已应用版本"
       fi
