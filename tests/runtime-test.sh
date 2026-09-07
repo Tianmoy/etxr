@@ -171,7 +171,8 @@ fi
   --uuid 33333333-3333-4333-8333-333333333333 \
   --nodes hk/xhttp/hk >/dev/null
 "$EDGE" hy2 enable --port 8443 --up-mbps 30 --down-mbps 200 \
-  --obfs salamander --obfs-password OBFSPASS >/dev/null
+  --obfs salamander --obfs-password OBFSPASS \
+  --listen-address 127.0.0.1 >/dev/null
 
 "$EDGE" render
 "$JQ" -e '.outbounds[] | select(.tag == "exit-tw") |
@@ -896,6 +897,7 @@ cat >"$LOCAL_DIRECT" <<'EOF'
 {
   "domain": "worker.example.com",
   "address": "worker.example.com",
+  "relay": {"listen_address": "127.0.0.1"},
   "nginx": {
     "mode": "standalone",
     "tls_port": 443,
@@ -911,7 +913,8 @@ cat >"$LOCAL_DIRECT" <<'EOF'
     "public_port": 443,
     "listen_port": 18000,
     "path": "/worker-local-xhttp",
-    "behind_nginx": true
+    "behind_nginx": true,
+    "listen_address": "127.0.0.1"
   },
   "reality": {
     "enabled": true,
@@ -920,7 +923,8 @@ cat >"$LOCAL_DIRECT" <<'EOF'
     "path": "/worker-local-reality",
     "target": "aod.itunes.apple.com:443",
     "server_name": "aod.itunes.apple.com",
-    "short_id": "0123456789abcdef"
+    "short_id": "0123456789abcdef",
+    "listen_address": "127.0.0.1"
   },
   "hysteria2": {
     "enabled": true,
@@ -929,7 +933,8 @@ cat >"$LOCAL_DIRECT" <<'EOF'
     "obfs_password": "LOCAL-HY2-OBFS",
     "masquerade": "https://worker.example.com",
     "up_mbps": 0,
-    "down_mbps": 0
+    "down_mbps": 0,
+    "listen_address": "127.0.0.1"
   }
 }
 EOF
@@ -965,8 +970,13 @@ local_pin="$(openssl x509 -in "$LOCAL_WORKER/certs/b1/fullchain.pem" -outform DE
     .path == "/worker-local-reality"
   )) and
   .hysteria2.port == 443 and
+  .hysteria2.listen == "127.0.0.1" and
   .hysteria2.shared_udp443 == true and
   .hysteria2.insecure == true
+  and
+  (.xray.relay_inbounds[] | select(
+    .name == "b1-public" and .listen == "127.0.0.1"
+  ))
 ' --arg pin "$local_pin" "$LOCAL_WORKER/state.json" >/dev/null
 PAIR_REALITY_PUBLIC="$("$EDGE" pair decode "$PAIR_ID" |
   "$JQ" -r '.direct.reality.public_key')"
@@ -981,6 +991,9 @@ grep -Fq 'server 127.0.0.1:18443;' \
 grep -Fq 'stream {' "$LOCAL_WORKER/generated/nginx-stream-loader.conf"
 grep -Fq 'proxy_pass http://127.0.0.1:18000;' \
   "$LOCAL_WORKER/generated/nginx-paths.conf"
+"$JQ" -e '.inbounds[] | select(
+  .type == "hysteria2" and .listen == "127.0.0.1" and .listen_port == 443
+)' "$LOCAL_WORKER/generated/sing-box.json" >/dev/null
 openssl x509 -in "$LOCAL_WORKER/certs/b1/fullchain.pem" -noout \
   -checkhost worker.example.com >/dev/null
 grep -Fq '订阅由主服务器统一生成' "$TMP/local-worker-join.txt"

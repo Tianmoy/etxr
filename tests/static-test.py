@@ -15,7 +15,7 @@ def main() -> int:
     text = SCRIPT.read_text(encoding="utf-8")
     assert text.startswith("#!/usr/bin/env bash\n")
     assert "set -Eeuo pipefail" in text
-    assert 'VERSION="0.17.5"' in text
+    assert 'VERSION="0.17.6"' in text
     assert "etxr_self_update_complete()" in text
     assert 'security=tls&sni=' in text
     assert "local expires_minutes=30 expires_at" in text
@@ -90,6 +90,13 @@ def main() -> int:
     assert "sing-box release 没有可用的 SHA256 摘要" in text
     assert "prompt_port_checked()" in text
     assert "prompt_worker_direct_config()" in text
+    assert "public_ipv4_candidates()" in text
+    assert "prompt_domain_or_public_ip_value()" in text
+    assert "prompt_inbound_listen_address()" in text
+    assert "prompt_public_entry_config()" in text
+    assert "ipv4_subnet24()" in text
+    assert "local_ipv4_for_address()" in text
+    assert "--listen-address" in text
     assert "prompt_protocol_selection()" in text
     assert "prompt_user_node_selection()" in text
     assert "设置用户可用节点" in text

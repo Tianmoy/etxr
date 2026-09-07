@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.17.5"
+VERSION="0.17.6"
 ETXR_REPOSITORY="${ETXR_REPOSITORY:-Tianmoy/etxr}"
 ETXR_RELEASE_API="${ETXR_RELEASE_API:-https://api.github.com/repos/${ETXR_REPOSITORY}/releases/latest}"
 
@@ -652,13 +652,16 @@ confirm_hy2_udp443_share() {
 }
 
 verify_hy2_udp_listener() {
-  local port="$1" shared="$2" attempt
+  local port="$1" shared="$2" listen_address="${3:-0.0.0.0}" attempt line
   command -v ss >/dev/null 2>&1 || {
     warn "没有 ss 命令，跳过 Hysteria2 UDP 监听验证"
     return 0
   }
   for ((attempt=1; attempt<=20; attempt++)); do
-    if port_is_listening udp "$port"; then
+    if line="$(ss -H -lnup "sport = :$port" 2>/dev/null |
+      grep 'users:(("sing-box"' |
+      grep -F "$listen_address:$port" | head -n 1)" &&
+      [[ -n "$line" ]]; then
       if [[ "$shared" == "true" ]] && port_is_nginx_owned udp "$port"; then
         warn "UDP $port 仍由 nginx 占用"
         return 1
@@ -1005,6 +1008,7 @@ valid_name() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; }
 valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( "$1" >= 1 && "$1" <= 65535 )); }
 valid_ipv4() {
   local value="$1" octet
+  local IFS=.
   local -a octets
   [[ "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
   IFS='.' read -r -a octets <<<"$value"
@@ -2129,7 +2133,7 @@ EOF
   fi
   listen_port="${listen_port:-$port}"
   valid_port "$listen_port" || die "Invalid Reality listen port"
-  [[ "$listen_address" == "0.0.0.0" || "$listen_address" == "127.0.0.1" ]] ||
+  valid_inbound_listen_address "$listen_address" ||
     die "Invalid Reality listen address"
   path="$(normalize_path "$path")"
   valid_http_path "$path" || die "Path may contain only letters, digits, /, ., _, ~, and -"
@@ -2179,7 +2183,7 @@ cmd_reality() {
 
 cmd_hy2_enable() {
   local port=8443 up=0 down=0 obfs="salamander" obfs_password="" masquerade=""
-  local cert="" key="" shared_udp443=false share_flag_seen=0
+  local cert="" key="" shared_udp443=false share_flag_seen=0 listen_address=""
   while (($#)); do
     case "$1" in
       --port) port="$2"; shift 2 ;;
@@ -2192,6 +2196,7 @@ cmd_hy2_enable() {
       --masquerade) masquerade="$2"; shift 2 ;;
       --cert) cert="$2"; shift 2 ;;
       --key) key="$2"; shift 2 ;;
+      --listen-address) listen_address="$2"; shift 2 ;;
       --help)
         cat <<'EOF'
 Usage:
@@ -2201,6 +2206,9 @@ Usage:
 
 --share-udp443 means Hysteria2 uses UDP 443 while HTTPS keeps TCP 443.
 During apply, ETXR backs up and disables nginx QUIC/HTTP3 automatically.
+
+Use --listen-address to bind one local IPv4 when this machine has several
+public IPs and their inbound/outbound paths differ.
 EOF
         return ;;
       *) die "Unknown hy2 option: $1" ;;
@@ -2208,6 +2216,11 @@ EOF
   done
   require_state
   valid_port "$port" || die "Invalid Hysteria2 port"
+  if [[ -z "$listen_address" ]]; then
+    listen_address="$(jq -r '.hysteria2.listen // "0.0.0.0"' "$STATE_FILE")"
+  fi
+  valid_inbound_listen_address "$listen_address" ||
+    die "Invalid Hysteria2 listen address: $listen_address"
   [[ "$shared_udp443" == "true" || "$shared_udp443" == "false" ]] ||
     die "Invalid Hysteria2 UDP 443 sharing flag"
   if [[ "$shared_udp443" == "true" && "$port" != "443" ]]; then
@@ -2234,6 +2247,7 @@ EOF
   key="${key:-$(jq -r '.nginx.certificate_key' "$STATE_FILE")}"
   state_update \
     '.hysteria2.enabled = true |
+     .hysteria2.listen = $listen |
      .hysteria2.port = $port |
      .hysteria2.shared_udp443 = $shared_udp443 |
      .hysteria2.up_mbps = $up |
@@ -2244,11 +2258,12 @@ EOF
      .hysteria2.certificate = $cert |
      .hysteria2.certificate_key = $key' \
     --argjson port "$port" --argjson shared_udp443 "$shared_udp443" \
+    --arg listen "$listen_address" \
     --argjson up "$up" --argjson down "$down" \
     --arg obfs "$obfs" --arg password "$obfs_password" \
     --arg masquerade "$masquerade" --arg cert "$cert" --arg key "$key"
   ensure_hy2_passwords_for_node "$(jq -r '.node.name' "$STATE_FILE")"
-  log "Enabled Hysteria2 on UDP $port (shared UDP 443: $shared_udp443)"
+  log "Enabled Hysteria2 on UDP ${listen_address}:${port} (shared UDP 443: $shared_udp443)"
   [[ -z "$obfs_password" ]] || printf 'Hysteria2 obfs password: %s\n' "$obfs_password"
 }
 
@@ -4286,7 +4301,7 @@ migration_prepare_state() {
   local source="$1" destination="$2" domain="$3" address="$4"
   local mode="$5" cert="$6" key="$7"
   local snippet="" stream_path="" stream_loader="" auto_rebind=false
-  local saved_state migration_pin=""
+  local saved_state migration_pin="" migration_listen=""
   need_jq
   valid_hostname "$domain" || die "迁移后的入口域名无效"
   valid_hostname "$address" || die "迁移后的客户端连接地址无效"
@@ -4315,12 +4330,15 @@ migration_prepare_state() {
     migration_pin="$(tls_certificate_sha256 "$cert")" ||
       die "无法计算迁移后的 TLS 证书 SHA256 指纹"
   fi
+  migration_listen="$(local_ipv4_for_address "$address")"
+  migration_listen="${migration_listen:-0.0.0.0}"
 
   jq --arg domain "$domain" --arg address "$address" \
     --arg mode "$mode" --arg cert "$cert" --arg key "$key" \
     --arg snippet "$snippet" --arg stream "$stream_path" \
     --arg stream_loader "$stream_loader" \
     --arg migration_pin "$migration_pin" \
+    --arg migration_listen "$migration_listen" \
     --arg xray_config "${RUNTIME_DIR}/live/xray.json" \
     --arg sing_config "${RUNTIME_DIR}/live/sing-box.json" \
     --arg paths "${RUNTIME_DIR}/live/nginx-paths.conf" \
@@ -4337,6 +4355,7 @@ migration_prepare_state() {
     .nginx.stream_loader_path = $stream_loader |
     .nginx.auto_rebind_https = $auto_rebind |
     .nginx.pinned_peer_cert_sha256 = $migration_pin |
+    .hysteria2.listen = $migration_listen |
     .nginx.web_root = "/var/www/etxr" |
     del(.nginx.binary) |
     .xray.config_path = $xray_config |
@@ -4344,6 +4363,15 @@ migration_prepare_state() {
       if (.security // "none") == "tls" then
         .certificate = $cert | .certificate_key = $key
       else . end
+    ) |
+    .xray.routes |= map(
+      if .listen == "127.0.0.1" then . else .listen = $migration_listen end
+    ) |
+    .xray.reality_inbounds |= map(
+      if .listen == "127.0.0.1" then . else .listen = $migration_listen end
+    ) |
+    .xray.relay_inbounds |= map(
+      if .listen == "0.0.0.0" then .listen = $migration_listen else . end
     ) |
     .hysteria2.config_path = $sing_config |
     .hysteria2.certificate = $cert |
@@ -4686,8 +4714,8 @@ EOF
   if [[ -t 0 ]]; then
     printf '\n%s【新服务器入口信息】%s\n' "$C_BOLD" "$C_RESET"
     domain="$(prompt_hostname_value '迁移后使用的入口域名' "${domain:-$old_domain}")"
-    address="$(prompt_hostname_value '客户端连接地址（通常与入口域名相同）' \
-      "${address:-${domain:-$old_address}}")"
+    address="$(prompt_domain_or_public_ip_value \
+      '客户端连接地址（0 保持域名，也可选择公网 IP）' "${address:-${domain:-$old_address}}")"
   else
     domain="${domain:-$old_domain}"
     address="${address:-$domain}"
@@ -6338,7 +6366,8 @@ cmd_apply() {
         { rollback_apply; die "sing-box 服务启动失败"; }
       systemctl restart etxr-sing-box.service ||
         { rollback_apply; die "sing-box 服务重启失败"; }
-      verify_hy2_udp_listener "$hy2_port" "$hy2_shared_udp443" ||
+      verify_hy2_udp_listener "$hy2_port" "$hy2_shared_udp443" \
+        "$(jq -r '.hysteria2.listen // "0.0.0.0"' "$STATE_FILE")" ||
         { rollback_apply; die "Hysteria2 UDP 监听验证失败"; }
     else
       systemctl disable --now etxr-sing-box.service 2>/dev/null || true
@@ -7917,18 +7946,302 @@ detect_public_ipv4() {
   printf '%s' "$ip"
 }
 
+is_public_ipv4() {
+  local value="$1" first second
+  local IFS=.
+  valid_ipv4 "$value" || return 1
+  IFS=. read -r first second _ <<<"$value"
+  [[ "$first" != 0 && "$first" != 10 && "$first" != 127 &&
+     "$first" -lt 224 ]] || return 1
+  if [[ "$first" == 172 ]]; then
+    (( second >= 16 && second <= 31 )) && return 1
+  elif [[ "$first" == 192 && "$second" == 168 ]]; then
+    return 1
+  elif [[ "$first" == 169 && "$second" == 254 ]]; then
+    return 1
+  elif [[ "$first" == 100 ]]; then
+    (( second >= 64 && second <= 127 )) && return 1
+  fi
+  return 0
+}
+
+ipv4_subnet24() {
+  local value="$1" first second third
+  local IFS=.
+  read -r first second third _ <<<"$value"
+  printf '%s.%s.%s.0/24' "$first" "$second" "$third"
+}
+
+default_route_interface() {
+  command -v ip >/dev/null 2>&1 || return 1
+  ip route show default 2>/dev/null |
+    awk '{
+      for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }
+    }'
+}
+
+default_route_source_ipv4() {
+  local line
+  command -v ip >/dev/null 2>&1 || return 1
+  line="$(ip route get 1.1.1.1 2>/dev/null | head -n 1)"
+  [[ "$line" =~ src[[:space:]]+([0-9]{1,3}(\.[0-9]{1,3}){3}) ]] ||
+    return 1
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+public_ipv4_candidates() {
+  local interface="${ETXR_PUBLIC_INTERFACE:-}" candidate address source_subnet=""
+  local -a result=()
+  local -a addresses=()
+  [[ -n "$interface" ]] || interface="$(default_route_interface)"
+  [[ -n "$interface" ]] || return 0
+  address="$(default_route_source_ipv4 || true)"
+  [[ -z "$address" ]] || source_subnet="$(ipv4_subnet24 "$address")"
+
+  while IFS= read -r address; do
+    [[ -n "$address" ]] || continue
+    addresses+=("$address")
+  done < <(
+    {
+      default_route_source_ipv4
+      ip -4 -o addr show dev "$interface" scope global 2>/dev/null |
+        awk '{print $4}' | cut -d/ -f1
+    }
+  )
+
+  for address in "${addresses[@]}"; do
+    is_public_ipv4 "$address" || continue
+    if [[ -n "$source_subnet" ]] &&
+       [[ "$(ipv4_subnet24 "$address")" != "$source_subnet" ]]; then
+      continue
+    fi
+    for candidate in "${result[@]}"; do
+      [[ "$address" != "$candidate" ]] || continue 2
+    done
+    result+=("$address")
+  done
+  ((${#result[@]} == 0)) || printf '%s\n' "${result[@]}"
+}
+
+is_local_ipv4() {
+  local address="$1"
+  command -v ip >/dev/null 2>&1 || return 1
+  ip -4 -o addr show scope global 2>/dev/null |
+    awk '{print $4}' | cut -d/ -f1 | grep -Fxq -- "$address"
+}
+
+valid_inbound_listen_address() {
+  [[ "$1" == "0.0.0.0" || "$1" == "127.0.0.1" ]] && return 0
+  valid_ipv4 "$1" && is_local_ipv4 "$1"
+}
+
+local_ipv4_for_address() {
+  local address="$1" candidate resolved
+  if valid_ipv4 "$address" && is_local_ipv4 "$address"; then
+    printf '%s' "$address"
+    return 0
+  fi
+  resolved="$(resolve_ipv4_cidr "$address" 2>/dev/null || true)"
+  resolved="${resolved%/*}"
+  while IFS= read -r candidate; do
+    [[ "$candidate" == "$resolved" ]] || continue
+    printf '%s' "$candidate"
+    return 0
+  done < <(public_ipv4_candidates)
+  default_route_source_ipv4
+}
+
+prompt_domain_or_public_ip_value() {
+  local label="$1" domain="$2" answer index
+  local -a candidates=()
+  while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] || continue
+    candidates+=("$candidate")
+  done < <(public_ipv4_candidates)
+
+  if ((${#candidates[@]} <= 1)); then
+    prompt_hostname_value "$label" "$domain"
+    return
+  fi
+
+  printf '\n%s检测到多个同网段公网 IPv4，可选择域名或指定 IP。%s\n' \
+    "$C_BOLD" "$C_RESET" >&2
+  printf '  0. %s（继续使用域名，直接回车）\n' "$domain" >&2
+  for ((index = 1; index <= ${#candidates[@]}; index++)); do
+    printf '  %s. %s\n' "$index" "${candidates[$((index - 1))]}" >&2
+  done
+  while true; do
+    read -r -p "$label [0-${#candidates[@]}]: " answer
+    answer="${answer:-0}"
+    if [[ "$answer" =~ ^[0-9]+$ ]] &&
+       (( answer >= 0 && answer <= ${#candidates[@]} )); then
+      if (( answer == 0 )); then
+        printf '%s' "$domain"
+      else
+        printf '%s' "${candidates[$((answer - 1))]}"
+      fi
+      return
+    fi
+    if valid_hostname "$answer"; then
+      printf '%s' "$answer"
+      return
+    fi
+    warn "请输入 0 到 ${#candidates[@]} 之间的编号，或输入域名/IP"
+  done
+}
+
+prompt_inbound_listen_address() {
+  local label="$1" default="${2:-0.0.0.0}" answer index default_index=0
+  local -a candidates=()
+  while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] || continue
+    candidates+=("$candidate")
+  done < <(public_ipv4_candidates)
+
+  if ((${#candidates[@]} == 0)); then
+    printf '%s' "$default"
+    return
+  fi
+
+  printf '\n%s检测到多个公网 IPv4。指定其中一个可固定“该 IP 入、该 IP 出”。%s\n' \
+    "$C_BOLD" "$C_RESET" >&2
+  printf '  0. 0.0.0.0（全部 IPv4，回程地址由系统选择）\n' >&2
+  for ((index = 1; index <= ${#candidates[@]}; index++)); do
+    printf '  %s. %s%s\n' "$index" "${candidates[$((index - 1))]}" \
+      "$([[ "${candidates[$((index - 1))]}" == "$default" ]] && printf '（直接回车）')"
+  done >&2
+  for ((index = 1; index <= ${#candidates[@]}; index++)); do
+    [[ "${candidates[$((index - 1))]}" != "$default" ]] || default_index=$index
+  done
+  [[ "$default" != "0.0.0.0" ]] || default_index=0
+  while true; do
+    read -r -p "$label [${default_index}]: " answer
+    answer="${answer:-$default_index}"
+    if [[ "$answer" =~ ^[0-9]+$ ]] &&
+       (( answer >= 0 && answer <= ${#candidates[@]} )); then
+      if (( answer == 0 )); then
+        printf '0.0.0.0'
+      else
+        printf '%s' "${candidates[$((answer - 1))]}"
+      fi
+      return
+    fi
+    if valid_inbound_listen_address "$answer"; then
+      printf '%s' "$answer"
+      return
+    fi
+    warn "请输入列表编号、0.0.0.0 或本机已配置的 IPv4"
+  done
+}
+
+prompt_public_endpoint_value() {
+  local label="$1" preferred="$2" alternative="$3" answer index
+  local -a candidates=() labels=() values=()
+  while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] || continue
+    candidates+=("$candidate")
+  done < <(public_ipv4_candidates)
+
+  labels+=("默认出站 $preferred（直接回车）")
+  values+=("$preferred")
+  if [[ -n "$alternative" && "$alternative" != "$preferred" ]]; then
+    labels+=("入口域名 $alternative")
+    values+=("$alternative")
+  fi
+  for candidate in "${candidates[@]}"; do
+    [[ "$candidate" != "$preferred" && "$candidate" != "$alternative" ]] || continue
+    labels+=("公网 IP $candidate")
+    values+=("$candidate")
+  done
+
+  if ((${#values[@]} <= 1)); then
+    prompt_hostname_value "$label" "$preferred"
+    return
+  fi
+  printf '\n%s检测到多个公网 IPv4，可选择默认出站、域名或指定 IP。%s\n' \
+    "$C_BOLD" "$C_RESET" >&2
+  for ((index = 0; index < ${#values[@]}; index++)); do
+    printf '  %s. %s\n' "$index" "${labels[$index]}"
+  done >&2
+  while true; do
+    read -r -p "$label [0]: " answer
+    answer="${answer:-0}"
+    if [[ "$answer" =~ ^[0-9]+$ ]] &&
+       (( answer >= 0 && answer < ${#values[@]} )); then
+      printf '%s' "${values[$answer]}"
+      return
+    fi
+    if valid_hostname "$answer"; then
+      printf '%s' "$answer"
+      return
+    fi
+    warn "请输入列表编号或域名/IP"
+  done
+}
+
+prompt_public_entry_config() {
+  local domain="$1" answer index candidate resolved default_source
+  local -a candidates=()
+  while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] || continue
+    candidates+=("$candidate")
+  done < <(public_ipv4_candidates)
+
+  resolved="$(local_ipv4_for_address "$domain")"
+  resolved="${resolved:-0.0.0.0}"
+  default_source="$(default_route_source_ipv4 || true)"
+  default_source="${default_source:-0.0.0.0}"
+
+  if ((${#candidates[@]} <= 1)); then
+    printf '%s\t%s' "$domain" "$resolved"
+    return
+  fi
+
+  printf '\n%s【公网入口模式】%s\n' "$C_BOLD" "$C_RESET" >&2
+  printf '  0. 客户端连接域名 %s，绑定 %s（%s 入、%s 出）\n' \
+    "$domain" "$resolved" "$resolved" "$resolved" >&2
+  printf '  1. 客户端连接域名 %s，绑定 0.0.0.0（域名解析 IP 入、默认 %s 出）\n' \
+    "$domain" "$default_source" >&2
+  for ((index = 2; index < ${#candidates[@]} + 2; index++)); do
+    candidate="${candidates[$((index - 2))]}"
+    printf '  %s. 客户端连接 IP %s，绑定 %s（%s 入、%s 出）\n' \
+      "$index" "$candidate" "$candidate" "$candidate" "$candidate" >&2
+  done
+  while true; do
+    read -r -p '请选择 [0]: ' answer
+    answer="${answer:-0}"
+    if [[ "$answer" == 0 ]]; then
+      printf '%s\t%s' "$domain" "$resolved"
+      return
+    elif [[ "$answer" == 1 ]]; then
+      printf '%s\t0.0.0.0' "$domain"
+      return
+    elif [[ "$answer" =~ ^[0-9]+$ ]] &&
+         (( answer >= 2 && answer < ${#candidates[@]} + 2 )); then
+      candidate="${candidates[$((answer - 2))]}"
+      printf '%s\t%s' "$candidate" "$candidate"
+      return
+    fi
+    warn "请输入列表编号"
+  done
+}
+
 bundle_worker_direct_config() {
-  local bundle="$1" name domain address
+  local bundle="$1" name domain address listen_address
   name="$(jq -r '.worker.name' <<<"$bundle")"
   address="$(jq -r '.worker.public_host // ""' <<<"$bundle")"
   address="${address:-$(detect_public_ipv4)}"
   domain="${address:-${name}.local}"
+  listen_address="$(local_ipv4_for_address "$address")"
+  listen_address="${listen_address:-0.0.0.0}"
   jq -n \
     --arg domain "$domain" --arg address "$address" \
+    --arg listen_address "$listen_address" \
     --argjson direct "$(jq '.direct' <<<"$bundle")" '
     {
       domain: $domain,
       address: $address,
+      relay: {listen_address: $listen_address},
       nginx: {
         mode: "disabled",
         tls_port: 443,
@@ -7939,9 +8252,11 @@ bundle_worker_direct_config() {
         certificate_key: "",
         snippet_path: ""
       },
-      xhttp: ($direct.xhttp + {behind_nginx: false}),
-      reality: ($direct.reality + {listen_port: $direct.reality.port}),
-      hysteria2: $direct.hysteria2
+      xhttp: ($direct.xhttp +
+        {behind_nginx: false, listen_address: $listen_address}),
+      reality: ($direct.reality +
+        {listen_port: $direct.reality.port, listen_address: $listen_address}),
+      hysteria2: ($direct.hysteria2 + {listen_address: $listen_address})
     }
   '
 }
@@ -7951,6 +8266,8 @@ validate_worker_direct_config() {
     (.domain | type == "string" and
       test("^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$")) and
     (.address | type == "string" and test("^[A-Za-z0-9.-]+$")) and
+    ((.relay.listen_address // "0.0.0.0") |
+      test("^(0\\.0\\.0\\.0|127\\.0\\.0\\.1|([0-9]{1,3}\\.){3}[0-9]{1,3})$")) and
     (.nginx.mode == "disabled" or .nginx.mode == "snippet" or
       .nginx.mode == "standalone") and
     (.nginx.tls_port | type == "number" and . >= 1 and . <= 65535) and
@@ -7972,11 +8289,15 @@ validate_worker_direct_config() {
     (.xhttp.public_port | type == "number" and . >= 1 and . <= 65535) and
     (.xhttp.listen_port | type == "number" and . >= 1 and . <= 65535) and
     (.xhttp.behind_nginx | type == "boolean") and
+    ((.xhttp.listen_address // "0.0.0.0") |
+      test("^(0\\.0\\.0\\.0|127\\.0\\.0\\.1|([0-9]{1,3}\\.){3}[0-9]{1,3})$")) and
     (.xhttp.behind_nginx == false or .nginx.mode != "disabled") and
     (.xhttp.behind_nginx == false or .xhttp.public_port == .nginx.tls_port) and
     (.xhttp.path | type == "string" and test("^/[A-Za-z0-9._~/-]+$") and
       (contains("//") | not) and (contains("..") | not)) and
     (.reality.enabled | type == "boolean") and
+    ((.reality.listen_address // "0.0.0.0") |
+      test("^(0\\.0\\.0\\.0|127\\.0\\.0\\.1|([0-9]{1,3}\\.){3}[0-9]{1,3})$")) and
     (.reality.port | type == "number" and . >= 1 and . <= 65535) and
     (.reality.listen_port | type == "number" and . >= 1 and . <= 65535) and
     (.reality.path | type == "string" and test("^/[A-Za-z0-9._~/-]+$") and
@@ -7988,6 +8309,13 @@ validate_worker_direct_config() {
       (.reality.enabled == true and .reality.port == 443 and
        .reality.listen_port != 443)) and
     (.hysteria2.enabled | type == "boolean") and
+    ((.hysteria2.listen_address // "0.0.0.0") |
+      test("^(0\\.0\\.0\\.0|127\\.0\\.0\\.1|([0-9]{1,3}\\.){3}[0-9]{1,3})$")) and
+    ((.hysteria2.listen // "0.0.0.0") | type == "string") and
+    ((.hysteria2.listen // "0.0.0.0") ==
+      "0.0.0.0" or (.hysteria2.listen // "0.0.0.0") == "127.0.0.1" or
+      ((.hysteria2.listen // "0.0.0.0") |
+        test("^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$"))) and
     (.hysteria2.port | type == "number" and . >= 1 and . <= 65535) and
     (.hysteria2.shared_udp443 | type == "boolean") and
     (.hysteria2.shared_udp443 == false or
@@ -8003,6 +8331,7 @@ validate_worker_direct_config() {
 
 prompt_worker_direct_config() {
   local bundle="$1" name default_address domain address is_baota=0
+  local bind_address=""
   local xhttp_enabled reality_enabled hy2_enabled shared_choice="n"
   local nginx_mode="disabled" tls_port=443 https_port=8443
   local auto_rebind=false cert="" key="" snippet=""
@@ -8026,8 +8355,6 @@ prompt_worker_direct_config() {
   printf '这部分是从服务器自己的代理入口，不影响“主服务器 -> 从服务器”的中继线路。\n' >&2
   printf '没有域名时可先填写准备使用的域名；证书无效时脚本会生成自签证书。\n\n' >&2
   domain="$(prompt_hostname_value '从服务器入口域名（用于 TLS 证书和 SNI）' "$domain")"
-  address="$(prompt_hostname_value '客户端实际连接的地址（通常填上面的域名，也可填公网 IP）' \
-    "${default_address:-$domain}")"
 
   if [[ -x /www/server/nginx/sbin/nginx ]]; then
     is_baota=1
@@ -8042,6 +8369,17 @@ prompt_worker_direct_config() {
   [[ " $protocol_selection " != *" 1 "* ]] || xhttp_enabled=y
   [[ " $protocol_selection " != *" 2 "* ]] || reality_enabled=y
   [[ " $protocol_selection " != *" 3 "* ]] || hy2_enabled=y
+
+  address="$domain"
+  bind_address=0.0.0.0
+  if [[ "$(jq -r '.relay.public_enabled' <<<"$bundle")" == "true" ||
+        "$xhttp_enabled" == "y" || "$reality_enabled" == "y" ||
+        "$hy2_enabled" == "y" ]]; then
+    local entry_config
+    entry_config="$(prompt_public_entry_config "$domain")"
+    address="${entry_config%%$'\t'}"
+    bind_address="${entry_config#*$'\t'}"
+  fi
 
   if [[ "$xhttp_enabled" == "y" || "$reality_enabled" == "y" ]]; then
     printf '\n%s【TCP 443 使用方式】%s\n' "$C_BOLD" "$C_RESET" >&2
@@ -8156,6 +8494,7 @@ prompt_worker_direct_config() {
 
   printf '\n%s【从服务器客户端入口摘要】%s\n' "$C_BOLD" "$C_RESET" >&2
   printf '客户端连接地址：%s\n' "$address" >&2
+  printf '本机监听 IPv4：%s\n' "$bind_address" >&2
   if [[ "$xhttp_enabled" == "y" ]]; then
     printf 'XHTTP + TLS：已启用，公网 TCP %s，Path %s\n' \
       "$xhttp_public" "$xhttp_path" >&2
@@ -8177,6 +8516,7 @@ prompt_worker_direct_config() {
 
   WORKER_DIRECT_CONFIG="$(jq -n \
     --arg domain "$domain" --arg address "$address" \
+    --arg bind_address "$bind_address" \
     --arg mode "$nginx_mode" --arg cert "$cert" --arg key "$key" \
     --arg snippet "$snippet" --argjson tls_port "$tls_port" \
     --argjson https_port "$https_port" \
@@ -8196,6 +8536,7 @@ prompt_worker_direct_config() {
     {
       domain: $domain,
       address: $address,
+      relay: {listen_address: $bind_address},
       nginx: {
         mode: $mode,
         tls_port: $tls_port,
@@ -8211,7 +8552,8 @@ prompt_worker_direct_config() {
         public_port: $xhttp_public,
         listen_port: $xhttp_listen,
         path: $xhttp_path,
-        behind_nginx: $xhttp_behind
+        behind_nginx: $xhttp_behind,
+        listen_address: $bind_address
       },
       reality: {
         enabled: $reality_enabled,
@@ -8220,7 +8562,8 @@ prompt_worker_direct_config() {
         path: $reality_path,
         target: $reality_target,
         server_name: $reality_sni,
-        short_id: $reality_short
+        short_id: $reality_short,
+        listen_address: $bind_address
       },
       hysteria2: {
         enabled: $hy2_enabled,
@@ -8229,7 +8572,8 @@ prompt_worker_direct_config() {
         obfs_password: $hy2_obfs,
         masquerade: $hy2_masquerade,
         up_mbps: $hy2_up,
-        down_mbps: $hy2_down
+        down_mbps: $hy2_down,
+        listen_address: $bind_address
       }
     }
   ')"
@@ -8308,6 +8652,15 @@ EOF
   nginx_mode="$(jq -r '.nginx.mode' <<<"$direct_config")"
   valid_hostname "$domain" || die "从服务器域名无效"
   valid_hostname "$address" || die "从服务器客户端连接地址无效"
+  while IFS= read -r listen_address; do
+    valid_inbound_listen_address "$listen_address" ||
+      die "从服务器本机监听 IPv4 无效：$listen_address"
+  done <<<"$(jq -r '
+    .relay.listen_address // "0.0.0.0",
+    .xhttp.listen_address // "0.0.0.0",
+    .reality.listen_address // "0.0.0.0",
+    .hysteria2.listen_address // "0.0.0.0"
+  ' <<<"$direct_config")"
 
   jq -e --argjson c "$direct_config" '
     [
@@ -8396,9 +8749,9 @@ EOF
     flow: .relay.flow
   }' <<<"$bundle")"
   if [[ "$(jq -r '.relay.public_enabled' <<<"$bundle")" == "true" ]]; then
-    public_relay="$(jq -c '[{
+    public_relay="$(jq -c --argjson config "$direct_config" '[{
       name: (.worker.name + "-public"),
-      listen: "0.0.0.0",
+      listen: ($config.relay.listen_address // "0.0.0.0"),
       port: (.relay.listen_port // .relay.public_port),
       public: true,
       allowed_source: .master.source_cidr,
@@ -8414,7 +8767,8 @@ EOF
       $config.xhttp as $x |
       [{
       name: ($name + "-xhttp"),
-      listen: (if $x.behind_nginx then "127.0.0.1" else "0.0.0.0" end),
+      listen: (if $x.behind_nginx then "127.0.0.1"
+              else ($x.listen_address // "0.0.0.0") end),
       port: $x.listen_port,
       public_port: $x.public_port,
       path: $x.path,
@@ -8437,7 +8791,8 @@ EOF
       $config.reality as $r |
       [{
         name: "direct",
-        listen: (if $config.nginx.shared_tcp443 then "127.0.0.1" else "0.0.0.0" end),
+        listen: (if $config.nginx.shared_tcp443 then "127.0.0.1"
+                else ($r.listen_address // "0.0.0.0") end),
         port: $r.port,
         listen_port: $r.listen_port,
         path: $r.path,
@@ -8481,6 +8836,7 @@ EOF
     .xray.reality_inbounds = $reality_inbounds |
     .nginx.pinned_peer_cert_sha256 = $certificate_pin |
     .hysteria2.enabled = $hy2_enabled |
+    .hysteria2.listen = $hy2_listen |
     .hysteria2.port = $hy2_port |
     .hysteria2.shared_udp443 = $hy2_shared_udp443 |
     .hysteria2.up_mbps = $hy2_up |
@@ -8513,6 +8869,7 @@ EOF
     --argjson xhttp_routes "$xhttp_routes" \
     --argjson reality_inbounds "$reality_inbounds" \
     --argjson hy2_enabled "$(jq -r '.hysteria2.enabled' <<<"$direct_config")" \
+    --arg hy2_listen "$(jq -r '.hysteria2.listen_address // "0.0.0.0"' <<<"$direct_config")" \
     --argjson hy2_port "$(jq -r '.hysteria2.port' <<<"$direct_config")" \
     --argjson hy2_shared_udp443 "$(jq -r '.hysteria2.shared_udp443' <<<"$direct_config")" \
     --argjson hy2_up "$(jq -r '.hysteria2.up_mbps' <<<"$direct_config")" \
@@ -9133,9 +9490,10 @@ menu_quick_init() {
   local role="gateway" name domain address mode cert key snippet=""
   local xhttp_enabled reality_enabled hy2_enabled tls_port route_port route_path
   local shared_tcp443=false auto_rebind_https=false
-  local https_listen_port=8443 reality_listen_port
+  local https_listen_port=8443 reality_listen_port reality_listen_address="0.0.0.0"
   local reality_port reality_path reality_target reality_sni
-  local hy2_port hy2_obfs_password hy2_masquerade hy2_up hy2_down
+  local hy2_port hy2_obfs_password hy2_masquerade hy2_up hy2_down hy2_listen_address="0.0.0.0"
+  local entry_config entry_bind_address="0.0.0.0"
   local hy2_shared_udp443=false hy2_share_choice
   local et_ip et_endpoint et_port et_name et_secret
   local username user_uuid user_password user_up user_down user_nodes
@@ -9146,7 +9504,9 @@ menu_quick_init() {
   printf '\n'
   name="$(prompt_name_value '主服务器名称（仅用于菜单和订阅显示，例如 hk）' 'hk')"
   domain="$(prompt_hostname_value '主服务器入口域名（必须已解析到这台机器）' 'hk.example.com')"
-  address="$domain"
+  entry_config="$(prompt_public_entry_config "$domain")"
+  address="${entry_config%%$'\t'}"
+  entry_bind_address="${entry_config#*$'\t'}"
 
   if (( is_baota )); then
     mode="snippet"
@@ -9222,6 +9582,7 @@ menu_quick_init() {
     else
       reality_port="$(prompt_port_checked 'Reality 公网 TCP 端口（需在防火墙放行）' '18443' tcp)"
       reality_listen_port="$reality_port"
+      reality_listen_address="$entry_bind_address"
     fi
     reality_path="$(prompt_path_value 'Reality 的 XHTTP 连接 Path（纯随机，不包含节点名或协议名）' "$(random_path)")"
     reality_target="$(prompt_target_value 'Reality 握手转发目标（域名:443）' 'aod.itunes.apple.com:443')"
@@ -9250,6 +9611,7 @@ menu_quick_init() {
       hy2_shared_udp443=false
     fi
     printf '下面是整条 Hysteria2 入站的带宽参数，不是单用户限速；0 表示不设置。\n'
+    hy2_listen_address="$entry_bind_address"
     hy2_up="$(prompt_mbps 'Hysteria2 总上传带宽 Mbps' '0')"
     hy2_down="$(prompt_mbps 'Hysteria2 总下载带宽 Mbps' '0')"
     hy2_obfs_password="$(prompt_secret_default 'Hysteria2 混淆密码（客户端必须填写相同密码）' "$(random_password)")"
@@ -9316,7 +9678,8 @@ menu_quick_init() {
   et_ip="$(prompt_ipv4_value '主服务器在 EasyTier 私网中的 IP' '10.100.0.1')"
   et_endpoint="$(detect_public_ipv4)"
   et_endpoint="${et_endpoint:-$address}"
-  et_endpoint="$(prompt_hostname_value '从服务器连接的主服务器公网 IP 或域名' "$et_endpoint")"
+  et_endpoint="$(prompt_public_endpoint_value \
+    '从服务器连接的主服务器公网 IP 或域名' "$et_endpoint" "$address")"
   et_port="$(prompt_port_checked 'EasyTier 公网 TCP 接入端口（需在主服务器防火墙放行）' '11010' tcp)"
   et_name="$(prompt_name_value 'EasyTier 私网名称（直接回车使用随机值）' "er-$(random_hex 8)")"
   et_secret="$(prompt_secret_default 'EasyTier 私网密钥（直接回车使用随机值）' "$(random_hex 24)")"
@@ -9333,7 +9696,8 @@ menu_quick_init() {
   [[ "$reality_enabled" != "y" ]] || printf '，公网 TCP %s，本机接收 TCP %s，SNI %s' \
     "$reality_port" "$reality_listen_port" "$reality_sni"
   printf '\n  • Hysteria2：%s' "$([[ "$hy2_enabled" == "y" ]] && printf '开启' || printf '关闭')"
-  [[ "$hy2_enabled" != "y" ]] || printf '，UDP %s%s，伪装 %s' \
+  [[ "$hy2_enabled" != "y" ]] || printf '，UDP %s:%s%s，伪装 %s' \
+    "$hy2_listen_address" \
     "$hy2_port" \
     "$([[ "$hy2_shared_udp443" == "true" ]] && printf '（与网站 TCP 443 同时使用；自动关闭 nginx H3）')" \
     "$hy2_masquerade"
@@ -9416,7 +9780,7 @@ menu_quick_init() {
     reality_short="$(random_hex 8)"
     menu_exec cmd_reality_add --name reality --port "$reality_port" \
       --listen-port "$reality_listen_port" \
-      --listen-address "$([[ "$shared_tcp443" == "true" ]] && printf '127.0.0.1' || printf '0.0.0.0')" \
+      --listen-address "$([[ "$shared_tcp443" == "true" ]] && printf '127.0.0.1' || printf '%s' "$reality_listen_address")" \
       --path "$reality_path" --target "$reality_target" \
       --server-names "$reality_sni" --private-key "$reality_private" \
       --public-key "$reality_public" --short-ids "$reality_short" || {
@@ -9429,7 +9793,7 @@ menu_quick_init() {
     local -a hy2_args=(
       --port "$hy2_port" --up-mbps "$hy2_up" --down-mbps "$hy2_down"
       --obfs salamander --obfs-password "$hy2_obfs_password"
-      --masquerade "$hy2_masquerade"
+      --masquerade "$hy2_masquerade" --listen-address "$hy2_listen_address"
     )
     if [[ "$hy2_shared_udp443" == "true" ]]; then
       hy2_args+=(--share-udp443)
@@ -9884,7 +10248,7 @@ menu_add_reality() {
     warn "请先安装 Xray"
     return 1
   fi
-  local output private_key public_key short_id name port listen_port path target sni
+  local output private_key public_key short_id name port listen_port path target sni listen_address
   output="$("$XRAY_BIN" x25519)"
   private_key="$(awk -F': ' '/^PrivateKey:/ {print $2}' <<<"$output")"
   public_key="$(awk -F': ' '/^Password/ {print $2}' <<<"$output")"
@@ -9896,12 +10260,16 @@ menu_add_reality() {
   else
     port="$(prompt_value 'Reality 公网 TCP 端口（需在防火墙放行）' '8444')"
     listen_port="$port"
+    listen_address="$(prompt_inbound_listen_address \
+      'Reality 本机监听 IPv4' "$(local_ipv4_for_address "$(jq -r '.node.address' "$STATE_FILE")")")"
   fi
   path="$(prompt_value 'Reality 的 XHTTP 连接 Path（默认纯随机）' "$(random_path)")"
   target="$(prompt_value 'Reality 握手转发目标（域名:443）' 'aod.itunes.apple.com:443')"
   sni="$(prompt_value 'Reality 客户端填写的伪装域名（SNI）' "${target%%:*}")"
   menu_exec cmd_reality_add --name "$name" --port "$port" \
-    --listen-port "$listen_port" --path "$path" \
+    --listen-port "$listen_port" \
+    --listen-address "$([[ "$(jq -r '.nginx.shared_tcp443 // false' "$STATE_FILE")" == "true" ]] && printf '127.0.0.1' || printf '%s' "$listen_address")" \
+    --path "$path" \
     --target "$target" --server-names "$sni" \
     --private-key "$private_key" --public-key "$public_key" \
     --short-ids "$short_id" || return
@@ -9910,6 +10278,7 @@ menu_add_reality() {
 
 menu_protocols() {
   local choice port up down masquerade name shared_udp443 share_choice obfs_password
+  local listen_address default_listen
   if [[ ! -f "$STATE_FILE" ]]; then
     warn "请先执行一键安装与初始化"
     menu_pause
@@ -9951,6 +10320,13 @@ menu_protocols() {
           port="$(prompt_port_checked 'Hysteria2 公网 UDP 端口（需在防火墙放行 UDP）' '8443' udp)"
         fi
         printf '下面是整条 Hysteria2 入站的带宽参数，不是单用户限速；0 表示不设置。\n'
+        default_listen="$(jq -r '.hysteria2.listen // "0.0.0.0"' "$STATE_FILE")"
+        if [[ "$default_listen" == "0.0.0.0" ]]; then
+          default_listen="$(local_ipv4_for_address "$(jq -r '.node.address' "$STATE_FILE")")"
+          default_listen="${default_listen:-0.0.0.0}"
+        fi
+        listen_address="$(prompt_inbound_listen_address \
+          'Hysteria2 本机监听 IPv4' "$default_listen")"
         up="$(prompt_mbps 'Hysteria2 总上传带宽 Mbps' '0')"
         down="$(prompt_mbps 'Hysteria2 总下载带宽 Mbps' '0')"
         obfs_password="$(prompt_secret_default 'Hysteria2 混淆密码（客户端必须填写相同密码）' "$(random_password)")"
@@ -9958,7 +10334,7 @@ menu_protocols() {
         local -a hy2_args=(
           --port "$port" --up-mbps "$up" --down-mbps "$down"
           --obfs salamander --obfs-password "$obfs_password"
-          --masquerade "$masquerade"
+          --masquerade "$masquerade" --listen-address "$listen_address"
         )
         if [[ "$shared_udp443" == "true" ]]; then
           hy2_args+=(--share-udp443)
@@ -10301,7 +10677,7 @@ menu_health_check() {
   fi
 
   local failures=0 xray_config sing_config cert key mode nb role limited_count
-  local health_hy2_port="" health_hy2_shared=false listener_ok
+  local health_hy2_port="" health_hy2_shared=false health_hy2_listen="0.0.0.0" listener_ok
   local health_quic_manifest health_quic_count health_quic_file
   xray_config="$(jq -r '.xray.config_path' "$STATE_FILE")"
   sing_config="$(jq -r '.hysteria2.config_path' "$STATE_FILE")"
@@ -10398,9 +10774,13 @@ menu_health_check() {
   if [[ "$(jq -r '.hysteria2.enabled' "$STATE_FILE")" == "true" ]]; then
     health_hy2_port="$(jq -r '.hysteria2.port' "$STATE_FILE")"
     health_hy2_shared="$(jq -r '.hysteria2.shared_udp443 // false' "$STATE_FILE")"
+    health_hy2_listen="$(jq -r '.hysteria2.listen // "0.0.0.0"' "$STATE_FILE")"
     listener_ok=1
     if command -v ss >/dev/null 2>&1; then
-      if ! port_is_sing_box_owned udp "$health_hy2_port"; then
+      if ! port_is_sing_box_owned udp "$health_hy2_port" ||
+         ! ss -H -lnup "sport = :$health_hy2_port" 2>/dev/null |
+           grep 'users:(("sing-box"' |
+           grep -Fq "${health_hy2_listen}:$health_hy2_port"; then
         listener_ok=0
       elif [[ "$health_hy2_shared" == "true" ]] &&
            port_is_nginx_owned udp "$health_hy2_port"; then

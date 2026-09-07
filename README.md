@@ -1,4 +1,4 @@
-# ETXR v0.17.5
+# ETXR v0.17.6
 
 ETXR 是面向 Debian 12 空白系统的一站式中文菜单脚本，用一份脚本安装主服务器或任意数量的从服务器。它管理 Xray、sing-box、EasyTier、订阅和用户配置，并可复用宝塔 nginx 的 TCP 443。
 
@@ -47,6 +47,8 @@ flowchart LR
 - 检测到宝塔时复用 `/www/server/nginx/sbin/nginx`，不会安装第二套 nginx。
 - 宝塔模式可选用 `stream_ssl_preread` 按 SNI 共享 TCP 443：Reality 进入本机 Xray，其他域名进入宝塔 HTTPS。
 - Hysteria2 可选择 UDP 443。确认后会自动备份并关闭 nginx QUIC/HTTP3，但保留 HTTPS、HTTP/2 和 TCP 443。
+- 检测到多个同网段公网 IPv4 时，向导会用一个“公网入口模式”选择连接地址和回程路径；
+  HY2、直连 XHTTP、Reality 和公网中继可绑定指定 IP，实现“该 IP 入、该 IP 出”。
 - 从服务器的 Reality 密钥只在从服务器本机生成，不由主服务器生成或下发。
 - 无宝塔时按需安装 Debian nginx 和 `libnginx-mod-stream`；有宝塔时只复用宝塔 nginx。
 
@@ -480,6 +482,7 @@ JQ=tools/jq tests/runtime-test.sh
 python3 tests/control-e2e-test.py
 python3 tests/data-plane-test.py
 python3 tests/menu-smoke-test.py
+tests/public-ip-test.sh
 tests/nginx-quic-test.sh
 bash tests/ufw-test.sh
 
@@ -501,7 +504,7 @@ checksums.txt
 
 脚本先校验 SHA-256 和二进制内置版本，再通过同目录临时文件原子替换；旧二进制保存在 `/etc/etxr/backups/dataplane-binary/`，失败时自动恢复。镜像站可将 `ETXR_DOWNLOAD_BASE` 设置为包含两个数据面二进制和 `checksums.txt` 的 HTTPS 目录。
 
-推送 `v0.17.5` 形式的 Git 标签后，GitHub Actions 会运行完整测试、交叉编译两个 Linux 架构并创建 Release。构建使用 `CGO_ENABLED=0`，目标机不需要额外运行库。
+推送 `v0.17.6` 形式的 Git 标签后，GitHub Actions 会运行完整测试、交叉编译两个 Linux 架构并创建 Release。构建使用 `CGO_ENABLED=0`，目标机不需要额外运行库。
 
 ## 许可证
 
