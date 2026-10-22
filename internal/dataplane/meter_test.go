@@ -51,6 +51,11 @@ func TestScrapeUsageAggregatesAndResets(t *testing.T) {
 		ledger.Users["alice"].Downlink != 2000 {
 		t.Fatalf("unexpected ledger: %#v", ledger)
 	}
+	month := usageMonthKey(time.Now())
+	monthly, exists := ledger.Users["alice"].Monthly[month]
+	if !exists || monthly.Uplink != 1000 || monthly.Downlink != 2000 {
+		t.Fatalf("unexpected monthly bucket %q: %#v", month, ledger.Users["alice"].Monthly)
+	}
 	if _, exists := ledger.Users["relay"]; exists {
 		t.Fatal("relay identity was included")
 	}
@@ -65,6 +70,24 @@ func TestScrapeUsageAggregatesAndResets(t *testing.T) {
 		reset.Users["alice"].Uplink != 1000 ||
 		reset.Users["alice"].Downlink != 2000 {
 		t.Fatalf("usage epoch did not reset: %#v", reset.Users["alice"])
+	}
+	if resetMonthly, exists := reset.Users["alice"].Monthly[month]; !exists ||
+		resetMonthly.Uplink != 1000 || resetMonthly.Downlink != 2000 {
+		t.Fatalf("usage epoch did not reset monthly: %#v", reset.Users["alice"].Monthly)
+	}
+}
+
+func TestUsageMonthKeyUsesUTC8(t *testing.T) {
+	t.Parallel()
+	// 2026-09-30 20:00 UTC is already 2026-10-01 04:00 in UTC+8.
+	boundary := time.Date(2026, 9, 30, 20, 0, 0, 0, time.UTC)
+	if got := usageMonthKey(boundary); got != "2026-10" {
+		t.Fatalf("UTC+8 boundary got %q", got)
+	}
+	// 2026-09-30 10:00 UTC (18:00 UTC+8) stays in September.
+	before := time.Date(2026, 9, 30, 10, 0, 0, 0, time.UTC)
+	if got := usageMonthKey(before); got != "2026-09" {
+		t.Fatalf("before UTC+8 boundary got %q", got)
 	}
 }
 

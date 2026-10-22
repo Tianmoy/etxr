@@ -11,6 +11,7 @@ import socket
 import struct
 import subprocess
 import tempfile
+from datetime import datetime, timedelta, timezone
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -226,6 +227,11 @@ func main() {
     assert ledger["users"]["alice"]["uplink"] == 1000
     assert ledger["users"]["alice"]["downlink"] == 2000
     assert "relay" not in ledger["users"]
+    month_key = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m")
+    monthly = ledger["users"]["alice"].get("monthly", {})
+    assert month_key in monthly
+    assert monthly[month_key]["uplink"] == 1000
+    assert monthly[month_key]["downlink"] == 2000
 
     state_value = json.loads(state.read_text(encoding="utf-8"))
     state_value["users"][0]["usage_epoch"] = "epoch-2"

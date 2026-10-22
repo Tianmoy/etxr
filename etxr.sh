@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.17.8"
+VERSION="0.17.9"
 ETXR_REPOSITORY="${ETXR_REPOSITORY:-Tianmoy/etxr}"
 ETXR_RELEASE_API="${ETXR_RELEASE_API:-https://api.github.com/repos/${ETXR_REPOSITORY}/releases/latest}"
 
@@ -1607,30 +1607,45 @@ cmd_user_usage() {
           .[$entry.key].uplink =
             ((.[$entry.key].uplink // 0) + ($entry.value.uplink // 0)) |
           .[$entry.key].downlink =
-            ((.[$entry.key].downlink // 0) + ($entry.value.downlink // 0))
+            ((.[$entry.key].downlink // 0) + ($entry.value.downlink // 0)) |
+          reduce (($entry.value.monthly // {}) | to_entries[]) as $month (
+            .;
+            .[$entry.key].monthly[$month.key].uplink =
+              (((.[$entry.key].monthly[$month.key].uplink // 0)) +
+               ($month.value.uplink // 0)) |
+            .[$entry.key].monthly[$month.key].downlink =
+              (((.[$entry.key].monthly[$month.key].downlink // 0)) +
+               ($month.value.downlink // 0))
+          )
         end
       )
     )
   ' "$sources")"
   rm -f "$sources"
 
-  printf '用户\t上传\t下载\t合计\t上传限速\t下载限速\n'
-  while IFS=$'\t' read -r user_name uplink downlink up_limit down_limit; do
+  printf '用户\t上传\t下载\t合计\t本月上传\t本月下载\t上传限速\t下载限速\n'
+  # GNU date TZ signs are inverted: UTC-8 means UTC+8 (东八区自然月).
+  month_key="$(TZ=UTC-8 date +%Y-%m)"
+  while IFS=$'\t' read -r user_name uplink downlink month_up month_down up_limit down_limit; do
     [[ -n "$user_name" ]] || continue
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$user_name" \
       "$(format_bytes "$uplink")" \
       "$(format_bytes "$downlink")" \
       "$(format_bytes "$((uplink + downlink))")" \
+      "$(format_bytes "$month_up")" \
+      "$(format_bytes "$month_down")" \
       "$([[ "$up_limit" == "0" ]] && printf '不限速' || printf '%s Mbps' "$up_limit")" \
       "$([[ "$down_limit" == "0" ]] && printf '不限速' || printf '%s Mbps' "$down_limit")"
-  done < <(jq -r --arg name "$name" --argjson totals "$totals" '
+  done < <(jq -r --arg name "$name" --arg month "$month_key" --argjson totals "$totals" '
     .users[] |
     select($name == "" or .name == $name) |
     [
       .name,
       ($totals[.name].uplink // 0),
       ($totals[.name].downlink // 0),
+      ($totals[.name].monthly[$month].uplink // 0),
+      ($totals[.name].monthly[$month].downlink // 0),
       (.speed_limit.up_mbps // 0),
       (.speed_limit.down_mbps // 0)
     ] | @tsv

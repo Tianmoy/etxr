@@ -18,6 +18,10 @@ import (
 
 var statPattern = regexp.MustCompile(`^user>>>(.+)>>>traffic>>>(uplink|downlink)$`)
 
+// usageLocation buckets monthly counters by UTC+8 calendar months so the
+// ledger does not depend on the server's timezone database or local time.
+var usageLocation = time.FixedZone("UTC+8", 8*3600)
+
 const (
 	maxStateBytes = 8 * 1024 * 1024
 	maxStatsBytes = 32 * 1024 * 1024
@@ -54,10 +58,16 @@ type usageLedger struct {
 }
 
 type usageLedgerUser struct {
-	UUID       string `json:"uuid"`
-	UsageEpoch string `json:"usage_epoch"`
-	Uplink     int64  `json:"uplink"`
-	Downlink   int64  `json:"downlink"`
+	UUID       string                     `json:"uuid"`
+	UsageEpoch string                     `json:"usage_epoch"`
+	Uplink     int64                      `json:"uplink"`
+	Downlink   int64                      `json:"downlink"`
+	Monthly    map[string]usageMonthEntry `json:"monthly,omitempty"`
+}
+
+type usageMonthEntry struct {
+	Uplink   int64 `json:"uplink"`
+	Downlink int64 `json:"downlink"`
 }
 
 type xrayStatsPayload struct {
@@ -219,6 +229,7 @@ func scrapeUsage(ctx context.Context, options MeterOptions, query statsQuery) er
 		port = 18182
 	}
 	if stats, ok := query(ctx, options.XrayBin, port); ok {
+		month := usageMonthKey(time.Now())
 		for statName, value := range stats {
 			match := statPattern.FindStringSubmatch(statName)
 			if match == nil {
@@ -238,8 +249,10 @@ func scrapeUsage(ctx context.Context, options MeterOptions, query statsQuery) er
 			}
 			if match[2] == "uplink" {
 				current.Uplink = saturatingAdd(current.Uplink, value)
+				current.addMonthly(month, value, 0)
 			} else {
 				current.Downlink = saturatingAdd(current.Downlink, value)
+				current.addMonthly(month, 0, value)
 			}
 			ledger.Users[username] = current
 		}
@@ -294,6 +307,20 @@ func readJSONLimited(path string, limit int64, destination interface{}) error {
 		return err
 	}
 	return nil
+}
+
+func usageMonthKey(moment time.Time) string {
+	return moment.In(usageLocation).Format("2006-01")
+}
+
+func (user *usageLedgerUser) addMonthly(month string, uplink, downlink int64) {
+	if user.Monthly == nil {
+		user.Monthly = make(map[string]usageMonthEntry)
+	}
+	entry := user.Monthly[month]
+	entry.Uplink = saturatingAdd(entry.Uplink, uplink)
+	entry.Downlink = saturatingAdd(entry.Downlink, downlink)
+	user.Monthly[month] = entry
 }
 
 func saturatingAdd(left, right int64) int64 {
