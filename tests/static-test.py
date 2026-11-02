@@ -15,7 +15,7 @@ def main() -> int:
     text = SCRIPT.read_text(encoding="utf-8")
     assert text.startswith("#!/usr/bin/env bash\n")
     assert "set -Eeuo pipefail" in text
-    assert 'VERSION="0.17.9"' in text
+    assert 'VERSION="0.17.10"' in text
     assert "etxr_self_update_complete()" in text
     assert 'security=tls&sni=' in text
     assert "local expires_minutes=30 expires_at" in text
@@ -27,6 +27,12 @@ def main() -> int:
     assert '"vlessenc-vision"' in text
     assert 'security: "reality"' in text
     assert 'type: "hysteria2"' in text
+    # Clash (mihomo) subscription output.
+    assert "subscription_clash()" in text
+    assert "clash_proxies_for_entry()" in text
+    assert "${token}.yaml" in text
+    assert "location = /\\(.subscription_prefix)/\\(.subscription_token).yaml" in text
+    assert "type: hysteria2, " in text
     assert "fallbackTag:" in text
     assert "observatory:" in text
     assert "proxy_request_buffering off" in text

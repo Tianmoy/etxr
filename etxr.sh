@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.17.9"
+VERSION="0.17.10"
 ETXR_REPOSITORY="${ETXR_REPOSITORY:-Tianmoy/etxr}"
 ETXR_RELEASE_API="${ETXR_RELEASE_API:-https://api.github.com/repos/${ETXR_REPOSITORY}/releases/latest}"
 
@@ -2971,6 +2971,11 @@ render_nginx_paths() {
       "    alias \($dir)/\(.subscription_token);\n" +
       "    default_type text/plain;\n" +
       "    add_header Cache-Control \"no-store\";\n" +
+      "}\n" +
+      "location = /\(.subscription_prefix)/\(.subscription_token).yaml {\n" +
+      "    alias \($dir)/\(.subscription_token).yaml;\n" +
+      "    default_type application/yaml;\n" +
+      "    add_header Cache-Control \"no-store\";\n" +
       "}\n"
     ' "$STATE_FILE"
     if [[ "$(jq -r '.control.enabled // false' "$STATE_FILE")" == "true" ]]; then
@@ -3604,6 +3609,91 @@ subscription_plain() {
   fi
 }
 
+# mihomo (Clash Meta / Clash Verge Rev) profile. VLESS Encryption routes are
+# omitted because mihomo does not implement that Xray extension.
+clash_proxies_for_entry() {
+  local user="$1" entry="$2" route reality route_name entry_name node_key
+  local uuid domain address port path host target profile
+  entry_name="$(jq -r '.node.name' <<<"$entry")"
+  uuid="$(jq -r '.uuid' <<<"$user")"
+  domain="$(jq -r '.node.domain' <<<"$entry")"
+  address="$(jq -r '.node.address' <<<"$entry")"
+  while IFS= read -r route; do
+    [[ -n "$route" ]] || continue
+    route_name="$(jq -r '.name' <<<"$route")"
+    node_key="${entry_name}/xhttp/${route_name}"
+    user_node_allowed "$user" "$node_key" || continue
+    profile="$(jq -r '.profile // "plain"' <<<"$route")"
+    [[ "$profile" == "plain" ]] || continue
+    if [[ "$(jq -r '.direct // false' <<<"$route")" == "true" ]]; then
+      port="$(jq -r '.public_port // .port' <<<"$route")"
+    else
+      port="$(jq -r '.nginx.tls_port // 443' <<<"$entry")"
+    fi
+    path="$(jq -r '.path' <<<"$route")"
+    host="$(jq -r 'if (.host // "") == "" then "" else .host end' <<<"$route")"
+    target="$(jq -r '.target' <<<"$route")"
+    local name="${entry_name}-XHTTP"
+    [[ "$target" == "direct" ]] || name="${entry_name}-${target}-XHTTP"
+    printf '  - {name: "%s", type: vless, server: "%s", port: %s, uuid: "%s", udp: true, tls: true, servername: "%s", client-fingerprint: chrome, network: xhttp, xhttp-opts: {path: "%s"%s, mode: auto}}\n' \
+      "$name" "$address" "$port" "$uuid" "$domain" "$path" \
+      "$([[ -z "$host" ]] || printf ', host: "%s"' "$host")"
+  done < <(jq -c '.xray.routes[]?' <<<"$entry")
+  while IFS= read -r reality; do
+    [[ -n "$reality" ]] || continue
+    node_key="${entry_name}/reality/$(jq -r '.name' <<<"$reality")"
+    user_node_allowed "$user" "$node_key" || continue
+    local public_key sni short_id
+    public_key="$(jq -r '.public_key // ""' <<<"$reality")"
+    [[ -n "$public_key" ]] || continue
+    sni="$(jq -r '.server_names[0]' <<<"$reality")"
+    short_id="$(jq -r '.short_ids[0]' <<<"$reality")"
+    port="$(jq -r '.port' <<<"$reality")"
+    path="$(jq -r '.path' <<<"$reality")"
+    printf '  - {name: "%s-Reality-XHTTP", type: vless, server: "%s", port: %s, uuid: "%s", udp: true, tls: true, servername: "%s", client-fingerprint: chrome, network: xhttp, xhttp-opts: {path: "%s", mode: auto}, reality-opts: {public-key: "%s", short-id: "%s"}}\n' \
+      "$entry_name" "$address" "$port" "$uuid" "$sni" "$path" "$public_key" "$short_id"
+  done < <(jq -c '.xray.reality_inbounds[]?' <<<"$entry")
+  if [[ "$(jq -r '.hysteria2.enabled' <<<"$entry")" == "true" ]] &&
+     [[ "$(jq -r '.hy2_password // ""' <<<"$user")" != "" ]] &&
+     user_node_allowed "$user" "${entry_name}/hy2"; then
+    local hy2_port hy2_obfs hy2_extra=""
+    hy2_port="$(jq -r '.hysteria2.port // 443' <<<"$entry")"
+    hy2_obfs="$(jq -r '.hysteria2.obfs // "none"' <<<"$entry")"
+    [[ "$hy2_obfs" == "none" ]] ||
+      hy2_extra=", obfs: ${hy2_obfs}, obfs-password: \"$(jq -r '.hysteria2.obfs_password // ""' <<<"$entry")\""
+    [[ "$(jq -r '.hysteria2.insecure // false' <<<"$entry")" == "true" ]] &&
+      hy2_extra+=", skip-cert-verify: true"
+    printf '  - {name: "%s-Hysteria2", type: hysteria2, server: "%s", port: %s, password: "%s", sni: "%s", udp: true%s}\n' \
+      "$entry_name" "$address" "$hy2_port" "$(jq -r '.hy2_password' <<<"$user")" "$domain" "$hy2_extra"
+  fi
+}
+
+subscription_clash() {
+  local name="$1" user entry proxies node_list
+  user="$(active_user_json "$name")" || die "用户不存在、已暂停或已过期：$name"
+  entry="$(subscription_entry_from_state)"
+  proxies=""
+  proxies+="$(clash_proxies_for_entry "$user" "$entry")"
+  if [[ "$(jq -r '.node.role' "$STATE_FILE")" != "exit" ]]; then
+    while IFS= read -r entry; do
+      [[ -n "$entry" ]] || continue
+      proxies+="$(clash_proxies_for_entry "$user" "$entry")"
+    done < <(subscription_worker_entries)
+  fi
+  node_list="$(grep -o '{name: "[^"]*"' <<<"$proxies" | cut -d'"' -f2 | sed 's/.*/"&"/' | paste -sd, -)"
+  printf '# Generated by etxr %s. Do not edit.\n' "$VERSION"
+  printf 'proxies:\n%s\n' "${proxies:-  []}"
+  if [[ -n "$node_list" ]]; then
+    printf 'proxy-groups:\n'
+    printf '  - {name: "ETXR", type: select, proxies: ["自动选择", "DIRECT", %s]}\n' "$node_list"
+    printf '  - {name: "自动选择", type: url-test, url: "https://www.gstatic.com/generate_204", interval: 300, tolerance: 50, proxies: [%s]}\n' "$node_list"
+  else
+    printf 'proxy-groups:\n'
+    printf '  - {name: "ETXR", type: select, proxies: ["DIRECT"]}\n'
+  fi
+  printf 'rules:\n  - MATCH,ETXR\n'
+}
+
 render_subscriptions() {
   local target_dir="$1" user token plain
   [[ -n "$target_dir" && "$target_dir" != "/" ]] || die "Unsafe subscription directory"
@@ -3620,6 +3710,8 @@ render_subscriptions() {
     plain="$(subscription_plain "$(jq -r '.name' <<<"$user")")"
     printf '%s' "$plain" | base64 -w 0 >"${target_dir}/${token}"
     chmod 600 "${target_dir}/${token}"
+    subscription_clash "$(jq -r '.name' <<<"$user")" >"${target_dir}/${token}.yaml"
+    chmod 600 "${target_dir}/${token}.yaml"
   done < <(jq -c '.users[] | select(
     .enabled == true and
     (.expires_at == null or .expires_at == "" or
@@ -9236,6 +9328,7 @@ cmd_subscription() {
     port="$(jq -r '.nginx.tls_port' "$STATE_FILE")"
     [[ "$port" == "443" ]] || suffix=":${port}"
     printf '\n订阅链接：https://%s%s/%s/%s\n' "$domain" "$suffix" "$prefix" "$token"
+    printf 'Clash 订阅：https://%s%s/%s/%s.yaml\n' "$domain" "$suffix" "$prefix" "$token"
   fi
 }
 

@@ -75,4 +75,20 @@ worker_link="$(grep -F '#worker-XHTTP' "$TMP/subscription.txt")"
 jq -e '.outbounds[0].streamSettings.tlsSettings |
   has("pinnedPeerCertSha256") | not' "$TMP/client.json" >/dev/null
 
+jq '.subscription.enabled = true' "$ETXR_STATE" >"$TMP/state.next.json"
+mv "$TMP/state.next.json" "$ETXR_STATE"
+"$EDGE" render >/dev/null
+token="$(jq -r '.users[] | select(.name == "alice") |
+  .subscription_token' "$ETXR_STATE")"
+clash="$ETXR_GENERATED/subscriptions/${token}.yaml"
+plain_file="$ETXR_GENERATED/subscriptions/${token}"
+[[ -s "$clash" ]]
+[[ -s "$plain_file" ]]
+grep -q 'name: "master-XHTTP"' "$clash"
+grep -q 'name: "worker-XHTTP"' "$clash"
+grep -q 'network: xhttp' "$clash"
+grep -q 'servername: "worker.example.com"' "$clash"
+grep -q 'proxy-groups:' "$clash"
+grep -q -- '- MATCH,ETXR' "$clash"
+
 echo "subscription-tls-test: PASS"
