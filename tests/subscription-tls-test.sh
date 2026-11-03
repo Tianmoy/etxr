@@ -86,6 +86,8 @@ plain_file="$ETXR_GENERATED/subscriptions/${token}"
 [[ -s "$plain_file" ]]
 grep -q 'name: "master-XHTTP"' "$clash"
 grep -q 'name: "worker-XHTTP"' "$clash"
+# every proxy entry must start its own line (multi-source join regression)
+[[ "$(grep -cE '^  - \{name: "[^"]*", type: (vless|hysteria2)' "$clash")" -eq 2 ]]
 grep -q 'network: xhttp' "$clash"
 grep -q 'servername: "worker.example.com"' "$clash"
 grep -q 'proxy-groups:' "$clash"
