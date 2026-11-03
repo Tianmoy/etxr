@@ -93,10 +93,13 @@ grep -q 'servername: "worker.example.com"' "$clash"
 grep -q 'proxy-groups:' "$clash"
 grep -q 'name: 🚀 节点选择' "$clash"
 grep -q 'GEOSITE,cn,DIRECT' "$clash"
-grep -q 'MATCH,🐟 漏网之鱼' "$clash"
+grep -q 'MATCH,🌐 国外流量' "$clash"
 # AI rules kept, Steam downloads direct, fallback defaults to proxy
 grep -q 'GEOSITE,openai,🤖 AI 服务' "$clash"
 grep -q 'DOMAIN-SUFFIX,steamcontent.com,🎯 全球直连' "$clash"
-grep -A 3 'name: 🐟 漏网之鱼' "$clash" | grep -q '🚀 节点选择'
+grep -A 3 'name: 🌐 国外流量' "$clash" | grep -q '🚀 节点选择'
+# service switch groups and auto-test group are gone
+! grep -q '⚡ 自动测速' "$clash"
+! grep -q 'name: GitHub' "$clash"
 
 echo "subscription-tls-test: PASS"

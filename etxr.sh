@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.17.13"
+VERSION="0.17.14"
 ETXR_REPOSITORY="${ETXR_REPOSITORY:-Tianmoy/etxr}"
 ETXR_RELEASE_API="${ETXR_RELEASE_API:-https://api.github.com/repos/${ETXR_REPOSITORY}/releases/latest}"
 
@@ -3766,8 +3766,8 @@ dns:
       - https://doh.pub/dns-query
       - https://dns.alidns.com/dns-query
     "geosite:geolocation-!cn":
-      - "https://dns.google/dns-query#⚡ 自动测速"
-      - "https://cloudflare-dns.com/dns-query#⚡ 自动测速"
+      - "https://dns.google/dns-query#🚀 节点选择"
+      - "https://cloudflare-dns.com/dns-query#🚀 节点选择"
 
 proxies:
 EOF
@@ -3777,59 +3777,15 @@ proxy-groups:
   - name: 🚀 节点选择
     type: select
     proxies:
-      - ⚡ 自动测速
       - DIRECT
     include-all: true
-  - name: ⚡ 自动测速
-    type: url-test
-    proxies: []
-    include-all: true
-    tolerance: 300
-    lazy: true
-    interval: 3600
   - name: 🤖 AI 服务
     type: select
     proxies:
       - 🚀 节点选择
       - 🎯 全球直连
     include-all: true
-  - name: GitHub
-    type: select
-    proxies: &svc [🚀 节点选择, 🎯 全球直连]
-  - name: Google
-    type: select
-    proxies: *svc
-  - name: YouTube
-    type: select
-    proxies: *svc
-  - name: Twitter
-    type: select
-    proxies: *svc
-  - name: Telegram
-    type: select
-    proxies: *svc
-  - name: Facebook
-    type: select
-    proxies: *svc
-  - name: Instagram
-    type: select
-    proxies: *svc
-  - name: Netflix
-    type: select
-    proxies: *svc
-  - name: Spotify
-    type: select
-    proxies: *svc
-  - name: Discord
-    type: select
-    proxies: *svc
-  - name: Reddit
-    type: select
-    proxies: *svc
-  - name: Steam
-    type: select
-    proxies: *svc
-  - name: 🐟 漏网之鱼
+  - name: 🌐 国外流量
     type: select
     proxies:
       - 🚀 节点选择
@@ -3839,17 +3795,20 @@ proxy-groups:
     proxies:
       - DIRECT
       - 🚀 节点选择
-  - name: 🛡️ 拒绝连接
-    type: select
-    proxies:
-      - REJECT
 
 rules:
   - GEOIP,LAN,DIRECT,no-resolve
   - GEOSITE,private,DIRECT
   - GEOSITE,cn,DIRECT
   - GEOIP,CN,DIRECT,no-resolve
-  - GEOSITE,github,GitHub
+  - GEOSITE,apple,🎯 全球直连
+  - GEOSITE,microsoft,🎯 全球直连
+  # Steam 拆分：游戏下载/CDN/国区节点直连（避免几十 GB 下载消耗节点流量），商店/社区落兜底走代理
+  - GEOSITE,steam@cn,🎯 全球直连
+  - DOMAIN-SUFFIX,steamcontent.com,🎯 全球直连
+  - DOMAIN-SUFFIX,steampipe.akamaized.net,🎯 全球直连
+  - DOMAIN-SUFFIX,steamserver.net,🎯 全球直连
+  # AI 服务独立开关（默认随 🚀 节点选择）
   - GEOSITE,openai,🤖 AI 服务
   - GEOSITE,anthropic,🤖 AI 服务
   - GEOSITE,google-gemini,🤖 AI 服务
@@ -3871,31 +3830,8 @@ rules:
   - DOMAIN-SUFFIX,githubcopilot.com,🤖 AI 服务
   - DOMAIN-SUFFIX,copilot.microsoft.com,🤖 AI 服务
   - DOMAIN-SUFFIX,v0.dev,🤖 AI 服务
-  - GEOSITE,apple,🎯 全球直连
-  - GEOSITE,microsoft,🎯 全球直连
-  - GEOSITE,google,Google
-  - GEOIP,google,Google,no-resolve
-  - GEOSITE,youtube,YouTube
-  - GEOSITE,twitter,Twitter
-  - GEOIP,twitter,Twitter,no-resolve
-  - GEOSITE,telegram,Telegram
-  - GEOIP,telegram,Telegram,no-resolve
-  - GEOSITE,facebook,Facebook
-  - GEOSITE,instagram,Instagram
-  - GEOSITE,netflix,Netflix
-  - GEOIP,netflix,Netflix,no-resolve
-  - GEOSITE,spotify,Spotify
-  - GEOSITE,discord,Discord
-  - GEOSITE,reddit,Reddit
-  # Steam 拆分：游戏下载/CDN/国区节点直连（速度快不耗流量），商店/社区走 Steam 组
-  - GEOSITE,steam@cn,🎯 全球直连
-  - DOMAIN-SUFFIX,steamcontent.com,🎯 全球直连
-  - DOMAIN-SUFFIX,steampipe.akamaized.net,🎯 全球直连
-  - DOMAIN-SUFFIX,steamserver.net,🎯 全球直连
-  - GEOSITE,steam,Steam
-  # 兜底：国内已在前面上面的规则直连，到这里的外网流量默认走代理（漏网之鱼组可切）
-  - GEOSITE,geolocation-!cn,🐟 漏网之鱼
-  - MATCH,🐟 漏网之鱼
+  # 兜底：国内/私有已在上方直连，到这里的外网流量默认走代理
+  - MATCH,🌐 国外流量
 EOF
 }
 

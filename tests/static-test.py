@@ -15,7 +15,7 @@ def main() -> int:
     text = SCRIPT.read_text(encoding="utf-8")
     assert text.startswith("#!/usr/bin/env bash\n")
     assert "set -Eeuo pipefail" in text
-    assert 'VERSION="0.17.13"' in text
+    assert 'VERSION="0.17.14"' in text
     assert "etxr_self_update_complete()" in text
     assert 'security=tls&sni=' in text
     assert "local expires_minutes=30 expires_at" in text
@@ -33,8 +33,8 @@ def main() -> int:
     assert "${token}.yaml" in text
     assert "location = /\\(.subscription_prefix)/\\(.subscription_token).yaml" in text
     assert "type: hysteria2, " in text
-    assert "GEOSITE,geolocation-!cn,🐟 漏网之鱼" in text
-    assert "⚡ 自动测速" in text
+    assert "MATCH,🌐 国外流量" in text
+    assert "GEOSITE,openai,🤖 AI 服务" in text
     assert "fallbackTag:" in text
     assert "observatory:" in text
     assert "proxy_request_buffering off" in text
