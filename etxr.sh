@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.17.12"
+VERSION="0.17.13"
 ETXR_REPOSITORY="${ETXR_REPOSITORY:-Tianmoy/etxr}"
 ETXR_RELEASE_API="${ETXR_RELEASE_API:-https://api.github.com/repos/${ETXR_REPOSITORY}/releases/latest}"
 
@@ -3832,8 +3832,8 @@ proxy-groups:
   - name: 🐟 漏网之鱼
     type: select
     proxies:
-      - 🎯 全球直连
       - 🚀 节点选择
+      - 🎯 全球直连
   - name: 🎯 全球直连
     type: select
     proxies:
@@ -3887,7 +3887,13 @@ rules:
   - GEOSITE,spotify,Spotify
   - GEOSITE,discord,Discord
   - GEOSITE,reddit,Reddit
+  # Steam 拆分：游戏下载/CDN/国区节点直连（速度快不耗流量），商店/社区走 Steam 组
+  - GEOSITE,steam@cn,🎯 全球直连
+  - DOMAIN-SUFFIX,steamcontent.com,🎯 全球直连
+  - DOMAIN-SUFFIX,steampipe.akamaized.net,🎯 全球直连
+  - DOMAIN-SUFFIX,steamserver.net,🎯 全球直连
   - GEOSITE,steam,Steam
+  # 兜底：国内已在前面上面的规则直连，到这里的外网流量默认走代理（漏网之鱼组可切）
   - GEOSITE,geolocation-!cn,🐟 漏网之鱼
   - MATCH,🐟 漏网之鱼
 EOF

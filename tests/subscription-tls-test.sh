@@ -94,5 +94,9 @@ grep -q 'proxy-groups:' "$clash"
 grep -q 'name: 🚀 节点选择' "$clash"
 grep -q 'GEOSITE,cn,DIRECT' "$clash"
 grep -q 'MATCH,🐟 漏网之鱼' "$clash"
+# AI rules kept, Steam downloads direct, fallback defaults to proxy
+grep -q 'GEOSITE,openai,🤖 AI 服务' "$clash"
+grep -q 'DOMAIN-SUFFIX,steamcontent.com,🎯 全球直连' "$clash"
+grep -A 3 'name: 🐟 漏网之鱼' "$clash" | grep -q '🚀 节点选择'
 
 echo "subscription-tls-test: PASS"
