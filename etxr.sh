@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.17.15"
+VERSION="0.17.16"
 ETXR_REPOSITORY="${ETXR_REPOSITORY:-Tianmoy/etxr}"
 ETXR_RELEASE_API="${ETXR_RELEASE_API:-https://api.github.com/repos/${ETXR_REPOSITORY}/releases/latest}"
 

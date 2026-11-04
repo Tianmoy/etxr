@@ -99,7 +99,7 @@ grep -q 'GEOSITE,openai,🤖 AI 服务' "$clash"
 grep -q 'DOMAIN-SUFFIX,steamcontent.com,🎯 全球直连' "$clash"
 grep -A 3 'name: 🌐 国外流量' "$clash" | grep -q '🚀 节点选择'
 # service switch groups and auto-test group are gone
-! grep -q '⚡ 自动测速' "$clash"
-! grep -q 'name: GitHub' "$clash"
+[[ "$(grep -c '⚡ 自动测速' "$clash")" -eq 0 ]]
+[[ "$(grep -c 'name: GitHub' "$clash")" -eq 0 ]]
 
 echo "subscription-tls-test: PASS"
