@@ -2154,7 +2154,18 @@ EOF
   valid_http_path "$path" || die "Path may contain only letters, digits, /, ., _, ~, and -"
   [[ "$path" != "/" ]] || die "Root path / is not allowed"
   [[ "$target" =~ ^[A-Za-z0-9.-]+:[0-9]{1,5}$ ]] || die "Invalid Reality target"
-  valid_hostname "${server_names%%,*}" || die "Invalid Reality server name"
+  IFS=',' read -ra _sni_entries <<<"$server_names"
+  for _sni in "${_sni_entries[@]}"; do
+    [[ -n "$_sni" ]] || continue
+    valid_hostname "$_sni" || die "Invalid Reality server name: $_sni"
+  done
+  unset _sni _sni_entries
+  local _sid
+  for _sid in ${short_ids//,/ }; do
+    [[ -z "$_sid" ]] || [[ "$_sid" =~ ^[0-9a-fA-F]{2,16}$ ]] ||
+      die "Invalid Reality short ID: $_sid"
+  done
+  unset _sid
   [[ "$private_key" =~ ^[A-Za-z0-9_-]{20,256}$ ]] || die "Invalid Reality private key"
   [[ "$public_key" =~ ^[A-Za-z0-9_-]{20,256}$ ]] || die "Invalid Reality public key"
   local server_names_json short_ids_json
@@ -2255,6 +2266,8 @@ EOF
   [[ -z "$masquerade" ]] || valid_url "$masquerade" || die "Invalid Hysteria2 masquerade URL"
   if [[ "$obfs" == "salamander" ]]; then
     obfs_password="${obfs_password:-$(random_password)}"
+    [[ "$obfs_password" =~ ^[A-Za-z0-9@%+=/:_-]+$ ]] ||
+      die "Hysteria2 混淆密码只能包含字母、数字和 @%+=/:_-"
   else
     obfs_password=""
   fi
@@ -3261,8 +3274,8 @@ public_tls_pin_from_state() {
   fi
   if [[ -n "$configured" ]]; then
     printf '%s' "$configured"
-    return 0
   fi
+  return 0
 }
 
 subscription_entry_from_state() {
@@ -8751,7 +8764,7 @@ prompt_worker_direct_config() {
       reality_listen="$(prompt_port_checked 'Xray Reality 本机接收 TCP 端口' '18443' tcp)"
     else
       reality_port="$(prompt_port_checked 'Reality 公网 TCP 端口（需在防火墙放行）' \
-        "$([[ "$xhttp_enabled" == "y" ]] && printf '18443' || printf '443')")"
+        "$([[ "$xhttp_enabled" == "y" ]] && printf '18443' || printf '443')" tcp)"
       reality_listen="$reality_port"
     fi
     reality_path="$(prompt_path_value 'Reality 的 XHTTP 连接 Path（纯随机，不包含节点名或协议名）' "$reality_path")"
