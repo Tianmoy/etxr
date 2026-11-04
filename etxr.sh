@@ -8614,8 +8614,9 @@ validate_worker_direct_config() {
     (.reality.server_name | type == "string" and test("^[A-Za-z0-9.-]+$")) and
     (.reality.short_id | type == "string" and test("^[0-9a-fA-F]{2,32}$")) and
     (.nginx.shared_tcp443 == false or
-      (.reality.enabled == true and .reality.port == 443 and
-       .reality.listen_port != 443)) and
+      (.nginx.mode != "disabled" and .nginx.tls_port == 443) and
+      (.reality.enabled == false or
+        (.reality.port == 443 and .reality.listen_port != 443))) and
     (.hysteria2.enabled | type == "boolean") and
     ((.hysteria2.listen_address // "0.0.0.0") |
       test("^(0\\.0\\.0\\.0|127\\.0\\.0\\.1|([0-9]{1,3}\\.){3}[0-9]{1,3})$")) and
