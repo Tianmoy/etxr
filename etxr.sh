@@ -8584,7 +8584,7 @@ validate_worker_direct_config() {
     (.nginx.auto_rebind_https | type == "boolean") and
     (.nginx.shared_tcp443 == false or
       (.nginx.mode != "disabled" and .nginx.tls_port == 443 and
-       .nginx.https_listen_port != 443)) and
+       (.reality.enabled == false or .nginx.https_listen_port != 443))) and
     (.nginx.auto_rebind_https == false or
       (.nginx.mode == "snippet" and .nginx.shared_tcp443 == true)) and
     (.nginx.certificate | type == "string" and
