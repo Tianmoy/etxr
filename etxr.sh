@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.17.16"
+VERSION="0.17.17"
 ETXR_REPOSITORY="${ETXR_REPOSITORY:-Tianmoy/etxr}"
 ETXR_RELEASE_API="${ETXR_RELEASE_API:-https://api.github.com/repos/${ETXR_REPOSITORY}/releases/latest}"
 
@@ -7666,12 +7666,12 @@ validate_pair_bundle() {
     (.control.base_url | type == "string" and test("^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._~/-]*)?$")) and
     (.control.node_id == .worker.name) and
     (.control.token | type == "string" and test("^[0-9a-fA-F]{64}$")) and
-    (.users | type == "array") and
-    (([.users[].name] | length) == ([.users[].name] | unique | length)) and
-    (([.users[].uuid] | length) == ([.users[].uuid] | unique | length)) and
-    (([.users[].subscription_token] | length) ==
-      ([.users[].subscription_token] | unique | length)) and
-    all(.users[];
+    ((.users // []) | type == "array") and
+    (([(.users // [])[].name] | length) == ([(.users // [])[].name] | unique | length)) and
+    (([(.users // [])[].uuid] | length) == ([(.users // [])[].uuid] | unique | length)) and
+    (([(.users // [])[].subscription_token] | length) ==
+      ([(.users // [])[].subscription_token] | unique | length)) and
+    all((.users // [])[];
       (.name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")) and
       (.uuid | type == "string" and test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$")) and
       (.hy2_password | type == "string" and length <= 512) and
@@ -7824,12 +7824,15 @@ cmd_pair_create() {
   local reality_path="" hy2_masquerade="https://www.cloudflare.com"
   local relay_uuid="" user_uuid="" hy2_password="" hy2_obfs="" reality_short=""
   local relay_private_port=19000
+  local relay_vlessenc=1 relay_vlessenc_seen=0
   local hy2_up=0 hy2_down=0
   local expires_minutes=30 expires_at
   while (($#)); do
     case "$1" in
       --name) name="$2"; shift 2 ;;
       --public-host) public_host="$2"; shift 2 ;;
+      --relay-vlessenc) relay_vlessenc=1; relay_vlessenc_seen=1; shift ;;
+      --no-relay-vlessenc) relay_vlessenc=0; relay_vlessenc_seen=1; shift ;;
       --public-relay-port) backup_port="$2"; shift 2 ;;
       --public-listen-port) backup_listen_port="$2"; shift 2 ;;
       --private-relay-port) relay_private_port="$2"; shift 2 ;;
@@ -7869,7 +7872,7 @@ Usage:
   etxr pair create --name worker1 [--public-host PUBLIC_HOST]
     [--public-relay-port EXTERNAL_PORT] [--public-listen-port INTERNAL_PORT]
     [--reality-port 18443] [--hy2-port 443 --hy2-share-udp443]
-    [--expires-minutes 30]
+    [--(no-)relay-vlessenc] [--expires-minutes 30]
 
 When --public-host is set, the public relay is primary and EasyTier is the
 automatic fallback. Without --public-host, traffic uses EasyTier only. For a
@@ -7943,7 +7946,18 @@ EOF
   fi
   valid_uuid "$relay_uuid" || die "Invalid relay UUID"
   valid_uuid "$user_uuid" || die "Invalid direct user UUID"
-  generate_vlessenc_x25519_pair
+  # EasyTier-only workers ride an already-encrypted tunnel, so the relay
+  # does not need its own VLESS Encryption layer by default; public-host
+  # relays keep it. Override with --relay-vlessenc / --no-relay-vlessenc.
+  if (( relay_vlessenc_seen == 0 )) && [[ -z "$public_host" ]]; then
+    relay_vlessenc=0
+  fi
+  if (( relay_vlessenc )); then
+    generate_vlessenc_x25519_pair
+  else
+    PAIR_DECRYPTION="none"
+    PAIR_ENCRYPTION="none"
+  fi
   reality_private=""
   reality_public=""
   if [[ "$reality_enabled" == "true" ]]; then
@@ -7989,8 +8003,7 @@ EOF
     --argjson hy2_shared_udp443 "$hy2_shared_udp443" \
     --arg hy2_masquerade "$hy2_masquerade" \
     --argjson hy2_up "$hy2_up" --argjson hy2_down "$hy2_down" \
-    --arg control_url "$control_url" --arg control_token "$control_token" \
-    --argjson users "$(jq '.users' "$STATE_FILE")" '
+    --arg control_url "$control_url" --arg control_token "$control_token" '
     {
       version: 2,
       expires_at: $expires,
@@ -8014,7 +8027,6 @@ EOF
         node_id: $name,
         token: $control_token
       },
-      users: $users,
       relay: {
         uuid: $relay_uuid,
         private_port: $relay_private_port,
