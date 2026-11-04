@@ -8824,7 +8824,7 @@ prompt_worker_direct_config() {
   printf '提示：TCP 和 UDP 是不同协议；TCP 443 与 UDP 443 可以同时使用。\n' >&2
 
   WORKER_DIRECT_CONFIG="$(jq -n \
-    --arg domain "$domain" --arg address "$address" \
+    --arg domain "${domain//$'\t'/}" --arg address "${address//$'\t'/}" \
     --arg bind_address "$bind_address" \
     --arg mode "$nginx_mode" --arg cert "$cert" --arg key "$key" \
     --arg snippet "$snippet" --argjson tls_port "$tls_port" \
