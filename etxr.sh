@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.17.14"
+VERSION="0.17.15"
 ETXR_REPOSITORY="${ETXR_REPOSITORY:-Tianmoy/etxr}"
 ETXR_RELEASE_API="${ETXR_RELEASE_API:-https://api.github.com/repos/${ETXR_REPOSITORY}/releases/latest}"
 
@@ -3739,10 +3739,14 @@ dns:
   ipv6: false
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
+  fake-ip-range6: "fdfe:dcba:9876::1/64"
   fake-ip-filter-mode: blacklist
   fake-ip-filter:
     - "+.lan"
     - "+.local"
+    - "*.arpa"
+    - "time.*.com"
+    - "ntp.*.com"
     - "+.market.xiaomi.com"
     - "localhost.ptlogin2.qq.com"
     - "+.msftconnecttest.com"
@@ -8914,7 +8918,7 @@ EOF
   local nginx_mode components="xray,easytier" local_direct=0
   local certificate_untrusted=false certificate_pin="" needs_certificate=false
   local reality_keys="" reality_private="" reality_public=""
-  bundle="$(pair_decode "$pairing_id" "$trusted_fingerprint")"
+  bundle="$(pair_decode "$pairing_id" "$trusted_fingerprint")" || exit $?
   validate_pair_bundle "$bundle" ||
     die "Pair ID 字段校验失败，未安装软件、未覆盖现有状态"
   now="$(date +%s)"
@@ -9251,7 +9255,7 @@ cmd_pair_renew() {
     die "原 Pair ID 文件超过大小限制"
   pairing_id="$(tr -d '\r\n' <"$pair_file")"
   fingerprint="$(pair_public_fingerprint)"
-  bundle="$(pair_decode "$pairing_id" "$fingerprint")"
+  bundle="$(pair_decode "$pairing_id" "$fingerprint")" || exit $?
   validate_pair_bundle "$bundle" ||
     die "原 Pair ID 内容无效；请删除该从服务器后重新添加"
   [[ "$(jq -r '.worker.name' <<<"$bundle")" == "$name" ]] ||
