@@ -8829,7 +8829,7 @@ prompt_worker_direct_config() {
     --arg mode "$nginx_mode" --arg cert "$cert" --arg key "$key" \
     --arg snippet "$snippet" --argjson tls_port "$tls_port" \
     --argjson https_port "$https_port" \
-    --argjson shared "$([[ "$shared_choice" == "y" && "$reality_enabled" == "y" ]] && printf true || printf false)" \
+    --argjson shared "$([[ "$shared_choice" == "y" ]] && printf true || printf false)" \
     --argjson auto_rebind "$auto_rebind" \
     --argjson xhttp_enabled "$([[ "$xhttp_enabled" == "y" ]] && printf true || printf false)" \
     --argjson xhttp_public "$xhttp_public" --argjson xhttp_listen "$xhttp_listen" \
