@@ -5814,6 +5814,27 @@ def main():
             args.etxr_bin,
             args.subscription_dir,
         )
+
+        async def periodic_subscription_refresh():
+            while True:
+                await asyncio.sleep(300)
+                try:
+                    await asyncio.to_thread(hub.refresh_subscriptions)
+                except Exception:
+                    pass
+
+        async def on_startup(app):
+            app["refresh_task"] = asyncio.create_task(
+                periodic_subscription_refresh()
+            )
+
+        async def on_cleanup(app):
+            task = app.get("refresh_task")
+            if task:
+                task.cancel()
+
+        hub.app().on_startup.append(on_startup)
+        hub.app().on_cleanup.append(on_cleanup)
         web.run_app(hub.app(), host=args.listen, port=args.port, access_log=None)
     else:
         asyncio.run(Agent(
