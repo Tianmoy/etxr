@@ -1648,7 +1648,7 @@ cmd_user_usage() {
       ($totals[.name].monthly[$month].downlink // 0),
       (.speed_limit.up_mbps // 0),
       (.speed_limit.down_mbps // 0)
-    ] | @tsv
+    ] | join("")
   ' "$STATE_FILE")
 }
 
@@ -3508,20 +3508,23 @@ vless_link_for_route() {
   local route="$1" user="$2" entry="$3"
   local uuid domain address port path profile encryption flow host query tls_pin
   local entry_name target protocol fragment
-  uuid="$(jq -r '.uuid' <<<"$user")"
-  domain="$(jq -r '.node.domain' <<<"$entry")"
-  address="$(jq -r '.node.address' <<<"$entry")"
-  if [[ "$(jq -r '.direct // false' <<<"$route")" == "true" ]]; then
-    port="$(jq -r '.public_port // .port' <<<"$route")"
-  else
-    port="$(jq -r '.nginx.tls_port' <<<"$entry")"
-  fi
-  path="$(jq -r '.path' <<<"$route")"
-  profile="$(jq -r '.profile' <<<"$route")"
-  encryption="$(jq -r '.client_encryption // "none"' <<<"$route")"
-  flow="$(jq -r '.flow // ""' <<<"$route")"
-  host="$(jq -r --arg d "$domain" 'if (.host // "") == "" then $d else .host end' <<<"$route")"
-  tls_pin="$(jq -r '.nginx.pinned_peer_cert_sha256 // ""' <<<"$entry")"
+  IFS=$'\x1f' read -r uuid domain address port path profile encryption flow host tls_pin entry_name target \
+    <<<"$(jq -rn --argjson r "$route" --argjson e "$entry" --argjson u "$user" '
+      [
+        $u.uuid,
+        $e.node.domain,
+        $e.node.address,
+        (if ($r.direct // false) then ($r.public_port // $r.port)
+         else ($e.nginx.tls_port // 443) end),
+        $r.path,
+        ($r.profile // "plain"),
+        ($r.client_encryption // "none"),
+        ($r.flow // ""),
+        (if ($r.host // "") == "" then $e.node.domain else $r.host end),
+        ($e.nginx.pinned_peer_cert_sha256 // ""),
+        $e.node.name,
+        ($r.target // "direct")
+      ] | join("")')"
   valid_certificate_pins "$tls_pin" || die "订阅中的 TLS 证书指纹格式无效"
   # nginx may forward plaintext to loopback, but every exported XHTTP endpoint
   # is reached by clients through the public TLS listener.
@@ -3533,8 +3536,6 @@ vless_link_for_route() {
     extra='{"xmux":{"maxConcurrency":"16-32","maxConnections":0,"cMaxReuseTimes":"64-128","cMaxLifetimeMs":0,"hMaxRequestTimes":"800-900","hKeepAlivePeriod":0}}'
     query+="&extra=$(urlencode "$extra")"
   fi
-  entry_name="$(jq -r '.node.name' <<<"$entry")"
-  target="$(jq -r '.target' <<<"$route")"
   protocol="XHTTP"
   [[ "$profile" != "vlessenc-vision" ]] || protocol="VLESS-Encryption-XHTTP"
   fragment="${entry_name}-${protocol}"
@@ -3546,21 +3547,24 @@ vless_link_for_route() {
 vless_link_for_reality() {
   local reality="$1" user="$2" entry="$3"
   local uuid address name port path sni public_key short_id query entry_name
-  uuid="$(jq -r '.uuid' <<<"$user")"
-  address="$(jq -r '.node.address' <<<"$entry")"
-  name="$(jq -r '.name' <<<"$reality")"
-  port="$(jq -r '.port' <<<"$reality")"
-  path="$(jq -r '.path' <<<"$reality")"
-  sni="$(jq -r '.server_names[0]' <<<"$reality")"
-  # Derive the public key from the private key when Xray is available.
-  public_key="$(jq -r '.public_key // ""' <<<"$reality")"
-  short_id="$(jq -r '.short_ids[0]' <<<"$reality")"
+  IFS=$'\x1f' read -r uuid address name port path sni public_key short_id entry_name \
+    <<<"$(jq -rn --argjson r "$reality" --argjson e "$entry" --argjson u "$user" '
+      [
+        $u.uuid,
+        $e.node.address,
+        $r.name,
+        $r.port,
+        $r.path,
+        ($r.server_names[0] // ""),
+        ($r.public_key // ""),
+        ($r.short_ids[0] // ""),
+        $e.node.name
+      ] | join("")')"
   if [[ -z "$public_key" ]]; then
     warn "Reality $name has no public_key in state; client link omitted"
     return 0
   fi
   query="encryption=none&security=reality&sni=$(urlencode "$sni")&fp=chrome&pbk=$(urlencode "$public_key")&sid=$(urlencode "$short_id")&type=xhttp&path=$(urlencode "$path")&mode=auto"
-  entry_name="$(jq -r '.node.name' <<<"$entry")"
   printf 'vless://%s@%s:%s?%s#%s\n' \
     "$uuid" "$address" "$port" "$query" \
     "$(urlencode "${entry_name}-Reality-XHTTP")"
@@ -3568,19 +3572,25 @@ vless_link_for_reality() {
 
 hy2_link_for_user() {
   local user="$1" entry="$2" password address domain port query entry_name
-  password="$(jq -r '.hy2_password' <<<"$user")"
-  address="$(jq -r '.node.address' <<<"$entry")"
-  domain="$(jq -r '.node.domain' <<<"$entry")"
-  port="$(jq -r '.hysteria2.port' <<<"$entry")"
+  local insecure obfs obfs_password
+  IFS=$'\x1f' read -r password address domain port insecure obfs obfs_password entry_name \
+    <<<"$(jq -rn --argjson e "$entry" --argjson u "$user" '
+      [
+        $u.hy2_password,
+        $e.node.address,
+        $e.node.domain,
+        ($e.hysteria2.port // 443),
+        ($e.hysteria2.insecure // false),
+        ($e.hysteria2.obfs // "none"),
+        ($e.hysteria2.obfs_password // ""),
+        $e.node.name
+      ] | join("")')"
   query="sni=$(urlencode "$domain")"
-  if [[ "$(jq -r '.hysteria2.insecure // false' <<<"$entry")" == "true" ]]; then
-    query+="&insecure=1"
+  [[ "$insecure" != "true" ]] || query+="&insecure=1"
+  if [[ "$obfs" != "none" ]]; then
+    query+="&obfs=$(urlencode "$obfs")"
+    query+="&obfs-password=$(urlencode "$obfs_password")"
   fi
-  if [[ "$(jq -r '.hysteria2.obfs' <<<"$entry")" != "none" ]]; then
-    query+="&obfs=$(urlencode "$(jq -r '.hysteria2.obfs' <<<"$entry")")"
-    query+="&obfs-password=$(urlencode "$(jq -r '.hysteria2.obfs_password' <<<"$entry")")"
-  fi
-  entry_name="$(jq -r '.node.name' <<<"$entry")"
   printf 'hysteria2://%s@%s:%s/?%s#%s\n' \
     "$(urlencode "$password")" "$address" "$port" "$query" \
     "$(urlencode "${entry_name}-Hysteria2")"
@@ -3627,57 +3637,60 @@ subscription_plain() {
 clash_proxies_for_entry() {
   local user="$1" entry="$2" route reality route_name entry_name node_key
   local uuid domain address port path host target profile
-  entry_name="$(jq -r '.node.name' <<<"$entry")"
-  uuid="$(jq -r '.uuid' <<<"$user")"
-  domain="$(jq -r '.node.domain' <<<"$entry")"
-  address="$(jq -r '.node.address' <<<"$entry")"
-  while IFS= read -r route; do
-    [[ -n "$route" ]] || continue
-    route_name="$(jq -r '.name' <<<"$route")"
+  local tls_port line name pub_key sni short_id
+  IFS=$'\x1f' read -r entry_name uuid domain address tls_port \
+    <<<"$(jq -rn --argjson e "$entry" --argjson u "$user" '
+      [$e.node.name, $u.uuid, $e.node.domain, $e.node.address,
+       ($e.nginx.tls_port // 443)] | join("")')"
+  while IFS=$'\x1f' read -r route_name path port target profile host; do
+    [[ -n "$route_name" ]] || continue
     node_key="${entry_name}/xhttp/${route_name}"
     user_node_allowed "$user" "$node_key" || continue
-    profile="$(jq -r '.profile // "plain"' <<<"$route")"
     [[ "$profile" == "plain" ]] || continue
-    if [[ "$(jq -r '.direct // false' <<<"$route")" == "true" ]]; then
-      port="$(jq -r '.public_port // .port' <<<"$route")"
-    else
-      port="$(jq -r '.nginx.tls_port // 443' <<<"$entry")"
-    fi
-    path="$(jq -r '.path' <<<"$route")"
-    host="$(jq -r 'if (.host // "") == "" then "" else .host end' <<<"$route")"
-    target="$(jq -r '.target' <<<"$route")"
-    local name="${entry_name}-XHTTP"
+    name="${entry_name}-XHTTP"
     [[ "$target" == "direct" ]] || name="${entry_name}-${target}-XHTTP"
     printf '  - {name: "%s", type: vless, server: "%s", port: %s, uuid: "%s", udp: true, tls: true, servername: "%s", client-fingerprint: chrome, network: xhttp, xhttp-opts: {path: "%s"%s, mode: auto}}\n' \
       "$name" "$address" "$port" "$uuid" "$domain" "$path" \
       "$([[ -z "$host" ]] || printf ', host: "%s"' "$host")"
-  done < <(jq -c '.xray.routes[]?' <<<"$entry")
-  while IFS= read -r reality; do
-    [[ -n "$reality" ]] || continue
-    node_key="${entry_name}/reality/$(jq -r '.name' <<<"$reality")"
+  done < <(jq -r --argjson e "$entry" --arg tp "$tls_port" '
+    .xray.routes[]? | [
+      .name,
+      .path,
+      (if (.direct // false) then (.public_port // .port) else ($tp | tonumber) end),
+      (.target // "direct"),
+      (.profile // "plain"),
+      (.host // "")
+    ] | join("")' <<<"$entry")
+  while IFS=$'\x1f' read -r route_name pub_key sni short_id port path; do
+    [[ -n "$route_name" ]] || continue
+    node_key="${entry_name}/reality/${route_name}"
     user_node_allowed "$user" "$node_key" || continue
-    local public_key sni short_id
-    public_key="$(jq -r '.public_key // ""' <<<"$reality")"
-    [[ -n "$public_key" ]] || continue
-    sni="$(jq -r '.server_names[0]' <<<"$reality")"
-    short_id="$(jq -r '.short_ids[0]' <<<"$reality")"
-    port="$(jq -r '.port' <<<"$reality")"
-    path="$(jq -r '.path' <<<"$reality")"
+    [[ -n "$pub_key" ]] || continue
     printf '  - {name: "%s-Reality-XHTTP", type: vless, server: "%s", port: %s, uuid: "%s", udp: true, tls: true, servername: "%s", client-fingerprint: chrome, network: xhttp, xhttp-opts: {path: "%s", mode: auto}, reality-opts: {public-key: "%s", short-id: "%s"}}\n' \
-      "$entry_name" "$address" "$port" "$uuid" "$sni" "$path" "$public_key" "$short_id"
-  done < <(jq -c '.xray.reality_inbounds[]?' <<<"$entry")
-  if [[ "$(jq -r '.hysteria2.enabled' <<<"$entry")" == "true" ]] &&
+      "$entry_name" "$address" "$port" "$uuid" "$sni" "$path" "$pub_key" "$short_id"
+  done < <(jq -r --argjson e "$entry" '
+    .xray.reality_inbounds[]? | [
+      .name,
+      (.public_key // ""),
+      (.server_names[0] // ""),
+      (.short_ids[0] // ""),
+      .port,
+      .path
+    ] | join("")' <<<"$entry")
+  if [[ "$(jq -r '.hysteria2.enabled // false' <<<"$entry")" == "true" ]] &&
      [[ "$(jq -r '.hy2_password // ""' <<<"$user")" != "" ]] &&
      user_node_allowed "$user" "${entry_name}/hy2"; then
-    local hy2_port hy2_obfs hy2_extra=""
-    hy2_port="$(jq -r '.hysteria2.port // 443' <<<"$entry")"
-    hy2_obfs="$(jq -r '.hysteria2.obfs // "none"' <<<"$entry")"
+    local hy2_port hy2_obfs hy2_pw hy2_obfs_pw hy2_insecure hy2_extra=""
+    IFS=$'\x1f' read -r hy2_port hy2_obfs hy2_pw hy2_obfs_pw hy2_insecure \
+      <<<"$(jq -rn --argjson e "$entry" --argjson u "$user" '
+        [($e.hysteria2.port // 443), ($e.hysteria2.obfs // "none"),
+         $u.hy2_password, ($e.hysteria2.obfs_password // ""),
+         ($e.hysteria2.insecure // false)] | join("")')"
     [[ "$hy2_obfs" == "none" ]] ||
-      hy2_extra=", obfs: ${hy2_obfs}, obfs-password: \"$(jq -r '.hysteria2.obfs_password // ""' <<<"$entry")\""
-    [[ "$(jq -r '.hysteria2.insecure // false' <<<"$entry")" == "true" ]] &&
-      hy2_extra+=", skip-cert-verify: true"
+      hy2_extra=", obfs: ${hy2_obfs}, obfs-password: \"${hy2_obfs_pw}\""
+    [[ "$hy2_insecure" != "true" ]] || hy2_extra+=", skip-cert-verify: true"
     printf '  - {name: "%s-Hysteria2", type: hysteria2, server: "%s", port: %s, password: "%s", sni: "%s", udp: true%s}\n' \
-      "$entry_name" "$address" "$hy2_port" "$(jq -r '.hy2_password' <<<"$user")" "$domain" "$hy2_extra"
+      "$entry_name" "$address" "$hy2_port" "$hy2_pw" "$domain" "$hy2_extra"
   fi
 }
 
@@ -4112,7 +4125,7 @@ validate_state_semantics() {
           (($exit.pinned_peer_cert_sha256 // "") != "") then
         [$name, "TLS 证书指纹", "只有 TLS 出口可以配置"]
       else empty end
-    ][] | @tsv
+    ][] | join("")
   ' "$STATE_FILE")"; then
     warn "读取出口配置失败：state.json 结构不完整或内容格式错误"
     errors=1
@@ -6187,7 +6200,7 @@ configure_ufw_from_state() {
       ufw_add_tcp "$port"
     fi
   done < <(jq -r '.xray.relay_inbounds[]? |
-    select(.public == true) | [.port, (.allowed_source // "")] | @tsv' "$STATE_FILE")
+    select(.public == true) | [.port, (.allowed_source // "")] | join("")' "$STATE_FILE")
   while IFS= read -r port; do
     [[ -n "$port" ]] || continue
     ufw_add_tcp "$port"
@@ -11344,7 +11357,7 @@ menu_health_check() {
     ] + [
       (.xray.reality_inbounds[]? | {tag: ("reality-" + .name), listen: (.listen // "0.0.0.0"), port: (.listen_port // .port)}),
       (.xray.relay_inbounds[]? | {tag: ("relay-" + .name), listen: (.listen // "0.0.0.0"), port: .port})
-    ] | .[] | [.tag, .listen, (.port | tostring)] | @tsv
+    ] | .[] | [.tag, .listen, (.port | tostring)] | join("")
   ' "$STATE_FILE" 2>/dev/null)
   if (( listener_count > 0 && listener_bad == 0 )); then
     health_result 1 "Xray 监听" "${listener_count} 个入口全部匹配"
@@ -11412,7 +11425,7 @@ menu_health_check() {
       else
         while IFS=$'\t' read -r pair_name pair_ip; do
           [[ -n "$pair_name" ]] || continue
-          mapfile -t et_rows < <(jq -r --arg ip "$pair_ip" '.[] | select((.ipv4 | startswith($ip + "/"))) | [.hostname, ((.path_latency // 0) | tostring), (.next_hop_hostname // "-")] | @tsv' <<<"$route_json")
+          mapfile -t et_rows < <(jq -r --arg ip "$pair_ip" '.[] | select((.ipv4 | startswith($ip + "/"))) | [.hostname, ((.path_latency // 0) | tostring), (.next_hop_hostname // "-")] | join("")' <<<"$route_json")
           if (( ${#et_rows[@]} > 0 )); then
             IFS=$'\t' read -r _ et_latency _ <<<"${et_rows[0]}"
             health_note "$pair_name：${pair_ip}，延迟 ${et_latency}ms"
@@ -11420,7 +11433,7 @@ menu_health_check() {
             et_bad=$((et_bad + 1))
             health_note "$pair_name：路由表缺少 ${pair_ip}"
           fi
-        done < <(jq -r '(.paired_nodes // [])[] | [.name, .easytier_ip] | @tsv' "$STATE_FILE")
+        done < <(jq -r '(.paired_nodes // [])[] | [.name, .easytier_ip] | join("")' "$STATE_FILE")
         if (( et_bad == 0 )); then
           health_result 1 "EasyTier 线路" "所有从服务器路由可见"
         else
@@ -11529,8 +11542,8 @@ menu_health_check() {
         sub_bad=$((sub_bad + 1))
         health_note "$sub_name：订阅文件不存在"
       fi
-    done < <(jq -r '.users[] | select(.enabled == true and (.expires_at == null or .expires_at == "" or ((.expires_at | fromdateiso8601?) > now))) | [.name, .subscription_prefix, .subscription_token] | @tsv' "$STATE_FILE")
-    IFS=$'\t' read -r sub_name sub_prefix sub_token <<<"$(jq -r '[.users[] | select(.enabled == true and (.expires_at == null or .expires_at == "" or ((.expires_at | fromdateiso8601?) > now)))] | if length > 0 then .[0] | [.name, .subscription_prefix, .subscription_token] | @tsv else "" end' "$STATE_FILE")"
+    done < <(jq -r '.users[] | select(.enabled == true and (.expires_at == null or .expires_at == "" or ((.expires_at | fromdateiso8601?) > now))) | [.name, .subscription_prefix, .subscription_token] | join("")' "$STATE_FILE")
+    IFS=$'\t' read -r sub_name sub_prefix sub_token <<<"$(jq -r '[.users[] | select(.enabled == true and (.expires_at == null or .expires_at == "" or ((.expires_at | fromdateiso8601?) > now)))] | if length > 0 then .[0] | [.name, .subscription_prefix, .subscription_token] | join("") else "" end' "$STATE_FILE")"
     if [[ -n "$sub_name" && -n "${entry_ip:-}" ]]; then
       sub_code="$(curl -4 -sS --noproxy '*' --resolve "${domain}:${tls_port}:${entry_ip}" --connect-timeout 4 --max-time 8 -o /dev/null -w '%{http_code}' "https://${domain}${port_suffix}/${sub_prefix}/${sub_token}" 2>/dev/null || true)"
       [[ "$sub_code" == "200" ]] || {
