@@ -5263,7 +5263,7 @@ class Hub:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
-                timeout=30,
+                timeout=120,
                 check=False,
             )
         except (OSError, subprocess.SubprocessError) as error:
