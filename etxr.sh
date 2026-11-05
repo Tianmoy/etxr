@@ -4225,14 +4225,14 @@ validate_state_semantics() {
     if ! jq -e '
       ((.nginx.mode == "snippet") or (.nginx.mode == "standalone")) and
       (.nginx.tls_port == 443) and
-      (.nginx.https_listen_port | type == "number" and . != 443) and
       ((.nginx.auto_rebind_https // false) | type == "boolean") and
       ((.nginx.auto_rebind_https // false) == false or .nginx.mode == "snippet") and
-      ([.xray.reality_inbounds[]?] | length > 0) and
-      (all(.xray.reality_inbounds[]?; .port == 443 and
-        (.listen // "127.0.0.1") == "127.0.0.1")) and
-      ([.xray.reality_inbounds[]?.server_names[]?] |
-        length == (unique | length))
+      ((([.xray.reality_inbounds[]?] | length) == 0) or
+        ((.nginx.https_listen_port | type == "number" and . != 443) and
+         (all(.xray.reality_inbounds[]?; .port == 443 and
+           (.listen // "127.0.0.1") == "127.0.0.1")) and
+         ([.xray.reality_inbounds[]?.server_names[]?] |
+           length == (unique | length))))
     ' "$STATE_FILE" >/dev/null; then
       warn "Shared TCP 443 state is incomplete or Reality SNI values are duplicated"
       errors=1
