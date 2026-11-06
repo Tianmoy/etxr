@@ -32,7 +32,7 @@ def main() -> int:
     assert 'security: "reality"' in text
     assert 'type: "hysteria2"' in text
     # Clash (mihomo) subscription output.
-    assert "subscription_clash()" in text
+    assert "subscription_clash_hoisted()" in text
     assert "clash_proxies_for_entry()" in text
     assert "${token}.yaml" in text
     assert "location = /\\(.subscription_prefix)/\\(.subscription_token).yaml" in text

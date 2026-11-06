@@ -1030,7 +1030,6 @@ valid_secret_value() { [[ "$1" =~ ^[A-Za-z0-9._:@+-]{1,256}$ ]]; }
 valid_socks_credential() { [[ ${#1} -le 255 && ! "$1" =~ [[:cntrl:]] ]]; }
 valid_bearer_token() { [[ "$1" =~ ^[0-9a-fA-F]{40}$ ]]; }
 valid_subscription_prefix() { [[ "$1" =~ ^[0-9a-fA-F]{8}$ ]]; }
-valid_control_token() { [[ "$1" =~ ^[0-9a-fA-F]{64}$ ]]; }
 valid_certificate_pins() {
   [[ -z "$1" || "$1" =~ ^[0-9a-fA-F]{64}(,[0-9a-fA-F]{64})*$ ]]
 }
@@ -1323,7 +1322,7 @@ EOF
   require_state
   [[ -n "$name" ]] || die "必须填写 --name"
   valid_name "$name" || die "用户名格式不正确"
-  jq -e --arg name "$name" '.users[]? | select(.name == $name)' "$STATE_FILE" >/dev/null &&
+  user_exists "$name" &&
     die "用户已存在：$name"
   uuid="${uuid:-$(random_uuid)}"
   usage_epoch="$(random_hex 8)"
@@ -1401,7 +1400,7 @@ cmd_user_remove() {
   local name="${1:-}"
   [[ -n "$name" ]] || die "用法：etxr user remove 用户名"
   require_state
-  jq -e --arg name "$name" '.users[]? | select(.name == $name)' "$STATE_FILE" >/dev/null ||
+  user_exists "$name" ||
     die "用户不存在：$name"
   state_update '.users |= map(select(.name != $name))' --arg name "$name"
   log "已删除用户：$name"
@@ -1437,8 +1436,7 @@ cmd_user_nodes() {
     esac
   done
   require_state
-  jq -e --arg name "$name" '.users[]? | select(.name == $name)' \
-    "$STATE_FILE" >/dev/null || die "用户不存在：$name"
+  user_exists "$name" || die "用户不存在：$name"
   nodes_json="$(enabled_nodes_json "$nodes")"
   current_password="$(jq -r --arg name "$name" \
     '.users[] | select(.name == $name) | (.hy2_password // "")' "$STATE_FILE")"
@@ -1500,8 +1498,7 @@ cmd_user_limit() {
     esac
   done
   require_state
-  jq -e --arg name "$name" '.users[]? | select(.name == $name)' \
-    "$STATE_FILE" >/dev/null || die "用户不存在：$name"
+  user_exists "$name" || die "用户不存在：$name"
   [[ -n "$up_mbps" ]] ||
     up_mbps="$(jq -r --arg name "$name" \
       '.users[] | select(.name == $name) | (.speed_limit.up_mbps // 0)' "$STATE_FILE")"
@@ -1528,8 +1525,7 @@ cmd_user_reset_usage() {
     state_update '.users |= map(.usage_epoch = $epoch)' \
       --arg epoch "$(random_hex 8)"
   else
-    jq -e --arg name "$name" '.users[]? | select(.name == $name)' \
-      "$STATE_FILE" >/dev/null || die "用户不存在：$name"
+    user_exists "$name" || die "用户不存在：$name"
     state_update '(.users[] | select(.name == $name) | .usage_epoch) = $epoch' \
       --arg name "$name" --arg epoch "$(random_hex 8)"
   fi
@@ -1544,8 +1540,7 @@ cmd_user_reset_domains() {
     state_update '.users |= map(.domain_epoch = $epoch)' \
       --arg epoch "$(random_hex 8)"
   else
-    jq -e --arg name "$name" '.users[]? | select(.name == $name)' \
-      "$STATE_FILE" >/dev/null || die "用户不存在：$name"
+    user_exists "$name" || die "用户不存在：$name"
     state_update '(.users[] | select(.name == $name) | .domain_epoch) = $epoch' \
       --arg name "$name" --arg epoch "$(random_hex 8)"
   fi
@@ -1565,8 +1560,7 @@ cmd_user_usage() {
   local name="${1:-}" sources totals line
   require_state
   if [[ -n "$name" ]]; then
-    jq -e --arg name "$name" '.users[]? | select(.name == $name)' \
-      "$STATE_FILE" >/dev/null || die "用户不存在：$name"
+    user_exists "$name" || die "用户不存在：$name"
   fi
   if [[ -x "$DATAPLANE_BIN" && -x "$XRAY_BIN" && ${EUID:-$(id -u)} -eq 0 ]]; then
     "$DATAPLANE_BIN" meter --state "$STATE_FILE" \
@@ -1839,7 +1833,7 @@ cmd_user() {
     nodes) cmd_user_nodes "$@" ;;
     enable|disable)
       local name="${1:-}"; [[ -n "$name" ]] || die "必须填写用户名"
-      jq -e --arg name "$name" '.users[]? | select(.name == $name)' "$STATE_FILE" >/dev/null ||
+      user_exists "$name" ||
         die "用户不存在：$name"
       local enabled=true; [[ "$action" == "disable" ]] && enabled=false
       state_update '(.users[] | select(.name == $name) | .enabled) = $enabled' \
@@ -3260,6 +3254,10 @@ urlencode() {
   printf '%s' "$encoded"
 }
 
+user_exists() {
+  jq -e --arg name "$1" '.users[]? | select(.name == $name)' "$STATE_FILE" >/dev/null
+}
+
 active_user_json() {
   local name="$1"
   jq -e --arg name "$name" '
@@ -3661,16 +3659,12 @@ subscription_plain_hoisted() {
 }
 
 subscription_plain() {
-  local name="$1" user entry
+  local name="$1" user
   user="$(active_user_json "$name")" || die "用户不存在、已暂停或已过期：$name"
-  entry="$(subscription_entry_from_state)"
-  subscription_links_for_entry "$user" "$entry"
-  if [[ "$(jq -r '.node.role' "$STATE_FILE")" != "exit" ]]; then
-    while IFS= read -r entry; do
-      [[ -n "$entry" ]] || continue
-      subscription_links_for_entry "$user" "$entry"
-    done < <(subscription_worker_entries)
-  fi
+  SUB_HOIST_ENTRY="$(subscription_entry_from_state)" \
+  SUB_HOIST_ROLE="$(jq -r '.node.role' "$STATE_FILE")" \
+  SUB_HOIST_WORKERS="$([[ "$(jq -r '.node.role' "$STATE_FILE")" != "exit" ]] && subscription_worker_entries || true)" \
+  subscription_plain_hoisted "$user"
 }
 
 # mihomo (Clash Meta / Clash Verge Rev) profile. VLESS Encryption routes are
@@ -3816,178 +3810,6 @@ rules:
   - MATCH,🌐 国外流量
 CLASHEOF
 }
-
-subscription_clash() {
-  local name="$1" user entry proxies chunk
-  user="$(active_user_json "$name")" || die "用户不存在、已暂停或已过期：$name"
-  entry="$(subscription_entry_from_state)"
-  proxies=""
-  chunk="$(clash_proxies_for_entry "$user" "$entry")"
-  [[ -z "$chunk" ]] || proxies+="${chunk}"$'\n'
-  if [[ "$(jq -r '.node.role' "$STATE_FILE")" != "exit" ]]; then
-    while IFS= read -r entry; do
-      [[ -n "$entry" ]] || continue
-      chunk="$(clash_proxies_for_entry "$user" "$entry")"
-      [[ -z "$chunk" ]] || proxies+="${chunk}"$'\n'
-    done < <(subscription_worker_entries)
-  fi
-  printf '# Generated by etxr %s. Do not edit.\n' "$VERSION"
-  printf '# 完整配置：直接导入 Clash Verge Rev/mihomo。\n'
-  printf '# 在外部配置中作为 proxy-provider 引用时，mihomo 只读取本文件的 proxies 部分。\n'
-  if [[ -z "$proxies" ]]; then
-    printf 'proxies: []\nproxy-groups:\n  - name: 🎯 全球直连\n    type: select\n    proxies: [DIRECT]\nrules:\n  - MATCH,🎯 全球直连\n'
-    return
-  fi
-  cat <<EOF
-mixed-port: 7890
-mode: rule
-log-level: info
-ipv6: true
-unified-delay: true
-tcp-concurrent: true
-find-process-mode: off
-geodata-mode: false
-geodata-loader: memconservative
-geo-auto-update: false
-global-ua: clash.meta
-etag-support: true
-keep-alive-interval: 30
-
-profile:
-  store-selected: true
-  store-fake-ip: true
-
-geox-url:
-  mmdb: "https://v6.gh-proxy.org/https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb"
-  geoip: "https://v6.gh-proxy.org/https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat"
-  geosite: "https://v6.gh-proxy.org/https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat"
-  asn: "https://v6.gh-proxy.org/https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/GeoLite2-ASN.mmdb"
-
-sniffer:
-  enable: true
-  force-dns-mapping: true
-  parse-pure-ip: true
-  override-destination: true
-  sniff:
-    HTTP:
-      ports: [80, 8080-8880]
-    TLS:
-      ports: [443, 8443]
-    QUIC:
-      ports: [443, 8443]
-  skip-domain:
-    - "Mijia Cloud"
-    - "+.push.apple.com"
-
-dns:
-  enable: true
-  listen: 0.0.0.0:1053
-  cache-algorithm: arc
-  prefer-h3: false
-  use-system-hosts: true
-  ipv6: false
-  enhanced-mode: fake-ip
-  fake-ip-range: 198.18.0.1/16
-  fake-ip-range6: "fdfe:dcba:9876::1/64"
-  fake-ip-filter-mode: blacklist
-  fake-ip-filter:
-    - "+.lan"
-    - "+.local"
-    - "*.arpa"
-    - "time.*.com"
-    - "ntp.*.com"
-    - "+.market.xiaomi.com"
-    - "localhost.ptlogin2.qq.com"
-    - "+.msftconnecttest.com"
-    - "+.msftncsi.com"
-    - "+.cdn.nintendo.net"
-    - "+.stun.playstation.net"
-    - "+.push.apple.com"
-  default-nameserver:
-    - 223.5.5.5
-    - 119.29.29.29
-  nameserver:
-    - https://doh.pub/dns-query
-    - https://dns.alidns.com/dns-query
-  direct-nameserver:
-    - 223.5.5.5
-    - 119.29.29.29
-  proxy-server-nameserver:
-    - https://doh.pub/dns-query
-  nameserver-policy:
-    "geosite:cn,private":
-      - https://doh.pub/dns-query
-      - https://dns.alidns.com/dns-query
-    "geosite:geolocation-!cn":
-      - "https://dns.google/dns-query#🚀 节点选择"
-      - "https://cloudflare-dns.com/dns-query#🚀 节点选择"
-
-proxies:
-EOF
-  printf '%s' "$proxies"
-  cat <<'EOF'
-proxy-groups:
-  - name: 🚀 节点选择
-    type: select
-    proxies:
-      - DIRECT
-    include-all: true
-  - name: 🤖 AI 服务
-    type: select
-    proxies:
-      - 🚀 节点选择
-      - 🎯 全球直连
-    include-all: true
-  - name: 🌐 国外流量
-    type: select
-    proxies:
-      - 🚀 节点选择
-      - 🎯 全球直连
-  - name: 🎯 全球直连
-    type: select
-    proxies:
-      - DIRECT
-      - 🚀 节点选择
-
-rules:
-  - GEOIP,LAN,DIRECT,no-resolve
-  - GEOSITE,private,DIRECT
-  - GEOSITE,cn,DIRECT
-  - GEOIP,CN,DIRECT,no-resolve
-  - GEOSITE,apple,🎯 全球直连
-  - GEOSITE,microsoft,🎯 全球直连
-  # Steam 拆分：游戏下载/CDN/国区节点直连（避免几十 GB 下载消耗节点流量），商店/社区落兜底走代理
-  - GEOSITE,steam@cn,🎯 全球直连
-  - DOMAIN-SUFFIX,steamcontent.com,🎯 全球直连
-  - DOMAIN-SUFFIX,steampipe.akamaized.net,🎯 全球直连
-  - DOMAIN-SUFFIX,steamserver.net,🎯 全球直连
-  # AI 服务独立开关（默认随 🚀 节点选择）
-  - GEOSITE,openai,🤖 AI 服务
-  - GEOSITE,anthropic,🤖 AI 服务
-  - GEOSITE,google-gemini,🤖 AI 服务
-  - GEOSITE,xai,🤖 AI 服务
-  - GEOSITE,perplexity,🤖 AI 服务
-  - GEOSITE,huggingface,🤖 AI 服务
-  - GEOSITE,poe,🤖 AI 服务
-  - DOMAIN-SUFFIX,midjourney.com,🤖 AI 服务
-  - DOMAIN-SUFFIX,mistral.ai,🤖 AI 服务
-  - DOMAIN-SUFFIX,suno.com,🤖 AI 服务
-  - DOMAIN-SUFFIX,suno.ai,🤖 AI 服务
-  - DOMAIN-SUFFIX,character.ai,🤖 AI 服务
-  - DOMAIN-SUFFIX,groq.com,🤖 AI 服务
-  - DOMAIN-SUFFIX,together.ai,🤖 AI 服务
-  - DOMAIN-SUFFIX,openrouter.ai,🤖 AI 服务
-  - DOMAIN-SUFFIX,elevenlabs.io,🤖 AI 服务
-  - DOMAIN-SUFFIX,cursor.com,🤖 AI 服务
-  - DOMAIN-SUFFIX,cursor.sh,🤖 AI 服务
-  - DOMAIN-SUFFIX,githubcopilot.com,🤖 AI 服务
-  - DOMAIN-SUFFIX,copilot.microsoft.com,🤖 AI 服务
-  - DOMAIN-SUFFIX,v0.dev,🤖 AI 服务
-  # 兜底：国内/私有已在上方直连，到这里的外网流量默认走代理
-  - MATCH,🌐 国外流量
-EOF
-}
-
 render_subscriptions() {
   local target_dir="$1" user token plain name
   [[ -n "$target_dir" && "$target_dir" != "/" ]] || die "Unsafe subscription directory"
@@ -7916,15 +7738,9 @@ resolve_ipv4_cidr() {
 }
 
 generate_vlessenc_x25519_pair() {
-  [[ -x "$XRAY_BIN" ]] || die "请先安装 Xray"
-  local output
-  output="$("$XRAY_BIN" vlessenc)"
-  # Xray may print multiple suites; use the final recommended pair
-  # (currently the ML-KEM authenticated profile).
-  PAIR_DECRYPTION="$(awk -F'"' '/"decryption"/ {v=$4} END {print v}' <<<"$output")"
-  PAIR_ENCRYPTION="$(awk -F'"' '/"encryption"/ {v=$4} END {print v}' <<<"$output")"
-  [[ -n "$PAIR_DECRYPTION" && -n "$PAIR_ENCRYPTION" ]] ||
-    die "无法解析 xray vlessenc 输出"
+  generate_vlessenc_pair || die "无法生成 VLESS Encryption 密钥对"
+  PAIR_DECRYPTION="$VLESSENC_DECRYPTION"
+  PAIR_ENCRYPTION="$VLESSENC_ENCRYPTION"
 }
 
 cmd_cluster_master_init() {
@@ -10344,8 +10160,7 @@ menu_users() {
       1)
         default_name="user$(( $(jq '.users | length' "$STATE_FILE") + 1 ))"
         name="$(prompt_name_value '用户名（仅用于 ETXR 用户管理和订阅名称）' "$default_name")"
-        if jq -e --arg name "$name" '.users[]? | select(.name == $name)' \
-          "$STATE_FILE" >/dev/null; then
+        if user_exists "$name"; then
           warn "用户已存在：$name"
           menu_pause
           continue
