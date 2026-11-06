@@ -1648,7 +1648,7 @@ cmd_user_usage() {
       ($totals[.name].monthly[$month].downlink // 0),
       (.speed_limit.up_mbps // 0),
       (.speed_limit.down_mbps // 0)
-    ] | join("")
+    ] | @tsv
   ' "$STATE_FILE")
 }
 
@@ -3246,8 +3246,10 @@ urlencode() {
     printf '%s' "$string"
     return
   fi
-  # Slow path: percent-encode non-unreserved characters
-  local encoded="" i char code
+  # Slow path: percent-encode non-unreserved characters.
+  # LC_ALL=C forces byte-by-byte iteration so multi-byte UTF-8
+  # sequences are encoded as individual bytes, matching jq @uri.
+  local LC_ALL=C encoded="" i char code
   for ((i = 0; i < ${#string}; i++)); do
     char="${string:i:1}"
     case "$char" in
@@ -4257,7 +4259,7 @@ validate_state_semantics() {
           (($exit.pinned_peer_cert_sha256 // "") != "") then
         [$name, "TLS 证书指纹", "只有 TLS 出口可以配置"]
       else empty end
-    ][] | join("")
+    ][] | @tsv
   ' "$STATE_FILE")"; then
     warn "读取出口配置失败：state.json 结构不完整或内容格式错误"
     errors=1
@@ -5978,9 +5980,10 @@ def main():
             if task:
                 task.cancel()
 
-        hub.app().on_startup.append(on_startup)
-        hub.app().on_cleanup.append(on_cleanup)
-        web.run_app(hub.app(), host=args.listen, port=args.port, access_log=None)
+        app = hub.app()
+        app.on_startup.append(on_startup)
+        app.on_cleanup.append(on_cleanup)
+        web.run_app(app, host=args.listen, port=args.port, access_log=None)
     else:
         asyncio.run(Agent(
             args.state, args.etxr_bin, args.usage_file, args.domain_file
@@ -6332,7 +6335,7 @@ configure_ufw_from_state() {
       ufw_add_tcp "$port"
     fi
   done < <(jq -r '.xray.relay_inbounds[]? |
-    select(.public == true) | [.port, (.allowed_source // "")] | join("")' "$STATE_FILE")
+    select(.public == true) | [.port, (.allowed_source // "")] | @tsv' "$STATE_FILE")
   while IFS= read -r port; do
     [[ -n "$port" ]] || continue
     ufw_add_tcp "$port"
@@ -11489,7 +11492,7 @@ menu_health_check() {
     ] + [
       (.xray.reality_inbounds[]? | {tag: ("reality-" + .name), listen: (.listen // "0.0.0.0"), port: (.listen_port // .port)}),
       (.xray.relay_inbounds[]? | {tag: ("relay-" + .name), listen: (.listen // "0.0.0.0"), port: .port})
-    ] | .[] | [.tag, .listen, (.port | tostring)] | join("")
+    ] | .[] | [.tag, .listen, (.port | tostring)] | @tsv
   ' "$STATE_FILE" 2>/dev/null)
   if (( listener_count > 0 && listener_bad == 0 )); then
     health_result 1 "Xray 监听" "${listener_count} 个入口全部匹配"
@@ -11557,7 +11560,7 @@ menu_health_check() {
       else
         while IFS=$'\t' read -r pair_name pair_ip; do
           [[ -n "$pair_name" ]] || continue
-          mapfile -t et_rows < <(jq -r --arg ip "$pair_ip" '.[] | select((.ipv4 | startswith($ip + "/"))) | [.hostname, ((.path_latency // 0) | tostring), (.next_hop_hostname // "-")] | join("")' <<<"$route_json")
+          mapfile -t et_rows < <(jq -r --arg ip "$pair_ip" '.[] | select((.ipv4 | startswith($ip + "/"))) | [.hostname, ((.path_latency // 0) | tostring), (.next_hop_hostname // "-")] | @tsv' <<<"$route_json")
           if (( ${#et_rows[@]} > 0 )); then
             IFS=$'\t' read -r _ et_latency _ <<<"${et_rows[0]}"
             health_note "$pair_name：${pair_ip}，延迟 ${et_latency}ms"
@@ -11565,7 +11568,7 @@ menu_health_check() {
             et_bad=$((et_bad + 1))
             health_note "$pair_name：路由表缺少 ${pair_ip}"
           fi
-        done < <(jq -r '(.paired_nodes // [])[] | [.name, .easytier_ip] | join("")' "$STATE_FILE")
+        done < <(jq -r '(.paired_nodes // [])[] | [.name, .easytier_ip] | @tsv' "$STATE_FILE")
         if (( et_bad == 0 )); then
           health_result 1 "EasyTier 线路" "所有从服务器路由可见"
         else
@@ -11674,8 +11677,8 @@ menu_health_check() {
         sub_bad=$((sub_bad + 1))
         health_note "$sub_name：订阅文件不存在"
       fi
-    done < <(jq -r '.users[] | select(.enabled == true and (.expires_at == null or .expires_at == "" or ((.expires_at | fromdateiso8601?) > now))) | [.name, .subscription_prefix, .subscription_token] | join("")' "$STATE_FILE")
-    IFS=$'\t' read -r sub_name sub_prefix sub_token <<<"$(jq -r '[.users[] | select(.enabled == true and (.expires_at == null or .expires_at == "" or ((.expires_at | fromdateiso8601?) > now)))] | if length > 0 then .[0] | [.name, .subscription_prefix, .subscription_token] | join("") else "" end' "$STATE_FILE")"
+    done < <(jq -r '.users[] | select(.enabled == true and (.expires_at == null or .expires_at == "" or ((.expires_at | fromdateiso8601?) > now))) | [.name, .subscription_prefix, .subscription_token] | @tsv' "$STATE_FILE")
+    IFS=$'\t' read -r sub_name sub_prefix sub_token <<<"$(jq -r '[.users[] | select(.enabled == true and (.expires_at == null or .expires_at == "" or ((.expires_at | fromdateiso8601?) > now)))] | if length > 0 then .[0] | [.name, .subscription_prefix, .subscription_token] | @tsv else "" end' "$STATE_FILE")"
     if [[ -n "$sub_name" && -n "${entry_ip:-}" ]]; then
       sub_code="$(curl -4 -sS --noproxy '*' --resolve "${domain}:${tls_port}:${entry_ip}" --connect-timeout 4 --max-time 8 -o /dev/null -w '%{http_code}' "https://${domain}${port_suffix}/${sub_prefix}/${sub_token}" 2>/dev/null || true)"
       [[ "$sub_code" == "200" ]] || {
