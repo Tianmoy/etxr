@@ -3755,8 +3755,6 @@ subscription_clash_hoisted() {
 proxy-groups:
   - name: 🚀 节点选择
     type: select
-    proxies:
-      - DIRECT
     include-all: true
   - name: 🤖 AI 服务
     type: select
@@ -3776,6 +3774,8 @@ proxy-groups:
       - 🚀 节点选择
 
 rules:
+  # 强制浏览器回落 HTTP/2 TCP（QUIC 过代理 UDP 套 TCP 双重重传反而慢）
+  - AND,((DST-PORT,443),(NETWORK,UDP)),REJECT
   - GEOIP,LAN,DIRECT,no-resolve
   - GEOSITE,private,DIRECT
   - GEOSITE,cn,DIRECT
@@ -3788,7 +3788,15 @@ rules:
   # GitHub / LinkedIn / Docker 走代理（在 Microsoft 大类之前，避免被吞进直连）
   - GEOSITE,github,🚀 节点选择
   - GEOSITE,linkedin,🚀 节点选择
-  - GEOSITE,apple,🎯 全球直连
+  # Apple 常用服务走直连（国内有 CDN）；开发者/测试服务走代理
+  - DOMAIN-SUFFIX,apple.com,🎯 全球直连
+  - DOMAIN-SUFFIX,icloud.com,🎯 全球直连
+  - DOMAIN-SUFFIX,icloud-content.com,🎯 全球直连
+  - DOMAIN-SUFFIX,mzstatic.com,🎯 全球直连
+  - DOMAIN-SUFFIX,cdn-apple.com,🎯 全球直连
+  - DOMAIN-SUFFIX,aaplimg.com,🎯 全球直连
+  - DOMAIN,testflight.apple.com,🚀 节点选择
+  - DOMAIN,developer.apple.com,🚀 节点选择
   - GEOSITE,steam@cn,🎯 全球直连
   - DOMAIN-SUFFIX,steamcontent.com,🎯 全球直连
   - DOMAIN-SUFFIX,steampipe.akamaized.net,🎯 全球直连
