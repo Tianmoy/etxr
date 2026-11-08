@@ -3777,17 +3777,17 @@ rules:
   # 强制浏览器回落 HTTP/2 TCP（QUIC 过代理 UDP 套 TCP 双重重传反而慢）
   - AND,((DST-PORT,443),(NETWORK,UDP)),REJECT
   - GEOIP,LAN,DIRECT,no-resolve
-  - GEOSITE,private,DIRECT
-  - GEOSITE,cn,DIRECT
-  - GEOIP,CN,DIRECT,no-resolve
+  - RULE-SET,private_domain,DIRECT,no-resolve
+  - RULE-SET,cn_domain,DIRECT,no-resolve
+  - RULE-SET,cn_ip,DIRECT,no-resolve
   # Windows Update 走直连（国内有 CDN，走代理反而慢）
   - DOMAIN-SUFFIX,windowsupdate.com,🎯 全球直连
   - DOMAIN-SUFFIX,update.microsoft.com,🎯 全球直连
   - DOMAIN-SUFFIX,delivery.mp.microsoft.com,🎯 全球直连
   - DOMAIN-SUFFIX,download.windowsupdate.com,🎯 全球直连
-  # GitHub / LinkedIn / Docker 走代理（在 Microsoft 大类之前，避免被吞进直连）
-  - GEOSITE,github,🚀 节点选择
-  - GEOSITE,linkedin,🚀 节点选择
+  # GitHub / LinkedIn 走代理
+  - RULE-SET,github_domain,🚀 节点选择
+  - DOMAIN-SUFFIX,linkedin.com,🚀 节点选择
   # Apple 常用服务走直连（国内有 CDN）；开发者/测试服务走代理
   - DOMAIN-SUFFIX,apple.com,🎯 全球直连
   - DOMAIN-SUFFIX,icloud.com,🎯 全球直连
@@ -3797,17 +3797,11 @@ rules:
   - DOMAIN-SUFFIX,aaplimg.com,🎯 全球直连
   - DOMAIN,testflight.apple.com,🚀 节点选择
   - DOMAIN,developer.apple.com,🚀 节点选择
-  - GEOSITE,steam@cn,🎯 全球直连
   - DOMAIN-SUFFIX,steamcontent.com,🎯 全球直连
   - DOMAIN-SUFFIX,steampipe.akamaized.net,🎯 全球直连
   - DOMAIN-SUFFIX,steamserver.net,🎯 全球直连
-  - GEOSITE,openai,🤖 AI 服务
-  - GEOSITE,anthropic,🤖 AI 服务
-  - GEOSITE,google-gemini,🤖 AI 服务
-  - GEOSITE,xai,🤖 AI 服务
-  - GEOSITE,perplexity,🤖 AI 服务
-  - GEOSITE,huggingface,🤖 AI 服务
-  - GEOSITE,poe,🤖 AI 服务
+  # AI 服务独立开关
+  - RULE-SET,ai_domain,🤖 AI 服务
   - DOMAIN-SUFFIX,midjourney.com,🤖 AI 服务
   - DOMAIN-SUFFIX,mistral.ai,🤖 AI 服务
   - DOMAIN-SUFFIX,suno.com,🤖 AI 服务
@@ -3823,6 +3817,12 @@ rules:
   - DOMAIN-SUFFIX,copilot.microsoft.com,🤖 AI 服务
   - DOMAIN-SUFFIX,v0.dev,🤖 AI 服务
   - MATCH,🌐 国外流量
+rule-providers:
+  private_domain: { type: http, interval: 86400, behavior: domain, format: mrs, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/private.mrs" }
+  cn_domain: { type: http, interval: 86400, behavior: domain, format: mrs, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/cn.mrs" }
+  cn_ip: { type: http, interval: 86400, behavior: ipcidr, format: mrs, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/cn.mrs" }
+  github_domain: { type: http, interval: 86400, behavior: domain, format: mrs, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/github.mrs" }
+  ai_domain: { type: http, interval: 86400, behavior: domain, format: mrs, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/category-ai-!cn.mrs" }
 CLASHEOF
 }
 render_subscriptions() {

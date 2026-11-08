@@ -38,7 +38,8 @@ def main() -> int:
     assert "location = /\\(.subscription_prefix)/\\(.subscription_token).yaml" in text
     assert "type: hysteria2, " in text
     assert "MATCH,🌐 国外流量" in text
-    assert "GEOSITE,openai,🤖 AI 服务" in text
+    assert "RULE-SET,ai_domain,🤖 AI 服务" in text
+    assert "rule-providers:" in text
     assert "fallbackTag:" in text
     assert "observatory:" in text
     assert "proxy_request_buffering off" in text

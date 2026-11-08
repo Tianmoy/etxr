@@ -92,10 +92,11 @@ grep -q 'network: xhttp' "$clash"
 grep -q 'servername: "worker.example.com"' "$clash"
 grep -q 'proxy-groups:' "$clash"
 grep -q 'name: 🚀 节点选择' "$clash"
-grep -q 'GEOSITE,cn,DIRECT' "$clash"
+grep -q 'RULE-SET,cn_domain,DIRECT' "$clash"
 grep -q 'MATCH,🌐 国外流量' "$clash"
-# AI rules kept, Steam downloads direct, fallback defaults to proxy
-grep -q 'GEOSITE,openai,🤖 AI 服务' "$clash"
+# AI rules via rule-set, Steam downloads direct, fallback defaults to proxy
+grep -q 'RULE-SET,ai_domain,🤖 AI 服务' "$clash"
+grep -q 'rule-providers:' "$clash"
 grep -q 'DOMAIN-SUFFIX,steamcontent.com,🎯 全球直连' "$clash"
 grep -A 3 'name: 🌐 国外流量' "$clash" | grep -q '🚀 节点选择'
 # service switch groups and auto-test group are gone
