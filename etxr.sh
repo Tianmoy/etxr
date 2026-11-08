@@ -3780,8 +3780,15 @@ rules:
   - GEOSITE,private,DIRECT
   - GEOSITE,cn,DIRECT
   - GEOIP,CN,DIRECT,no-resolve
+  # Windows Update 走直连（国内有 CDN，走代理反而慢）
+  - DOMAIN-SUFFIX,windowsupdate.com,🎯 全球直连
+  - DOMAIN-SUFFIX,update.microsoft.com,🎯 全球直连
+  - DOMAIN-SUFFIX,delivery.mp.microsoft.com,🎯 全球直连
+  - DOMAIN-SUFFIX,download.windowsupdate.com,🎯 全球直连
+  # GitHub / LinkedIn / Docker 走代理（在 Microsoft 大类之前，避免被吞进直连）
+  - GEOSITE,github,🚀 节点选择
+  - GEOSITE,linkedin,🚀 节点选择
   - GEOSITE,apple,🎯 全球直连
-  - GEOSITE,microsoft,🎯 全球直连
   - GEOSITE,steam@cn,🎯 全球直连
   - DOMAIN-SUFFIX,steamcontent.com,🎯 全球直连
   - DOMAIN-SUFFIX,steampipe.akamaized.net,🎯 全球直连
