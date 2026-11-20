@@ -1833,6 +1833,7 @@ cmd_user() {
     nodes) cmd_user_nodes "$@" ;;
     enable|disable)
       local name="${1:-}"; [[ -n "$name" ]] || die "必须填写用户名"
+      require_state
       user_exists "$name" ||
         die "用户不存在：$name"
       local enabled=true; [[ "$action" == "disable" ]] && enabled=false
@@ -3551,7 +3552,7 @@ vless_link_for_route() {
         ($e.nginx.pinned_peer_cert_sha256 // ""),
         $e.node.name,
         ($r.target // "direct")
-      ] | join("")')"
+      ] | join("\u001f")')"
   valid_certificate_pins "$tls_pin" || die "订阅中的 TLS 证书指纹格式无效"
   # nginx may forward plaintext to loopback, but every exported XHTTP endpoint
   # is reached by clients through the public TLS listener.
@@ -3586,7 +3587,7 @@ vless_link_for_reality() {
         ($r.public_key // ""),
         ($r.short_ids[0] // ""),
         $e.node.name
-      ] | join("")')"
+      ] | join("\u001f")')"
   if [[ -z "$public_key" ]]; then
     warn "Reality $name has no public_key in state; client link omitted"
     return 0
@@ -3611,7 +3612,7 @@ hy2_link_for_user() {
         ($e.hysteria2.obfs // "none"),
         ($e.hysteria2.obfs_password // ""),
         $e.node.name
-      ] | join("")')"
+      ] | join("\u001f")')"
   query="sni=$(urlencode "$domain")"
   [[ "$insecure" != "true" ]] || query+="&insecure=1"
   if [[ "$obfs" != "none" ]]; then
@@ -3673,17 +3674,28 @@ clash_proxies_for_entry() {
   local user="$1" entry="$2" route reality route_name entry_name node_key
   local uuid domain address port path host target profile
   local tls_port line name pub_key sni short_id
+  local route_count reality_count rname
   IFS=$'\x1f' read -r entry_name uuid domain address tls_port \
     <<<"$(jq -rn --argjson e "$entry" --argjson u "$user" '
       [$e.node.name, $u.uuid, $e.node.domain, $e.node.address,
-       ($e.nginx.tls_port // 443)] | join("")')"
+       ($e.nginx.tls_port // 443)] | join("\u001f")')"
+  # mihomo rejects duplicate proxy names; append the route name when one node
+  # exports several routes so every generated proxy stays unique.
+  route_count="$(jq -r '[.xray.routes[]? |
+    select((.profile // "plain") == "plain")] | length' <<<"$entry")"
+  reality_count="$(jq -r '[.xray.reality_inbounds[]?] | length' <<<"$entry")"
   while IFS=$'\x1f' read -r route_name path port target profile host; do
     [[ -n "$route_name" ]] || continue
     node_key="${entry_name}/xhttp/${route_name}"
     user_node_allowed "$user" "$node_key" || continue
     [[ "$profile" == "plain" ]] || continue
-    name="${entry_name}-XHTTP"
-    [[ "$target" == "direct" ]] || name="${entry_name}-${target}-XHTTP"
+    if [[ "$route_count" -gt 1 ]]; then
+      name="${entry_name}-${route_name}-XHTTP"
+      [[ "$target" == "direct" ]] || name="${entry_name}-${route_name}-${target}-XHTTP"
+    else
+      name="${entry_name}-XHTTP"
+      [[ "$target" == "direct" ]] || name="${entry_name}-${target}-XHTTP"
+    fi
     printf '  - {name: "%s", type: vless, server: "%s", port: %s, uuid: "%s", udp: true, tls: true, servername: "%s", client-fingerprint: chrome, network: xhttp, xhttp-opts: {path: "%s"%s, mode: auto}}\n' \
       "$name" "$address" "$port" "$uuid" "$domain" "$path" \
       "$([[ -z "$host" ]] || printf ', host: "%s"' "$host")"
@@ -3695,14 +3707,16 @@ clash_proxies_for_entry() {
       (.target // "direct"),
       (.profile // "plain"),
       (.host // "")
-    ] | join("")' <<<"$entry")
+    ] | join("\u001f")' <<<"$entry")
   while IFS=$'\x1f' read -r route_name pub_key sni short_id port path; do
     [[ -n "$route_name" ]] || continue
     node_key="${entry_name}/reality/${route_name}"
     user_node_allowed "$user" "$node_key" || continue
     [[ -n "$pub_key" ]] || continue
-    printf '  - {name: "%s-Reality-XHTTP", type: vless, server: "%s", port: %s, uuid: "%s", udp: true, tls: true, servername: "%s", client-fingerprint: chrome, network: xhttp, xhttp-opts: {path: "%s", mode: auto}, reality-opts: {public-key: "%s", short-id: "%s"}}\n' \
-      "$entry_name" "$address" "$port" "$uuid" "$sni" "$path" "$pub_key" "$short_id"
+    rname="${entry_name}-Reality-XHTTP"
+    [[ "$reality_count" -le 1 ]] || rname="${entry_name}-${route_name}-Reality-XHTTP"
+    printf '  - {name: "%s", type: vless, server: "%s", port: %s, uuid: "%s", udp: true, tls: true, servername: "%s", client-fingerprint: chrome, network: xhttp, xhttp-opts: {path: "%s", mode: auto}, reality-opts: {public-key: "%s", short-id: "%s"}}\n' \
+      "$rname" "$address" "$port" "$uuid" "$sni" "$path" "$pub_key" "$short_id"
   done < <(jq -r --argjson e "$entry" '
     .xray.reality_inbounds[]? | [
       .name,
@@ -3711,7 +3725,7 @@ clash_proxies_for_entry() {
       (.short_ids[0] // ""),
       .port,
       .path
-    ] | join("")' <<<"$entry")
+    ] | join("\u001f")' <<<"$entry")
   if [[ "$(jq -r '.hysteria2.enabled // false' <<<"$entry")" == "true" ]] &&
      [[ "$(jq -r '.hy2_password // ""' <<<"$user")" != "" ]] &&
      user_node_allowed "$user" "${entry_name}/hy2"; then
@@ -3720,9 +3734,16 @@ clash_proxies_for_entry() {
       <<<"$(jq -rn --argjson e "$entry" --argjson u "$user" '
         [($e.hysteria2.port // 443), ($e.hysteria2.obfs // "none"),
          $u.hy2_password, ($e.hysteria2.obfs_password // ""),
-         ($e.hysteria2.insecure // false)] | join("")')"
+         ($e.hysteria2.insecure // false)] | join("\u001f")')"
     [[ "$hy2_obfs" == "none" ]] ||
       hy2_extra=", obfs: ${hy2_obfs}, obfs-password: \"${hy2_obfs_pw}\""
+    # Passwords are free-form (only control chars rejected); escape the
+    # double-quoted YAML metacharacters so a quote or backslash cannot
+    # corrupt the whole generated profile.
+    hy2_pw="${hy2_pw//\\/\\\\}"
+    hy2_pw="${hy2_pw//\"/\\\"}"
+    hy2_obfs_pw="${hy2_obfs_pw//\\/\\\\}"
+    hy2_obfs_pw="${hy2_obfs_pw//\"/\\\"}"
     [[ "$hy2_insecure" != "true" ]] || hy2_extra+=", skip-cert-verify: true"
     printf '  - {name: "%s-Hysteria2", type: hysteria2, server: "%s", port: %s, password: "%s", sni: "%s", udp: true%s}\n' \
       "$entry_name" "$address" "$hy2_port" "$hy2_pw" "$domain" "$hy2_extra"
@@ -3778,8 +3799,6 @@ rules:
   - AND,((DST-PORT,443),(NETWORK,UDP)),REJECT
   - GEOIP,LAN,DIRECT,no-resolve
   - RULE-SET,private_domain,DIRECT,no-resolve
-  - RULE-SET,cn_domain,DIRECT,no-resolve
-  - RULE-SET,cn_ip,DIRECT,no-resolve
   # Windows Update 走直连（国内有 CDN，走代理反而慢）
   - DOMAIN-SUFFIX,windowsupdate.com,🎯 全球直连
   - DOMAIN-SUFFIX,update.microsoft.com,🎯 全球直连
@@ -3789,6 +3808,8 @@ rules:
   - RULE-SET,github_domain,🚀 节点选择
   - DOMAIN-SUFFIX,linkedin.com,🚀 节点选择
   # Apple 常用服务走直连（国内有 CDN）；开发者/测试服务走代理
+  # （显式规则必须排在 cn 列表之前：geosite cn 也收录了部分
+  #   apple/microsoft 子域，放后面会被 cn 兜底直连静默吞掉）
   - DOMAIN-SUFFIX,apple.com,🎯 全球直连
   - DOMAIN-SUFFIX,icloud.com,🎯 全球直连
   - DOMAIN-SUFFIX,icloud-content.com,🎯 全球直连
@@ -3816,6 +3837,9 @@ rules:
   - DOMAIN-SUFFIX,githubcopilot.com,🤖 AI 服务
   - DOMAIN-SUFFIX,copilot.microsoft.com,🤖 AI 服务
   - DOMAIN-SUFFIX,v0.dev,🤖 AI 服务
+  # 国内域名/IP 兜底直连（所有显式例外已在上方优先处理）
+  - RULE-SET,cn_domain,DIRECT,no-resolve
+  - RULE-SET,cn_ip,DIRECT,no-resolve
   - MATCH,🌐 国外流量
 rule-providers:
   private_domain: { type: http, interval: 86400, behavior: domain, format: mrs, url: "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/private.mrs" }
@@ -3829,7 +3853,7 @@ render_subscriptions() {
   local target_dir="$1" user token plain name
   [[ -n "$target_dir" && "$target_dir" != "/" ]] || die "Unsafe subscription directory"
   mkdir -p "$target_dir"
-  find "$target_dir" -mindepth 1 -maxdepth 1 -type f -delete
+  find "$target_dir" -mindepth 1 -maxdepth 1 \( -type f -o -type l \) -delete
   [[ "$(jq -r '.subscription.enabled // false' "$STATE_FILE")" == "true" ]] ||
     return 0
   # Hoist shared data once (avoids re-parsing state.json per user per format)

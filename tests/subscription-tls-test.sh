@@ -21,6 +21,8 @@ EDGE="$ROOT/etxr.sh"
   --password TEST-PASSWORD >/dev/null
 "$EDGE" route add --name master --path /master-path \
   --port 18001 --target direct >/dev/null
+"$EDGE" route add --name master-b --path /master-path-b \
+  --port 18002 --target direct >/dev/null
 
 "$EDGE" subscriptions snapshot >"$TMP/master-entry.json"
 jq -e 'all(.xray.routes[]; .security == "tls")' \
@@ -84,10 +86,12 @@ clash="$ETXR_GENERATED/subscriptions/${token}.yaml"
 plain_file="$ETXR_GENERATED/subscriptions/${token}"
 [[ -s "$clash" ]]
 [[ -s "$plain_file" ]]
-grep -q 'name: "master-XHTTP"' "$clash"
+# multi-route nodes emit route-named proxies so mihomo never sees duplicates
+grep -q 'name: "master-master-XHTTP"' "$clash"
+grep -q 'name: "master-master-b-XHTTP"' "$clash"
 grep -q 'name: "worker-XHTTP"' "$clash"
 # every proxy entry must start its own line (multi-source join regression)
-[[ "$(grep -cE '^  - \{name: "[^"]*", type: (vless|hysteria2)' "$clash")" -eq 2 ]]
+[[ "$(grep -cE '^  - \{name: "[^"]*", type: (vless|hysteria2)' "$clash")" -eq 3 ]]
 grep -q 'network: xhttp' "$clash"
 grep -q 'servername: "worker.example.com"' "$clash"
 grep -q 'proxy-groups:' "$clash"

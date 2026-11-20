@@ -40,6 +40,18 @@ def main() -> int:
     assert "MATCH,🌐 国外流量" in text
     assert "RULE-SET,ai_domain,🤖 AI 服务" in text
     assert "rule-providers:" in text
+    # jq field joins must use the escaped separator, never raw 0x1f bytes.
+    assert "\x1f" not in text
+    assert 'join("\\u001f")' in text
+    # Multi-route nodes need unique proxy names in the generated profile.
+    assert 'name="${entry_name}-${route_name}-XHTTP"' in text
+    # Free-form hy2 passwords are escaped before YAML interpolation.
+    hy2_escape = 'hy2_pw="${hy2_pw//' + "\\" * 2 + "/" + "\\" * 4 + '}"'
+    assert hy2_escape in text
+    # Explicit per-service rules must precede the cn fallback ruleset.
+    assert text.index("- DOMAIN,testflight.apple.com,🚀 节点选择") < text.index(
+        "- RULE-SET,cn_domain,DIRECT,no-resolve"
+    )
     assert "fallbackTag:" in text
     assert "observatory:" in text
     assert "proxy_request_buffering off" in text
